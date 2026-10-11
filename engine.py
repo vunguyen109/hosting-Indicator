@@ -4,7 +4,7 @@ Low-Resource Quant Engine | 1.5vCore - 2GB RAM - 2GB Disk
 
 Assets  : BTC/USDT - XAU/USD - WTI (OIL/USD)
 Signals : EMA crossover - RSI OB/OS - BB squeeze - ATR breakout
-Stack   : Python 3.11+ - asyncio - aiohttp - stdlib only
+Stack   : Python 3.11+ - asyncio - aiohttp (with aiohttp.web Dashboard) - stdlib only
 
 Memory strategy:
   - CircularBuffer fixed 300 candles/asset  -> ~72 KB total RAM
@@ -12,6 +12,7 @@ Memory strategy:
   - All indicator functions are pure-math implementations
   - State persist = atomic JSON write every 15 min (<2MB)
   - Log rotating 5MB x 2 files = max 15MB on disk
+  - Embedded aiohttp.web Dashboard: 0 external dependencies, <5MB RAM
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 import aiohttp  # pip install aiohttp
+from aiohttp import web
 
 
 # =============================================================================
@@ -38,32 +40,45 @@ import aiohttp  # pip install aiohttp
 # =============================================================================
 
 CONFIG = {
+    # ---- Web Dashboard --------------------------------------------------
+    # Botkeep assigns port via SERVER_PORT, or standard PORT env var
+    "web_host":           os.environ.get("HOST", "0.0.0.0"),
+    "web_port":           int(os.environ.get("SERVER_PORT", os.environ.get("PORT", "8080"))),
+
     # ---- Telegram -------------------------------------------------------
+    # Optional: If not provided or default placeholder, engine runs in Web/Console mode
     "telegram_bot_token": os.environ.get("TG_BOT_TOKEN", "YOUR_BOT_TOKEN"),
     "telegram_chat_id":   os.environ.get("TG_CHAT_ID",   "YOUR_CHAT_ID"),
+
     # ---- API Keys -------------------------------------------------------
     # TwelveData free tier: 800 requests/day (~33/hour). Used for XAU & OIL.
     "twelvedata_api_key": os.environ.get("TWELVE_API_KEY", "YOUR_TWELVE_KEY"),
+
     # ---- Asset definitions ----------------------------------------------
     "assets": {
         "BTC": {
+            "name":       "Bitcoin",
             "source":     "binance",
             "symbol":     "BTCUSDT",
             "timeframes": ["15m", "1h"],
         },
         "XAU": {
+            "name":       "Gold",
             "source":     "twelvedata",
             "symbol":     "XAU/USD",
             "timeframes": ["15min", "1h"],
         },
         "OIL": {
+            "name":       "Crude Oil (WTI)",
             "source":     "twelvedata",
             "symbol":     "WTI/USD",
             "timeframes": ["15min", "1h"],
         },
     },
+
     # ---- Circular buffer ------------------------------------------------
     "buffer_size": 300,          # candles kept in RAM per (asset, timeframe)
+
     # ---- Indicator parameters -------------------------------------------
     "ema_fast":    20,
     "ema_slow":    50,
@@ -71,21 +86,26 @@ CONFIG = {
     "bb_period":   20,
     "bb_std":      2.0,
     "atr_period":  14,
+
     # ---- Signal thresholds ----------------------------------------------
     "rsi_overbought":          70.0,
     "rsi_oversold":            30.0,
     "atr_breakout_multiplier": 1.5,   # ATR x1.5 spike = breakout signal
+
     # ---- Polling timing -------------------------------------------------
     # Poll 5 seconds after candle close for exchange data to settle
     "poll_offset_seconds": 5,
-    # ---- State persistence ----------------------------------------------
-    "state_file":           "/opt/indicator/data/state.json",
+
+    # ---- State persistence (relative path for container portability) ----
+    "state_file":           os.environ.get("STATE_FILE", "./data/state.json"),
     "state_max_bytes":      1_500_000,   # 1.5 MB ceiling before trim
     "state_flush_interval": 900,         # flush every 15 minutes
-    # ---- Logging --------------------------------------------------------
-    "log_file":        "/opt/indicator/logs/app.log",
+
+    # ---- Logging (relative path for container portability) --------------
+    "log_file":        os.environ.get("LOG_FILE", "./logs/app.log"),
     "log_max_bytes":    5_242_880,       # 5 MB per file
     "log_backup_count": 2,               # 2 backup files => max 15 MB logs
+
     # ---- Disk watchdog --------------------------------------------------
     "disk_alert_threshold_pct": 70,      # alert when disk > 70 %
     "disk_check_interval":      21600,   # check every 6 hours
@@ -116,127 +136,138 @@ class Candle:
     high:   float
     low:    float
     close:  float
-    volume: float
+    volume: float = 0.0
 
 
 class CircularBuffer:
     """
-    Fixed-capacity FIFO using collections.deque(maxlen=N).
-    Oldest candle is evicted automatically on append when full.
-    RAM footprint stays constant after __init__ -- never grows.
+    Fixed-capacity FIFO buffer backed by collections.deque(maxlen=N).
+    push() is O(1). Oldest elements are dropped automatically.
+    RAM usage is strictly bounded.
     """
 
-    __slots__ = ("_buf", "maxlen", "asset", "timeframe")
-
     def __init__(self, maxlen: int, asset: str, timeframe: str) -> None:
-        self.maxlen    = maxlen
+        self._buf: deque[Candle] = deque(maxlen=maxlen)
         self.asset     = asset
         self.timeframe = timeframe
-        self._buf: deque[Candle] = deque(maxlen=maxlen)
 
     def push(self, candle: Candle) -> None:
-        """Append a closed candle. Oldest entry evicted when at capacity."""
         self._buf.append(candle)
 
-    def last_n_closes(self, n: int) -> list[float]:
-        return [c.close for c in list(self._buf)[-n:]]
-
-    def last_n_candles(self, n: int) -> list[Candle]:
-        return list(self._buf)[-n:]
+    def is_full(self) -> bool:
+        return len(self._buf) == self._buf.maxlen
 
     def __len__(self) -> int:
         return len(self._buf)
 
     @property
+    def closes(self) -> list[float]:
+        return [c.close for c in self._buf]
+
+    @property
+    def highs(self) -> list[float]:
+        return [c.high for c in self._buf]
+
+    @property
+    def lows(self) -> list[float]:
+        return [c.low for c in self._buf]
+
+    @property
     def latest(self) -> Optional[Candle]:
         return self._buf[-1] if self._buf else None
 
+    def last_n_candles(self, n: int) -> list[Candle]:
+        return list(self._buf)[-n:]
+
 
 # =============================================================================
-# SECTION 3: INDICATOR ENGINE  (pure math -- zero external dependencies)
+# SECTION 3: INDICATOR ENGINE  (pure-math, zero external dependencies)
 # =============================================================================
 
 class IndicatorEngine:
     """
-    EMA, RSI, Bollinger Bands, ATR in pure Python.
-    Avoids numpy/pandas to save ~80 MB of baseline RAM.
-    All formulas are textbook implementations.
+    All technical indicators implemented with Python built-ins.
+    Zero NumPy / Pandas dependencies saves ~80 MB baseline RAM.
     """
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------------- EMA
     @staticmethod
-    def ema(closes: list[float], period: int) -> Optional[float]:
+    def ema(values: list[float], period: int) -> Optional[float]:
         """
-        Exponential Moving Average (Wilder smoothing).
-            k       = 2 / (period + 1)
-            EMA_t   = close_t * k  +  EMA_{t-1} * (1 - k)
-        Seed = simple average of first `period` values.
+        Exponential Moving Average.
+        Seed: SMA of first `period` values.
+        Multiplier k = 2 / (period + 1).
         """
-        if len(closes) < period:
+        if len(values) < period:
             return None
-        k       = 2.0 / (period + 1)
-        ema_val = sum(closes[:period]) / period   # seed
-        for price in closes[period:]:
-            ema_val = price * k + ema_val * (1.0 - k)
-        return ema_val
+        k   = 2.0 / (period + 1)
+        val = sum(values[:period]) / period
+        for p in values[period:]:
+            val = p * k + val * (1.0 - k)
+        return val
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------------- RSI
     @staticmethod
     def rsi(closes: list[float], period: int = 14) -> Optional[float]:
         """
-        Relative Strength Index (Wilder smoothed).
-            RS  = AvgGain / AvgLoss
-            RSI = 100 - 100 / (1 + RS)
-        Requires at least period + 1 bars.
+        Relative Strength Index using Wilder's smoothing technique.
+        RSI = 100 - (100 / (1 + RS))
         """
         if len(closes) < period + 1:
             return None
-        deltas   = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-        gains    = [d if d > 0 else 0.0 for d in deltas]
-        losses   = [-d if d < 0 else 0.0 for d in deltas]
-        avg_gain = sum(gains[:period]) / period   # seed
+        deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        gains  = [max(d, 0.0)  for d in deltas]
+        losses = [max(-d, 0.0) for d in deltas]
+        avg_gain = sum(gains[:period])  / period
         avg_loss = sum(losses[:period]) / period
-        for i in range(period, len(gains)):
-            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        for i in range(period, len(deltas)):
+            avg_gain = (avg_gain * (period - 1) + gains[i])  / period
             avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        if avg_loss == 0:
+        if avg_loss == 0.0:
             return 100.0
-        return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------- BOLLINGER BANDS
     @staticmethod
     def bollinger_bands(
-        closes: list[float], period: int = 20, num_std: float = 2.0
+        closes: list[float],
+        period: int = 20,
+        num_std: float = 2.0,
     ) -> Optional[tuple[float, float, float]]:
         """
-        Bollinger Bands -> (upper, middle, lower).
-            middle = SMA(period)
-            std    = population std-dev of last period values
-            upper  = middle + num_std * std
-            lower  = middle - num_std * std
+        Bollinger Bands: returns (upper, middle, lower).
+        middle = SMA(closes, period)
+        upper  = middle + num_std * population_std
+        lower  = middle - num_std * population_std
         """
         if len(closes) < period:
             return None
-        window   = closes[-period:]
-        mean     = sum(window) / period
-        variance = sum((x - mean) ** 2 for x in window) / period
-        std      = math.sqrt(variance)
-        return mean + num_std * std, mean, mean - num_std * std
+        window = closes[-period:]
+        mid    = sum(window) / period
+        var    = sum((x - mid) ** 2 for x in window) / period
+        sd     = math.sqrt(var)
+        return (mid + num_std * sd, mid, mid - num_std * sd)
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------------- ATR
     @staticmethod
     def atr(candles: list[Candle], period: int = 14) -> Optional[float]:
         """
-        Average True Range (Wilder smoothed).
-            TR = max(H-L,  |H - prev_C|,  |L - prev_C|)
-        Seed = simple average of first `period` TR values.
+        Average True Range using Wilder's smoothing.
+        TR = max(H - L, |H - C_prev|, |L - C_prev|)
         """
         if len(candles) < period + 1:
             return None
         trs: list[float] = []
         for i in range(1, len(candles)):
-            h, lo, pc = candles[i].high, candles[i].low, candles[i - 1].close
-            trs.append(max(h - lo, abs(h - pc), abs(lo - pc)))
+            c      = candles[i]
+            prev_c = candles[i - 1]
+            tr = max(
+                c.high - c.low,
+                abs(c.high - prev_c.close),
+                abs(c.low  - prev_c.close),
+            )
+            trs.append(tr)
         if len(trs) < period:
             return None
         atr_val = sum(trs[:period]) / period
@@ -278,9 +309,20 @@ class Signal:
     asset:       str
     timeframe:   str
     signal_type: str   # e.g. "EMA_CROSS_UP", "RSI_OVERBOUGHT", ...
-    message:     str   # human-readable text for Telegram
+    message:     str   # human-readable text
     price:       float
     ts:          int = field(default_factory=lambda: int(time.time()))
+
+    def to_dict(self) -> dict:
+        return {
+            "asset": self.asset,
+            "timeframe": self.timeframe,
+            "signal_type": self.signal_type,
+            "message": self.message,
+            "price": self.price,
+            "ts": self.ts,
+            "time_str": datetime.datetime.fromtimestamp(self.ts, datetime.timezone.utc).strftime("%H:%M:%S UTC"),
+        }
 
 
 class RuleEngine:
@@ -405,7 +447,7 @@ class RuleEngine:
 
 
 # =============================================================================
-# SECTION 5: TELEGRAM DISPATCHER
+# SECTION 5: TELEGRAM DISPATCHER (with graceful offline / web fallback)
 # =============================================================================
 
 class TelegramDispatcher:
@@ -413,6 +455,7 @@ class TelegramDispatcher:
     Async Telegram message sender.
     Reuses one aiohttp session (persistent keep-alive connection).
     Retries up to 3 times with exponential backoff on failure.
+    If no valid token is provided, gracefully switches to Web & Console mode.
     """
 
     _API_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -421,6 +464,22 @@ class TelegramDispatcher:
         self._token   = token
         self._chat_id = chat_id
         self._session: Optional[aiohttp.ClientSession] = None
+        self._is_enabled = bool(
+            token
+            and token.strip()
+            and token != "YOUR_BOT_TOKEN"
+            and chat_id
+            and chat_id.strip()
+            and chat_id != "YOUR_CHAT_ID"
+        )
+        if self._is_enabled:
+            logger.info("Telegram notification is ENABLED.")
+        else:
+            logger.info("Telegram bot not configured -> Running in Web UI & Console mode.")
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._is_enabled
 
     async def _session_get(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -432,6 +491,8 @@ class TelegramDispatcher:
 
     async def send(self, text: str, retries: int = 3) -> bool:
         """Send a Markdown message. Returns True on success."""
+        if not self._is_enabled:
+            return True
         url     = self._API_URL.format(token=self._token)
         payload = {"chat_id": self._chat_id, "text": text, "parse_mode": "Markdown"}
         for attempt in range(retries):
@@ -447,6 +508,9 @@ class TelegramDispatcher:
         return False
 
     async def dispatch_signal(self, sig: Signal) -> None:
+        if not self._is_enabled:
+            logger.info(f">> [SIGNAL DETECTED] [{sig.asset} {sig.timeframe}] {sig.signal_type} @ {sig.price:.4f}")
+            return
         ok = await self.send(sig.message)
         logger.info(f"[SIGNAL {'SENT' if ok else 'FAIL'}] {sig.asset} {sig.timeframe} {sig.signal_type}")
 
@@ -555,6 +619,8 @@ class TwelveDataFetcher:
                         ))
                     except (KeyError, ValueError) as exc:
                         logger.debug(f"TwelveData row parse skip: {exc}")
+                    except Exception as exc:
+                        logger.debug(f"TwelveData row error: {exc}")
                 return candles
         except Exception as exc:
             logger.error(f"TwelveDataFetcher ({symbol}): {exc}")
@@ -575,7 +641,9 @@ class StatePersistence:
     def __init__(self, filepath: str, max_bytes: int) -> None:
         self._path      = filepath
         self._max_bytes = max_bytes
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        dir_name = os.path.dirname(filepath)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
 
     def save(self, state: dict) -> None:
         try:
@@ -584,7 +652,7 @@ class StatePersistence:
             if byte_size > self._max_bytes:
                 logger.warning(f"State {byte_size}B > {self._max_bytes}B ceiling -- trimming")
                 payload = json.dumps(self._trim(state), indent=2)
-            dir_path = os.path.dirname(self._path)
+            dir_path = os.path.dirname(self._path) or "."
             fd, tmp  = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -646,7 +714,8 @@ class DiskWatchdog:
         while True:
             await asyncio.sleep(self._interval)
             try:
-                st       = os.statvfs("/")
+                path_to_check = "." if os.path.exists(".") else "/"
+                st       = os.statvfs(path_to_check)
                 total    = st.f_blocks * st.f_frsize
                 free     = st.f_bfree * st.f_frsize
                 used_pct = (total - free) / total * 100 if total else 0
@@ -686,7 +755,489 @@ def seconds_until_next_close(tf_seconds: int, offset: int = 5) -> float:
 
 
 # =============================================================================
-# SECTION 10: MAIN ORCHESTRATOR
+# SECTION 10: WEB DASHBOARD & EMBEDDED SERVER (aiohttp.web)
+# =============================================================================
+
+HTML_DASHBOARD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Indicator Engine - Live Dashboard</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: #111827;
+      --card-border: #1f2937;
+      --text: #f9fafb;
+      --text-muted: #9ca3af;
+      --accent: #3b82f6;
+      --green: #10b981;
+      --red: #ef4444;
+      --gold: #f59e0b;
+      --purple: #8b5cf6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 24px;
+      gap: 16px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.02em; }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--green);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.9); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+    .meta-info {
+      display: flex;
+      gap: 16px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      align-items: center;
+    }
+    .meta-item { display: flex; align-items: center; gap: 6px; }
+    .meta-value { color: var(--text); font-weight: 600; font-family: monospace; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 16px 20px;
+    }
+    .card-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+    .card-metric { font-size: 1.5rem; font-weight: 700; font-family: monospace; }
+    .card-sub { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
+    .table-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 24px;
+    }
+    .table-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--card-border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .table-header h2 { font-size: 1.05rem; font-weight: 600; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; }
+    th {
+      background: rgba(255, 255, 255, 0.02);
+      color: var(--text-muted);
+      font-weight: 600;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    td {
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      font-family: monospace;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255, 255, 255, 0.02); }
+    .asset-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .pill {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .pill-bull { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .pill-bear { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }
+    .pill-neutral { background: rgba(156, 163, 175, 0.15); color: var(--text-muted); border: 1px solid rgba(156, 163, 175, 0.2); }
+    .pill-gold { background: rgba(245, 158, 11, 0.15); color: var(--gold); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .pill-purple { background: rgba(139, 92, 246, 0.15); color: var(--purple); border: 1px solid rgba(139, 92, 246, 0.3); }
+    .signals-box {
+      max-height: 380px;
+      overflow-y: auto;
+      padding: 12px 16px;
+    }
+    .signal-item {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      gap: 8px;
+    }
+    .signal-item:last-child { margin-bottom: 0; }
+    .sig-left { display: flex; align-items: center; gap: 10px; }
+    .sig-time { font-size: 0.75rem; color: var(--text-muted); font-family: monospace; }
+    .sig-msg { font-size: 0.85rem; color: #d1d5db; }
+    .sig-price { font-size: 0.85rem; font-weight: 700; font-family: monospace; }
+    .empty-signals {
+      padding: 32px 16px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+    footer {
+      text-align: center;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      padding: 20px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <h1>Hosting Indicator Engine</h1>
+        <div class="status-badge" id="engineStatusBadge">
+          <span class="pulse-dot"></span>
+          <span id="engineStatusText">ONLINE</span>
+        </div>
+      </div>
+      <div class="meta-info">
+        <div class="meta-item">
+          <span>Uptime:</span>
+          <span class="meta-value" id="uptimeDisplay">--:--:--</span>
+        </div>
+        <div class="meta-item">
+          <span>Server Time:</span>
+          <span class="meta-value" id="serverTimeDisplay">--:--:-- UTC</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-title">Assets Tracked</div>
+        <div class="card-metric" style="color: var(--accent);">BTC • XAU • OIL</div>
+        <div class="card-sub">Timeframes: 15m & 1h (6 Streams)</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Telegram Mode</div>
+        <div class="card-metric" id="tgModeMetric">Detecting...</div>
+        <div class="card-sub" id="tgModeSub">Optional Bot Fallback</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Signal Memory</div>
+        <div class="card-metric" id="signalsCountMetric">0</div>
+        <div class="card-sub">Circular ring buffer (Max 50)</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Resource Profile</div>
+        <div class="card-metric" style="color: var(--green);">&lt; 120 MB RAM</div>
+        <div class="card-sub">1.5 vCore • Low Overhead Engine</div>
+      </div>
+    </div>
+
+    <div class="table-card">
+      <div class="table-header">
+        <h2>Live Technical Indicators</h2>
+        <span style="font-size: 0.8rem; color: var(--text-muted);">Auto-refreshes every 3s</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Asset</th>
+              <th>TF</th>
+              <th>Close Price</th>
+              <th>RSI (14)</th>
+              <th>EMA Trend (20 / 50)</th>
+              <th>Bollinger Bands (Low / Mid / High)</th>
+              <th>ATR (14)</th>
+              <th>Last Update</th>
+            </tr>
+          </thead>
+          <tbody id="indicatorsTbody">
+            <tr>
+              <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 24px;">
+                Loading indicator streams...
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="table-card">
+      <div class="table-header">
+        <h2>Live Signals Feed</h2>
+        <span style="font-size: 0.8rem; color: var(--text-muted);" id="signalsTotalLabel">0 triggered</span>
+      </div>
+      <div class="signals-box" id="signalsFeedBox">
+        <div class="empty-signals">No signals triggered yet. Waiting for candle closes...</div>
+      </div>
+    </div>
+
+    <footer>
+      Hosting Indicator Engine v1.0 • Designed for low-resource hosting (Botkeep, VPS, Local)
+    </footer>
+  </div>
+
+  <script>
+    async function updateDashboard() {
+      try {
+        const res = await fetch('/api/snapshot');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+
+        // 1. Header meta
+        document.getElementById('uptimeDisplay').textContent = data.uptime_formatted || '--';
+        document.getElementById('serverTimeDisplay').textContent = data.server_time || '--';
+        document.getElementById('engineStatusText').textContent = data.status.toUpperCase();
+
+        // 2. Telegram mode
+        const tgMetric = document.getElementById('tgModeMetric');
+        const tgSub = document.getElementById('tgModeSub');
+        if (data.telegram_enabled) {
+          tgMetric.textContent = 'ACTIVE';
+          tgMetric.style.color = 'var(--green)';
+          tgSub.textContent = 'Dispatching to Telegram Chat';
+        } else {
+          tgMetric.textContent = 'WEB / LOGS';
+          tgMetric.style.color = 'var(--gold)';
+          tgSub.textContent = 'Running Standalone (No Bot Token)';
+        }
+
+        // 3. Signals count
+        const signals = data.signals || [];
+        document.getElementById('signalsCountMetric').textContent = signals.length;
+        document.getElementById('signalsTotalLabel').textContent = signals.length + ' stored';
+
+        // 4. Render Indicators Table
+        const tbody = document.getElementById('indicatorsTbody');
+        const indMap = data.indicators || {};
+        let rowsHtml = '';
+        const assetsOrder = ['BTC', 'XAU', 'OIL'];
+
+        assetsOrder.forEach(asset => {
+          const tfs = indMap[asset] || {};
+          Object.keys(tfs).forEach(tf => {
+            const item = tfs[tf];
+            if (!item) return;
+
+            // Price format
+            const price = item.close != null ? Number(item.close).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4}) : '--';
+
+            // RSI format & badge
+            let rsiBadge = '<span class="pill pill-neutral">N/A</span>';
+            if (item.rsi != null) {
+              const r = Number(item.rsi);
+              if (r >= 70) {
+                rsiBadge = `<span class="pill pill-bear">${r.toFixed(1)} [OB]</span>`;
+              } else if (r <= 30) {
+                rsiBadge = `<span class="pill pill-bull">${r.toFixed(1)} [OS]</span>`;
+              } else {
+                rsiBadge = `<span class="pill pill-neutral">${r.toFixed(1)}</span>`;
+              }
+            }
+
+            // EMA Trend
+            let emaTrend = '<span class="pill pill-neutral">N/A</span>';
+            if (item.ema_fast != null && item.ema_slow != null) {
+              const ef = Number(item.ema_fast);
+              const es = Number(item.ema_slow);
+              if (ef > es) {
+                emaTrend = `<span class="pill pill-bull">BULLISH ▲</span> <span style="color:var(--text-muted);font-size:0.75rem;">(${ef.toFixed(1)} / ${es.toFixed(1)})</span>`;
+              } else {
+                emaTrend = `<span class="pill pill-bear">BEARISH ▼</span> <span style="color:var(--text-muted);font-size:0.75rem;">(${ef.toFixed(1)} / ${es.toFixed(1)})</span>`;
+              }
+            }
+
+            // Bollinger Bands
+            let bbStr = '<span style="color:var(--text-muted);">N/A</span>';
+            if (item.bb_lower != null && item.bb_mid != null && item.bb_upper != null) {
+              bbStr = `${Number(item.bb_lower).toFixed(2)} | ${Number(item.bb_mid).toFixed(2)} | ${Number(item.bb_upper).toFixed(2)}`;
+            }
+
+            // ATR
+            const atrStr = item.atr != null ? Number(item.atr).toFixed(4) : 'N/A';
+
+            // Time
+            const timeStr = item.ts ? new Date(item.ts * 1000).toLocaleTimeString() : '--';
+
+            let assetIcon = '📊';
+            if (asset === 'BTC') assetIcon = '₿';
+            if (asset === 'XAU') assetIcon = '🟡';
+            if (asset === 'OIL') assetIcon = '🛢️';
+
+            rowsHtml += `
+              <tr>
+                <td><span class="asset-tag">${assetIcon} ${asset}</span></td>
+                <td><span class="pill pill-neutral">${tf}</span></td>
+                <td style="font-weight:700;color:var(--text);">$${price}</td>
+                <td>${rsiBadge}</td>
+                <td>${emaTrend}</td>
+                <td style="font-size:0.8rem;color:var(--text-muted);">${bbStr}</td>
+                <td>${atrStr}</td>
+                <td style="font-size:0.8rem;color:var(--text-muted);">${timeStr}</td>
+              </tr>
+            `;
+          });
+        });
+
+        if (rowsHtml) {
+          tbody.innerHTML = rowsHtml;
+        }
+
+        // 5. Render Signals Feed
+        const feedBox = document.getElementById('signalsFeedBox');
+        if (signals.length === 0) {
+          feedBox.innerHTML = '<div class="empty-signals">No signals triggered yet. Waiting for candle closes...</div>';
+        } else {
+          feedBox.innerHTML = signals.map(sig => {
+            let pillClass = 'pill-gold';
+            if (sig.signal_type.includes('UP') || sig.signal_type.includes('OVERSOLD')) pillClass = 'pill-bull';
+            if (sig.signal_type.includes('DOWN') || sig.signal_type.includes('OVERBOUGHT')) pillClass = 'pill-bear';
+            if (sig.signal_type.includes('SPIKE')) pillClass = 'pill-purple';
+
+            const cleanMsg = (sig.message || '').replace(/\\*|_|`/g, '');
+            return `
+              <div class="signal-item">
+                <div class="sig-left">
+                  <span class="pill ${pillClass}">${sig.signal_type}</span>
+                  <span style="font-weight:700;">${sig.asset} (${sig.timeframe})</span>
+                  <span class="sig-msg">${cleanMsg}</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:12px;">
+                  <span class="sig-price">$${Number(sig.price).toFixed(4)}</span>
+                  <span class="sig-time">${sig.time_str || ''}</span>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+      } catch (err) {
+        console.warn('Dashboard fetch error:', err);
+      }
+    }
+
+    setInterval(updateDashboard, 3000);
+    window.addEventListener('load', updateDashboard);
+  </script>
+</body>
+</html>
+"""
+
+
+class DashboardServer:
+    """
+    Lightweight web server embedded inside engine.py via aiohttp.web.
+    Provides:
+      GET /             -> Interactive Dark Mode Web Dashboard
+      GET /api/snapshot -> Realtime JSON snapshot of indicators & signals
+      GET /api/health   -> Lightweight health check
+    Consumes < 5MB RAM and reuses the existing aiohttp library.
+    """
+
+    def __init__(self, orchestrator: IndicatorOrchestrator, host: str, port: int) -> None:
+        self._orchestrator = orchestrator
+        self._host         = host
+        self._port         = port
+        self._app          = web.Application()
+        self._app.router.add_get("/",             self.handle_index)
+        self._app.router.add_get("/api/snapshot", self.handle_snapshot)
+        self._app.router.add_get("/api/health",   self.handle_health)
+        self._runner: Optional[web.AppRunner] = None
+        self._site:   Optional[web.TCPSite]   = None
+
+    async def handle_index(self, request: web.Request) -> web.Response:
+        return web.Response(text=HTML_DASHBOARD, content_type="text/html", charset="utf-8")
+
+    async def handle_snapshot(self, request: web.Request) -> web.Response:
+        now = time.time()
+        uptime_sec = int(now - self._orchestrator._start_time)
+        data = {
+            "status": "online",
+            "uptime_seconds": uptime_sec,
+            "uptime_formatted": str(datetime.timedelta(seconds=uptime_sec)),
+            "server_time": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "telegram_enabled": self._orchestrator._tg.is_enabled if self._orchestrator._tg else False,
+            "indicators": self._orchestrator._latest_indicators,
+            "signals": list(self._orchestrator._recent_signals),
+        }
+        return web.json_response(data)
+
+    async def handle_health(self, request: web.Request) -> web.Response:
+        return web.json_response({
+            "status": "ok",
+            "time": int(time.time()),
+        })
+
+    async def start(self) -> None:
+        try:
+            self._runner = web.AppRunner(self._app)
+            await self._runner.setup()
+            self._site = web.TCPSite(self._runner, self._host, self._port)
+            await self._site.start()
+            logger.info(f"Web Dashboard listening on http://{self._host}:{self._port}")
+        except Exception as exc:
+            logger.error(f"Failed to start Web Dashboard on {self._host}:{self._port}: {exc}")
+
+    async def stop(self) -> None:
+        if self._runner:
+            try:
+                await self._runner.cleanup()
+                logger.info("Web Dashboard stopped cleanly")
+            except Exception as exc:
+                logger.error(f"Error stopping Web Dashboard: {exc}")
+
+
+# =============================================================================
+# SECTION 11: MAIN ORCHESTRATOR
 # =============================================================================
 
 class IndicatorOrchestrator:
@@ -696,17 +1247,21 @@ class IndicatorOrchestrator:
       _init_buffers  -> create CircularBuffers and pre-fill with history
       _asset_loop    -> per-(asset, tf) infinite poll-compute-signal loop
       _flush_loop    -> periodic state snapshot to disk
-      run            -> starts all asyncio tasks
+      run            -> starts all asyncio tasks & web dashboard
     """
 
     def __init__(self) -> None:
-        self._bufs:    dict[str, dict[str, CircularBuffer]] = {}
-        self._rules    = RuleEngine()
-        self._persist: Optional[StatePersistence]   = None
-        self._tg:      Optional[TelegramDispatcher] = None
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._binance: Optional[BinanceFetcher]     = None
-        self._twelve:  Optional[TwelveDataFetcher]  = None
+        self._bufs:              dict[str, dict[str, CircularBuffer]] = {}
+        self._rules              = RuleEngine()
+        self._persist:           Optional[StatePersistence]   = None
+        self._tg:                Optional[TelegramDispatcher] = None
+        self._session:           Optional[aiohttp.ClientSession] = None
+        self._binance:           Optional[BinanceFetcher]     = None
+        self._twelve:            Optional[TwelveDataFetcher]  = None
+        self._dashboard:         Optional[DashboardServer]    = None
+        self._start_time:        float                        = time.time()
+        self._latest_indicators: dict[str, dict[str, dict]]   = {}
+        self._recent_signals:    deque[dict]                  = deque(maxlen=50)
 
     # ------------------------------------------------------------------ setup
     async def _init_session(self) -> None:
@@ -728,6 +1283,10 @@ class IndicatorOrchestrator:
                 for c in candles:
                     buf.push(c)
                 logger.info(f"  [{asset} {tf}] loaded {len(buf)} candles")
+                # Immediately compute indicators so Web Dashboard has data on launch
+                if len(buf) > 0:
+                    ind = IndicatorEngine.compute_all(buf)
+                    self._latest_indicators.setdefault(asset, {})[tf] = ind
                 await asyncio.sleep(1)   # respect rate limits during init
 
     # --------------------------------------------------------------- fetching
@@ -759,12 +1318,16 @@ class IndicatorOrchestrator:
             return
         buf.push(latest)
         ind = IndicatorEngine.compute_all(buf)
+        # Store in latest indicators cache for Web UI & snapshot API
+        self._latest_indicators.setdefault(asset, {})[tf] = ind
+
         # Compact log line
         rsi = f"{ind['rsi']:.1f}" if ind.get("rsi") is not None else "N/A"
         atr = f"{ind['atr']:.4f}" if ind.get("atr") is not None else "N/A"
         logger.info(f"[{asset} {tf}] close={latest.close:.4f} RSI={rsi} ATR={atr}")
         for sig in self._rules.evaluate(ind):
             logger.info(f"  >> {sig.signal_type}")
+            self._recent_signals.appendleft(sig.to_dict())
             asyncio.create_task(self._tg.dispatch_signal(sig))
 
     # ------------------------------------------------------------------ loops
@@ -809,14 +1372,21 @@ class IndicatorOrchestrator:
         self._tg      = TelegramDispatcher(
             CONFIG["telegram_bot_token"], CONFIG["telegram_chat_id"]
         )
+
+        # Launch Web Dashboard
+        self._dashboard = DashboardServer(self, CONFIG["web_host"], CONFIG["web_port"])
+        await self._dashboard.start()
+
         await self._init_buffers()
-        await self._tg.send(
-            f"*[ENGINE STARTED]*\n"
-            f"Assets: `{', '.join(CONFIG['assets'])}`\n"
-            f"EMA {CONFIG['ema_fast']}/{CONFIG['ema_slow']} | "
-            f"RSI {CONFIG['rsi_period']} | BB | ATR\n"
-            f"`{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
-        )
+        if self._tg.is_enabled:
+            await self._tg.send(
+                f"*[ENGINE STARTED]*\n"
+                f"Assets: `{', '.join(CONFIG['assets'])}`\n"
+                f"EMA {CONFIG['ema_fast']}/{CONFIG['ema_slow']} | "
+                f"RSI {CONFIG['rsi_period']} | BB | ATR\n"
+                f"`{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`"
+            )
+
         tasks = [
             asyncio.create_task(self._asset_loop(a, tf), name=f"{a}_{tf}")
             for a, cfg in CONFIG["assets"].items()
@@ -840,6 +1410,8 @@ class IndicatorOrchestrator:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self._dashboard:
+                await self._dashboard.stop()
             if self._session:
                 await self._session.close()
             if self._tg:
@@ -848,7 +1420,7 @@ class IndicatorOrchestrator:
 
 
 # =============================================================================
-# SECTION 11: LOGGING SETUP
+# SECTION 12: LOGGING SETUP & ENTRY POINT
 # =============================================================================
 
 def setup_logging() -> logging.Logger:
@@ -857,7 +1429,8 @@ def setup_logging() -> logging.Logger:
     5 MB per file, 2 backup files => max 15 MB logs on disk.
     """
     log_dir = os.path.dirname(CONFIG["log_file"])
-    os.makedirs(log_dir, exist_ok=True)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
@@ -870,6 +1443,11 @@ def setup_logging() -> logging.Logger:
     )
     fh.setFormatter(fmt)
     fh.setLevel(logging.DEBUG)
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     ch.setLevel(logging.INFO)
@@ -880,10 +1458,6 @@ def setup_logging() -> logging.Logger:
     return logging.getLogger("indicator")
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
-
 logger = setup_logging()
 
 
@@ -891,6 +1465,7 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("  HOSTING INDICATOR ENGINE v1.0  (low-resource edition)")
     logger.info(f"  Python {sys.version.split()[0]}")
+    logger.info(f"  Dashboard available at http://{CONFIG['web_host']}:{CONFIG['web_port']}")
     logger.info("=" * 60)
     try:
         asyncio.run(IndicatorOrchestrator().run())

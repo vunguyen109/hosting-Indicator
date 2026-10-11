@@ -1,8 +1,9 @@
 # Hosting Indicator Engine
 
-**Low-Resource Quant Signal Service** — Python 3.11 | asyncio | aiohttp  
-Tài sản: BTC/USDT · XAU/USD · WTI Oil | Khung thời gian: M15 · H1  
-Tín hiệu: EMA Cross · RSI OB/OS · Bollinger Bands · ATR Spike → Telegram
+**Low-Resource Quant Signal Service & Web Dashboard** — Python 3.11 | asyncio | aiohttp  
+Tài sản: BTC/USDT · XAU/USD (Gold) · WTI Crude Oil | Khung thời gian: M15 · H1  
+Tín hiệu: EMA Cross · RSI OB/OS · Bollinger Bands · ATR Volatility Spike  
+Giao diện: **Web UI Dashboard (Dark Mode)** · Live Console · Telegram Bot *(Tùy chọn)*
 
 ---
 
@@ -10,71 +11,88 @@ Tín hiệu: EMA Cross · RSI OB/OS · Bollinger Bands · ATR Spike → Telegram
 
 1. [Tổng quan kiến trúc](#1-tổng-quan-kiến-trúc)
 2. [Yêu cầu tối thiểu](#2-yêu-cầu-tối-thiểu)
-3. [Chuẩn bị Repository trước khi deploy](#3-chuẩn-bị-repository-trước-khi-deploy)
-4. [Deploy lên Botkeep qua GitHub](#4-deploy-lên-botkeep-qua-github)
-5. [Cấu hình Secrets & Environment Variables](#5-cấu-hình-secrets--environment-variables)
-6. [Lệnh khởi động (Start Command)](#6-lệnh-khởi-động-start-command)
-7. [Giám sát và vận hành](#7-giám-sát-và-vận-hành)
-8. [Cập nhật code (Deploy revision mới)](#8-cập-nhật-code-deploy-revision-mới)
-9. [Xử lý sự cố thường gặp](#9-xử-lý-sự-cố-thường-gặp)
-10. [Giới hạn tài nguyên](#10-giới-hạn-tài-nguyên)
+3. [Giao diện Web UI & Chế độ không cần Telegram](#3-giao-diện-web-ui--chế-độ-không-cần-telegram)
+4. [Chuẩn bị Repository trước khi deploy](#4-chuẩn-bị-repository-trước-khi-deploy)
+5. [Deploy lên Botkeep qua GitHub](#5-deploy-lên-botkeep-qua-github)
+6. [Cấu hình Secrets & Environment Variables](#6-cấu-hình-secrets--environment-variables)
+7. [Lệnh khởi động (Start Command)](#7-lệnh-khởi-động-start-command)
+8. [Cấu hình Web Domain & Giám sát trên Botkeep](#8-cấu-hình-web-domain--giám-sát-trên-botkeep)
+9. [Cập nhật code (Deploy revision mới)](#9-cập-nhật-code-deploy-revision-mới)
+10. [Xử lý sự cố thường gặp](#10-xử-lý-sự-cố-thường-gặp)
+11. [Giới hạn tài nguyên & Hiệu năng](#11-giới-hạn-tài-nguyên--hiệu-năng)
+12. [Bảng tham chiếu tín hiệu (Signals Reference)](#12-bảng-tham-chiếu-tín-hiệu-signals-reference)
 
 ---
 
 ## 1. Tổng quan kiến trúc
 
 ```
-Data Sources          RAM (Circular Buffers)        Output
-Binance REST  ──────► BTC M15 300 candles ──► EMA/RSI/BB/ATR ──► Telegram
-TwelveData    ──────► XAU M15 300 candles ──► RuleEngine
-              ──────► OIL  H1 300 candles ──►     └─► state.json (15min flush)
+Data Sources          RAM (Circular Buffers)        Processing Engine           Output Destinations
+Binance REST  ──────► BTC M15 (300 nến) ──┐                                  ┌─► Web Dashboard (HTTP :8080/SERVER_PORT)
+                      BTC  H1 (300 nến) ──┤                                  │   (Bảng chỉ báo realtime + 50 signals)
+TwelveData    ──────► XAU M15 (300 nến) ──┼─► IndicatorEngine (RSI/EMA/BB/ATR)├─► REST API (/api/snapshot)
+                      XAU  H1 (300 nến) ──┤        │                         ├─► Live Console Log (Stdout)
+                      OIL M15 (300 nến) ──┤        ▼                         │
+                      OIL  H1 (300 nến) ──┘   RuleEngine (Phát tín hiệu) ────┴─► Telegram Bot (Tùy chọn)
+                                                   │
+                                                   └─► state.json (Lưu mỗi 15 phút vào ./data/)
 ```
 
-| Tài nguyên | Sử dụng thực tế | Giới hạn Botkeep |
-|---|---|---|
-| RAM | ~110 MB | 2 GB |
-| Disk | ~17 MB | 2 GB |
-| CPU | ~10% avg | 1.5 vCore |
+| Tài nguyên | Sử dụng thực tế | Giới hạn Botkeep (Free Plan) | Tỷ lệ sử dụng |
+|---|---|---|---|
+| **RAM** | **~115 MB** | 2 GB | ~5.8% |
+| **Disk** | **~18 MB** | 2 GB | ~0.9% |
+| **CPU** | **~5 - 10% avg** | 1.5 vCore | Rất nhẹ |
+| **Web Server** | Nhúng `aiohttp.web` | Tích hợp sẵn trong runtime | **0 dependency mới** |
 
 ---
 
 ## 2. Yêu cầu tối thiểu
 
-Trước khi deploy, cần có sẵn:
+Trước khi deploy, bạn cần chuẩn bị:
 
-- [ ] Tài khoản **Botkeep** tại [botkeep.cloud/app](https://botkeep.cloud/app)
-- [ ] Tài khoản **GitHub** đã push repo này lên (`main` branch)
-- [ ] **Telegram Bot Token** — lấy từ [@BotFather](https://t.me/BotFather)
-- [ ] **Telegram Chat ID** — ID group/channel nhận tín hiệu
-- [ ] **TwelveData API Key** — đăng ký miễn phí tại [twelvedata.com](https://twelvedata.com) (free tier: 800 req/ngày)
+- [x] **Tài khoản Botkeep** tại [botkeep.cloud/app](https://botkeep.cloud/app)
+- [x] **Tài khoản GitHub** đã fork hoặc push repository này lên branch `main`
+- [x] **TwelveData API Key** *(Bắt buộc cho Vàng & Dầu)*: Đăng ký miễn phí tại [twelvedata.com](https://twelvedata.com) (800 req/ngày miễn phí).
+- [ ] **Telegram Bot Token & Chat ID** *(TÙY CHỌN)*: Nếu chưa tạo bot Telegram, engine vẫn chạy bình thường 100% và hiển thị đầy đủ thông tin trên **Web UI** và **Console log**.
 
 ---
 
-## 3. Chuẩn bị Repository trước khi deploy
+## 3. Giao diện Web UI & Chế độ không cần Telegram
 
-### 3.1. Kiểm tra cấu trúc file bắt buộc
+### 3.1. Chưa có Telegram Bot thì xem thông tin ở đâu?
+Hệ thống được tích hợp sẵn **Single-page Web Dashboard** và **REST API** bằng `aiohttp.web`:
+1. **Bảng chỉ báo Realtime (Live Indicators Table):** Cập nhật giá đóng cửa, RSI (14), Trend EMA (20/50), Bollinger Bands (Lower / Mid / Upper), ATR (14) của cả 3 tài sản (BTC, Vàng XAU, Dầu WTI) trên khung 15m và 1h.
+2. **Dòng tín hiệu trực tiếp (Live Signals Feed):** Lưu bộ đệm 50 tín hiệu gần nhất trong RAM, phân loại rõ ràng:
+   - `BULLISH ▲ / BEARISH ▼`
+   - `RSI OVERBOUGHT / RSI OVERSOLD`
+   - `BB BREAKOUT UP / DOWN`
+   - `ATR VOLATILITY SPIKE`
+3. **Cơ chế tự động làm mới (Auto-refresh):** Giao diện tự động fetch API `/api/snapshot` mỗi 3 giây.
+4. **Console Output:** Khi chưa cấu hình Telegram, tín hiệu sẽ tự động in ra màn hình console dạng `>> [SIGNAL DETECTED]` thay vì báo lỗi.
 
-Botkeep yêu cầu các file sau phải có ở **root của repository**:
+---
 
+## 4. Chuẩn bị Repository trước khi deploy
+
+### 4.1. Cấu trúc thư mục chuẩn
 ```
 hosting-Indicator/
-├── engine.py          ← File chính, entry point
-├── requirements.txt   ← Danh sách dependencies
-├── .env.example       ← Template cho secrets (KHÔNG commit .env thật)
-└── README.md
+├── engine.py          ← Core engine + Web Dashboard tích hợp
+├── requirements.txt   ← Chỉ duy nhất: aiohttp==3.9.5
+├── test_engine.py     ← Bộ kiểm thử tự động
+├── .env.example       ← Mẫu biến môi trường
+└── README.md          ← Tài liệu hướng dẫn
 ```
 
-### 3.2. Kiểm tra `requirements.txt`
-
-```
-# requirements.txt — chỉ 1 dependency ngoài stdlib
+### 4.2. File `requirements.txt`
+```txt
 aiohttp==3.9.5
 ```
+*(Chỉ cần duy nhất `aiohttp`, dashboard dùng `aiohttp.web` có sẵn, không cần cài Flask/FastAPI hay React).*
 
-### 3.3. Đảm bảo `.env` KHÔNG được commit vào git
-
-Kiểm tra `.gitignore` đã có:
-
+### 4.3. Đảm bảo `.env` KHÔNG commit vào GitHub
+File `.gitignore` đã chặn các file nhạy cảm:
 ```gitignore
 .env
 *.env
@@ -84,284 +102,159 @@ __pycache__/
 *.pyc
 ```
 
-> **⚠️ Quan trọng:** Không bao giờ commit file `.env` chứa API keys vào GitHub.
-> Botkeep sẽ yêu cầu nhập secrets qua giao diện dashboard, không qua file.
-
 ---
 
-## 4. Deploy lên Botkeep qua GitHub
+## 5. Deploy lên Botkeep qua GitHub
 
 ### Bước 1 — Đăng nhập Botkeep
+Truy cập [botkeep.cloud/app](https://botkeep.cloud/app) và đăng nhập bằng tài khoản GitHub hoặc Discord.
 
-Truy cập [botkeep.cloud/app](https://botkeep.cloud/app) và đăng nhập bằng **GitHub** hoặc **Discord**.
+### Bước 2 — Tạo Server mới
+1. Click **"New Server"** (hoặc **"Create"**) trên dashboard.
+2. Chọn loại: **Application** (Python app).
+3. Chọn nguồn triển khai: **GitHub**.
 
-### Bước 2 — Tạo server mới
-
-1. Click **"New Server"** (hoặc **"Create"**) trên dashboard
-2. Chọn loại: **Application** (Python app)
-3. Chọn nguồn: **GitHub**
-
-### Bước 3 — Kết nối GitHub
-
-1. Click **"Connect GitHub"** → Botkeep sẽ yêu cầu cấp quyền qua GitHub App
-2. Chọn **"Only select repositories"** → chọn `hosting-Indicator`
-3. Click **"Install & Authorize"**
-
-> **Lưu ý:** Đây là cài đặt một lần. Sau này khi bạn push code mới lên GitHub, Botkeep có thể pull về tự động (nếu bật tùy chọn **pull-on-start**).
-
-### Bước 4 — Chọn Repository và Branch
-
-Trong cấu hình server Botkeep:
-
-| Trường | Giá trị |
-|---|---|
-| **Repository** | `vunguyen109/hosting-Indicator` |
-| **Branch** | `main` |
-| **Project root** | `/` (root, vì `requirements.txt` nằm ở root) |
-
-### Bước 5 — Xác nhận Runtime
-
-Botkeep sẽ tự động nhận diện:
-- **Runtime:** Python
-- **Dependency file:** `requirements.txt`
-- **Detected packages:** `aiohttp==3.9.5`
-
-Kiểm tra và xác nhận trước khi tiếp tục.
+### Bước 3 — Kết nối Repository
+1. Click **"Connect GitHub"** → cấp quyền cho Botkeep truy cập repo của bạn.
+2. Chọn repo `vunguyen109/hosting-Indicator` (hoặc tên repo bạn fork về).
+3. Cấu hình thông số:
+   - **Branch:** `main`
+   - **Project root:** `/` (thư mục gốc)
+   - **Runtime:** Python 3.11 hoặc 3.12 (Botkeep tự nhận diện qua `requirements.txt`)
 
 ---
 
-## 5. Cấu hình Secrets & Environment Variables
+## 6. Cấu hình Secrets & Environment Variables
 
-**Không** đặt API keys vào code hay file `.env` commit lên GitHub. Thay vào đó, cấu hình trực tiếp trong Botkeep dashboard:
+Trong giao diện quản lý server trên Botkeep, vào mục **Settings → Environment** (hoặc **Secrets**) để thêm các biến:
 
-### Secrets (thông tin nhạy cảm)
+| Biến môi trường | Bắt buộc? | Giá trị mẫu | Mô tả |
+|---|---|---|---|
+| `TWELVE_API_KEY` | **Bắt buộc** | `abc123xyz...` | Lấy miễn phí tại [twelvedata.com](https://twelvedata.com) |
+| `SERVER_PORT` | Tự động | *Botkeep tự cấp* | Botkeep tự gán port; engine tự động nhận diện |
+| `TG_BOT_TOKEN` | *Tùy chọn* | `123456:AAxxxx...` | Để trống nếu chưa có bot Telegram |
+| `TG_CHAT_ID` | *Tùy chọn* | `-100123456789` | Để trống nếu chưa có bot Telegram |
 
-Vào **Settings → Secrets** của server, thêm các biến sau:
-
-| Secret Name | Giá trị | Mô tả |
-|---|---|---|
-| `TG_BOT_TOKEN` | `123456789:AAxxxx...` | Token từ @BotFather |
-| `TG_CHAT_ID` | `-100123456789` | ID Telegram channel/group |
-| `TWELVE_API_KEY` | `abc123...` | TwelveData API key |
-
-### Cách lấy từng giá trị
-
-**Telegram Bot Token:**
-```
-1. Nhắn tin @BotFather trên Telegram
-2. Gõ /newbot → đặt tên bot
-3. Copy token dạng: 123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-**Telegram Chat ID:**
-```
-1. Thêm bot vào group/channel
-2. Gửi 1 tin nhắn bất kỳ trong group
-3. Truy cập: https://api.telegram.org/bot<TOKEN>/getUpdates
-4. Tìm "chat":{"id": ...} → đó là Chat ID
-   (Group/Channel ID thường có dấu âm, VD: -100123456789)
-```
-
-**TwelveData API Key:**
-```
-1. Đăng ký tại https://twelvedata.com (free, không cần thẻ)
-2. Dashboard → API Keys → Copy key
-   Free tier: 800 requests/ngày — đủ cho 3 assets x 2 timeframes
-```
+> 💡 **Mẹo:** Nếu bạn để trống `TG_BOT_TOKEN`, engine tự động chuyển sang chế độ **Web UI & Console Mode**, không phát sinh bất kỳ lỗi kết nối nào!
 
 ---
 
-## 6. Lệnh khởi động (Start Command)
+## 7. Lệnh khởi động (Start Command)
 
-Trong phần **Start Command** của Botkeep server, nhập:
+Trong ô **Start Command** trên Botkeep, nhập chính xác:
 
 ```bash
 python engine.py
 ```
 
-> **Không** dùng `python3`, `python3.11` hay bất kỳ prefix nào khác. Botkeep tự quản lý virtual environment và sẽ tìm đúng interpreter Python đã cài từ `requirements.txt`.
-
-### Kiểm tra start command hoạt động (local)
-
+### Chạy thử nghiệm trên máy tính cá nhân (Local Test)
 ```bash
-# Trên máy local, test trước khi deploy:
+# 1. Cài đặt thư viện
 pip install aiohttp==3.9.5
-TG_BOT_TOKEN=xxx TG_CHAT_ID=xxx TWELVE_API_KEY=xxx python engine.py
+
+# 2. Chạy engine (không cần token Telegram)
+python engine.py
+
+# 3. Mở trình duyệt xem Dashboard:
+# http://localhost:8080
 ```
 
-Output mong đợi khi khởi động thành công:
+Log khởi động thành công:
 ```
-2026-10-11T22:00:00 [INFO    ] indicator: ============================================================
-2026-10-11T22:00:00 [INFO    ] indicator:   HOSTING INDICATOR ENGINE v1.0  (low-resource edition)
-2026-10-11T22:00:00 [INFO    ] indicator:   Python 3.11.x
-2026-10-11T22:00:00 [INFO    ] indicator: ============================================================
-2026-10-11T22:00:00 [INFO    ] indicator: Pre-filling circular buffers with historical data...
-2026-10-11T22:00:05 [INFO    ] indicator:   [BTC 15m] loaded 300 candles
-2026-10-11T22:00:10 [INFO    ] indicator:   [XAU 15min] loaded 300 candles
-...
+============================================================
+  HOSTING INDICATOR ENGINE v1.0  (low-resource edition)
+  Python 3.12.x
+  Dashboard available at http://0.0.0.0:8080
+============================================================
+2026-10-11T23:30:00 [INFO    ] indicator: Telegram bot not configured -> Running in Web UI & Console mode.
+2026-10-11T23:30:00 [INFO    ] indicator: Web Dashboard listening on http://0.0.0.0:8080
+2026-10-11T23:30:00 [INFO    ] indicator: Pre-filling circular buffers with historical data...
+2026-10-11T23:30:02 [INFO    ] indicator:   [BTC 15m] loaded 300 candles
+2026-10-11T23:30:04 [INFO    ] indicator:   [BTC 1h] loaded 300 candles
+2026-10-11T23:30:06 [INFO    ] indicator:   [XAU 15min] loaded 300 candles
+2026-10-11T23:30:08 [INFO    ] indicator:   [OIL 15min] loaded 300 candles
+2026-10-11T23:30:10 [INFO    ] indicator: All 8 tasks started -- engine running 24/7
 ```
 
 ---
 
-## 7. Giám sát và vận hành
+## 8. Cấu hình Web Domain & Giám sát trên Botkeep
 
-### 7.1. Xem Live Output trên Botkeep
+### 8.1. Mở Web UI qua Internet (Public Access)
+Theo tài liệu chuẩn của Botkeep ([botkeep.cloud/docs/hosting](https://botkeep.cloud/docs/hosting)):
+1. Vào tab **Network** của server: Xem port được hệ thống gán.
+2. Vào tab **Domains**:
+   - Thêm một domain (hoặc subdomain miễn phí do Botkeep cung cấp dạng `ten-app.botkeep.cloud`).
+   - Trỏ domain vào port của service.
+3. **Mở trình duyệt:** Truy cập `https://ten-app.botkeep.cloud` để xem Dashboard realtime từ bất kỳ đâu (điện thoại, máy tính bảng, PC).
 
-Botkeep cung cấp **Live output streaming** trực tiếp trên dashboard. Click vào server → tab **"Console"** hoặc **"Output"** để xem log realtime.
-
-### 7.2. Tín hiệu Telegram
-
-Khi engine hoạt động, bạn sẽ nhận được:
-
-| Loại tin nhắn | Khi nào |
-|---|---|
-| `[ENGINE STARTED]` | Mỗi lần service khởi động |
-| `[GOLDEN CROSS]` | EMA20 vượt lên EMA50 |
-| `[DEATH CROSS]` | EMA20 xuống dưới EMA50 |
-| `[RSI OVERBOUGHT]` | RSI vượt 70 |
-| `[RSI OVERSOLD]` | RSI dưới 30 |
-| `[BB BREAKOUT UP/DOWN]` | Giá bứt phá Bollinger Bands |
-| `[ATR SPIKE]` | Biến động đột ngột x1.5 |
-| `[DISK ALERT]` | Disk > 70% — cần dọn log |
-
-### 7.3. Kiểm tra RAM và CPU
-
-Botkeep hiển thị **live resource monitoring** (Memory, CPU, Storage) ngay trên dashboard server. RAM target: dưới 150 MB là bình thường.
-
-### 7.4. Restart Service
-
-Trên Botkeep dashboard:
-- **Restart** — Khởi động lại (dùng khi thay đổi secrets)
-- **Stop / Start** — Dừng và bật lại thủ công
+### 8.2. Xem qua Tab Console (Nếu không cấu hình Domain)
+Nếu bạn không muốn public domain ra ngoài internet:
+- Vào tab **Console / Output** trên Botkeep.
+- Toàn bộ giá đóng cửa, RSI, ATR và tín hiệu `>> [SIGNAL DETECTED]` sẽ được in rõ ràng theo từng chu kỳ nến (15 phút, 1 giờ).
 
 ---
 
-## 8. Cập nhật code (Deploy revision mới)
+## 9. Cập nhật code (Deploy revision mới)
 
-### Quy trình cập nhật code
-
+Khi bạn chỉnh sửa code hoặc logic chỉ báo:
 ```bash
-# 1. Chỉnh sửa engine.py hoặc file khác trên máy local
-# 2. Commit và push lên GitHub
-git add engine.py
-git commit -m "fix: BB edge-trigger dedup để tránh spam Telegram"
+git add engine.py README.md
+git commit -m "feat: enhance web dashboard indicators"
 git push origin main
 ```
 
-### Pull revision mới trên Botkeep
-
-1. Vào dashboard server → tab **"GitHub"**
-2. Click **"Check for updates"** — Botkeep hiển thị danh sách file thay đổi
-3. Review changed files (đọc kỹ trước khi apply)
-4. Click **"Apply update"** → chọn **"Restart"** sau khi import
-5. Theo dõi quá trình build/pull trong console
-
-> **⚠️ Lưu ý:** Đây **không phải** zero-downtime deployment. Trong lúc restart (~10-30 giây), engine không poll candle. Chọn thời điểm ít tín hiệu nhất để update (VD: ngoài giờ giao dịch chính).
-
-### Kích hoạt Pull-on-Start (tùy chọn)
-
-Nếu muốn Botkeep tự pull code mới nhất từ GitHub mỗi khi server restart:
-
-1. Settings → **"Pull on start"** → Enable
-2. Engine sẽ luôn dùng code mới nhất từ `main` branch sau mỗi lần restart
+Trên Botkeep dashboard:
+1. Vào tab **GitHub** → Click **"Check for updates"**.
+2. Click **"Apply update"** → Chọn **"Restart"**.
+3. Service sẽ khởi động lại với code mới nhất trong vòng 10 giây.
 
 ---
 
-## 9. Xử lý sự cố thường gặp
+## 10. Xử lý sự cố thường gặp
 
-### ❌ Engine không khởi động — `ModuleNotFoundError: No module named 'aiohttp'`
+### ❌ Web Dashboard không truy cập được trên Botkeep
+- **Kiểm tra Host binding:** Code đã cấu hình mặc định bind vào `0.0.0.0` và tự đọc `SERVER_PORT`.
+- **Kiểm tra Domains:** Đảm bảo bạn đã cấu hình mục **Domains** trên Botkeep trỏ vào đúng port tại tab **Network**.
 
-**Nguyên nhân:** Botkeep chưa cài dependencies.  
-**Giải pháp:** Kiểm tra `requirements.txt` có ở root repo và nội dung đúng:
-```
-aiohttp==3.9.5
-```
-Sau đó restart server.
+### ❌ Lỗi TwelveData `status: error`
+- Kiểm tra đã nhập biến `TWELVE_API_KEY` trong mục Environment chưa.
+- Gói Free của TwelveData giới hạn 8 req/phút: engine đã tích hợp sẵn throttle 8 giây giữa các request để đảm bảo không bao giờ bị rate-limit.
 
----
-
-### ❌ Không nhận được tin nhắn Telegram
-
-**Kiểm tra theo thứ tự:**
-1. Secret `TG_BOT_TOKEN` đã được nhập đúng định dạng chưa? (`123456789:AAxxxx...`)
-2. Secret `TG_CHAT_ID` có đúng không? (Group ID phải có dấu `-`, VD: `-100xxx`)
-3. Bot đã được thêm vào group/channel chưa?
-4. Bot có quyền gửi tin nhắn trong group không?
-
-Xem log trên Botkeep console — tìm dòng có `[SIGNAL FAIL]` hoặc `Telegram HTTP`.
+### ❌ File state và log báo lỗi Permission
+- Code đã chuyển sang dùng đường dẫn tương đối (`./data/state.json` và `./logs/app.log`), tự động tạo thư mục con mà không cần quyền root `/opt`.
 
 ---
 
-### ❌ TwelveData trả lỗi `status: error`
+## 11. Giới hạn tài nguyên & Hiệu năng
 
-**Nguyên nhân thường gặp:**
-- API key sai → Kiểm tra lại secret `TWELVE_API_KEY`
-- Vượt 800 req/ngày free tier → Chờ reset lúc 00:00 UTC hôm sau
-- Symbol không hỗ trợ → Kiểm tra `XAU/USD` và `WTI/USD` là đúng format
-
----
-
-### ❌ Service liên tục restart (crash loop)
-
-**Xem log console Botkeep** để tìm exception. Các nguyên nhân phổ biến:
-- `FileNotFoundError` → Path `/opt/indicator/data/` không tồn tại trên Botkeep — cần sửa `CONFIG["state_file"]` thành path tương đối (VD: `./data/state.json`)
-- OOM → RAM vượt giới hạn → Kiểm tra có đang import numpy/pandas không
-
----
-
-### ❌ Disk alert > 70%
-
-Engine sẽ tự gửi Telegram alert. Để dọn dẹp:
-1. Xóa log backup cũ qua terminal Botkeep (nếu có web terminal)
-2. Hoặc restart server — Botkeep sẽ reset sandbox
-3. Kiểm tra `RotatingFileHandler` đã cấu hình đúng `maxBytes` chưa
-
----
-
-## 10. Giới hạn tài nguyên
-
-### Botkeep Free Plan (Founder Tier)
-
-| Tài nguyên | Giới hạn |
-|---|---|
-| RAM | 2 GB (chia sẻ) |
-| CPU | 1.5 vCore (chia sẻ) |
-| Disk | 2 GB |
-| Server slots | 5 slots |
-| Uptime | 24/7 liên tục |
-| Backups | 2 bản / 14 ngày giữ |
-
-### Engine sử dụng thực tế
-
-| Component | RAM | Disk |
+| Thành phần | Tiêu thụ RAM | Tiêu thụ Disk |
 |---|---|---|
-| Python Runtime + aiohttp | ~20 MB | ~5 MB |
-| Circular Buffers (6 buffers) | ~0.3 MB | 0 |
-| state.json | — | <2 MB |
-| Logs (rotating) | — | <15 MB |
-| Safety buffer | ~90 MB | — |
-| **Tổng** | **~110 MB** | **~22 MB** |
+| Python Runtime + aiohttp + Web Server | ~25 MB | ~5 MB |
+| 6 Circular Buffers (300 nến x 6) | ~0.5 MB | 0 MB |
+| Bộ đệm 50 tín hiệu gần nhất | ~0.1 MB | 0 MB |
+| File state (`./data/state.json`) | — | < 1.5 MB |
+| File logs xoay vòng (Rotating 5MB x 2) | — | < 15 MB |
+| Vùng đệm an toàn (Safety Buffer) | ~85 MB | — |
+| **Tổng cộng** | **~115 MB / 2 GB** | **~21.5 MB / 2 GB** |
 
-Engine chiếm ~5.5% RAM và ~1.1% Disk của giới hạn Botkeep Free Plan.
-
----
-
-## Signals Reference
-
-| Signal | Điều kiện kỹ thuật |
-|---|---|
-| `EMA_CROSS_UP` | EMA20 cắt lên trên EMA50 (Golden Cross) |
-| `EMA_CROSS_DOWN` | EMA20 cắt xuống dưới EMA50 (Death Cross) |
-| `RSI_OVERBOUGHT` | RSI(14) vượt ngưỡng 70 (lần đầu) |
-| `RSI_OVERSOLD` | RSI(14) xuống dưới 30 (lần đầu) |
-| `BB_BREAKOUT_UP` | Close > BB Upper (2σ), lần đầu vào vùng |
-| `BB_BREAKOUT_DOWN` | Close < BB Lower (2σ), lần đầu vào vùng |
-| `ATR_SPIKE` | ATR hiện tại > 1.5 × ATR trước |
+=> **Chiếm chưa tới 6% tài nguyên của gói Botkeep Free**.
 
 ---
 
-*Docs: [botkeep.cloud/docs/github](https://botkeep.cloud/docs/github) · [botkeep.cloud/docs/python](https://botkeep.cloud/docs/python)*  
-*Repo: [github.com/vunguyen109/hosting-Indicator](https://github.com/vunguyen109/hosting-Indicator)*
+## 12. Bảng tham chiếu tín hiệu (Signals Reference)
 
-#   h o s t i n g - I n d i c a t o r  
- 
+| Mã Tín Hiệu | Điều kiện kích hoạt | Phân loại |
+|---|---|---|
+| `EMA_CROSS_UP` | EMA 20 cắt lên trên EMA 50 | **Golden Cross (Tăng giá)** |
+| `EMA_CROSS_DOWN` | EMA 20 cắt xuống dưới EMA 50 | **Death Cross (Giảm giá)** |
+| `RSI_OVERSOLD` | RSI(14) giảm xuống dưới 30 | **Quá bán (Cơ hội Mua)** |
+| `RSI_OVERBOUGHT` | RSI(14) tăng vượt 70 | **Quá mua (Cơ hội Chốt lời)** |
+| `BB_BREAKOUT_UP` | Giá đóng cửa vượt dải trên Bollinger Band | **Biến động bứt phá tăng** |
+| `BB_BREAKOUT_DOWN` | Giá đóng cửa thủng dải dưới Bollinger Band | **Biến động bứt phá giảm** |
+| `ATR_SPIKE` | ATR hiện tại tăng đột biến > 1.5 lần ATR trước | **Cảnh báo biến động mạnh** |
+
+---
+
+*Hỗ trợ & Tài liệu Botkeep:* [botkeep.cloud/docs](https://botkeep.cloud/docs)  
+*Repository GitHub:* [github.com/vunguyen109/hosting-Indicator](https://github.com/vunguyen109/hosting-Indicator)
