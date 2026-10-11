@@ -1,0 +1,6 @@
+# Hosting Indicator Engine -- minimal dependency list
+# Only ONE non-stdlib package: aiohttp for async HTTP.
+# aiohttp brings in: attrs, aiosignal, frozenlist, multidict, yarl, async-timeout
+# Total install footprint: ~5 MB on disk
+
+aiohttp==3.9.5
