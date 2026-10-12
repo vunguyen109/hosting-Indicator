@@ -1,59 +1,54 @@
-# KẾ HOẠCH NÂNG CẤP: THIẾT LẬP TWELVE_API_KEY & TELEGRAM TRỰC TIẾP TRÊN WEB UI
+# KẾ HOẠCH DỌN DẸP CÁC XỬ LÝ & FILE CŨ KHÔNG CÒN SỬ DỤNG
 **Dự án**: Hosting Indicator Engine (`vunguyen109/hosting-Indicator`)  
 **Tác giả**: CTO AI Assistant  
 **Trạng thái**: Chờ phê duyệt (Pending Approval)  
 
 ---
 
-## 1. Mục tiêu & Bài toán thực tế
+## 1. Rà soát hiện trạng (Audit Findings)
 
-Trên giao diện Botkeep (và nhiều nền tảng container khác), người dùng không thể nhập biến môi trường ở bước tạo server ban đầu, hoặc việc cấu hình biến môi trường trên panel đòi hỏi phải restart lại container.
+Dự án hiện tại đã chuyển đổi hoàn toàn sang kiến trúc **Container PaaS / Botkeep-first** với Web Dashboard tích hợp và cơ chế Zero-ENV / UI Config. Tuy nhiên, trong repository vẫn còn tồn đọng 4 file di tích cũ từ mô hình triển khai trên VPS Linux truyền thống (`/opt/indicator`):
 
-**Giải pháp**: Tích hợp một bảng điều khiển **"⚙️ System Configuration"** trực tiếp trên Web Dashboard UI:
-- Người dùng chỉ cần mở Web Dashboard bằng trình duyệt (hoặc qua domain/IP Botkeep cấp).
-- Nhập `TWELVE_API_KEY` (và token Telegram nếu muốn) trực tiếp vào form trên giao diện web.
-- Bấm nút **"Save & Connect"**.
-- Backend tự động áp dụng ngay trong runtime mà không cần restart server, nạp nến Vàng (XAU) & Dầu (WTI) ngay lập tức, đồng thời lưu cấu hình vào file để duy trì sau mỗi lần restart container!
-
----
-
-## 2. Thiết kế chi tiết hệ thống
-
-### 2.1. Phía Frontend (Web Dashboard UI - `HTML_DASHBOARD`)
-1. **Thêm Card "⚙️ API & Notifications Settings"**:
-   - Trường nhập `TwelveData API Key` (có nút ẩn/hiện key).
-   - Badge trạng thái kết nối realtime:
-     - 🟡 `NOT CONFIGURED (Running BTC only)` nếu chưa có key.
-     - 🟢 `CONNECTED (Tracking XAU & OIL)` khi đã có key.
-   - Trường nhập `Telegram Bot Token` & `Chat ID` (Tùy chọn).
-   - Nút hành động: **"Save & Apply"** với animation loading và Toast thông báo kết quả.
-2. **Cập nhật JS Fetcher**:
-   - Gọi API `POST /api/config` gửi dữ liệu cấu hình.
-   - Cập nhật trạng thái badge theo dữ liệu trả về từ `/api/snapshot`.
-
-### 2.2. Phía Backend (`engine.py`)
-1. **Endpoint mới: `POST /api/config`**:
-   - Tiếp nhận JSON payload: `{ "twelvedata_api_key": "...", "telegram_bot_token": "...", "telegram_chat_id": "..." }`.
-   - Cập nhật trực tiếp vào đối tượng `TwelveDataFetcher`:
-     - Gán API Key mới.
-     - Đặt `is_configured = True`.
-     - Kích hoạt tác vụ nền nạp nến lịch sử cho XAU và OIL (`_reload_assets(["XAU", "OIL"])`).
-   - Cập nhật `TelegramDispatcher` nếu có token mới.
-   - **Ghi bền vững (Persistence)**: Tự động ghi/cập nhật vào file `.env` trên đĩa để khi container khởi động lại trong tương lai, cấu hình vẫn được giữ nguyên 100%!
-2. **Endpoint `GET /api/snapshot`**:
-   - Bổ sung trường `twelvedata_configured: bool` và `twelvedata_key_masked: str` để frontend hiển thị đúng trạng thái.
+| File cần dọn dẹp | Mục đích cũ | Lý do không còn dùng đến trên Botkeep |
+|---|---|---|
+| [`setup.sh`](file:///d:/project/hosting-Indicator/setup.sh) | Script cài đặt root user, venv, systemd trên Ubuntu VPS | Botkeep tự động chạy container độc lập, không dùng root setup script này |
+| [`indicator-engine.service`](file:///d:/project/hosting-Indicator/indicator-engine.service) | File unit systemd để quản lý daemon trên VPS vật lý | Botkeep/Docker tự quản lý vòng đời tiến trình (Process Lifecycle), không có systemd |
+| [`logrotate.conf`](file:///d:/project/hosting-Indicator/logrotate.conf) | Cấu hình xoay vòng log của hệ điều hành Linux | Trong [`engine.py`](file:///d:/project/hosting-Indicator/engine.py) đã có sẵn `RotatingFileHandler` (max 15MB) tự động, không cần OS logrotate |
+| [`crontab.example`](file:///d:/project/hosting-Indicator/crontab.example) | Cron job dọn dẹp file tạm và kiểm tra tiến trình định kỳ | Engine tự dọn và giám sát bằng `asyncio` 24/7 bên trong tiến trình |
 
 ---
 
-## 3. Các bước thực hiện
+## 2. Kế hoạch hành động chi tiết
 
-1. **Cập nhật [`engine.py`](file:///d:/project/hosting-Indicator/engine.py)**:
-   - Thêm hàm `_save_env_file(key, value)`.
-   - Thêm method `_reload_assets()` trong `IndicatorOrchestrator` để nạp nến ngay khi có key mới.
-   - Thêm route handler `handle_save_config` cho `POST /api/config` trong `DashboardServer`.
-   - Cập nhật `HTML_DASHBOARD` với giao diện Settings Card & form xử lý AJAX.
-2. **Cập nhật [`test_engine.py`](file:///d:/project/hosting-Indicator/test_engine.py)**:
-   - Viết test case kiểm tra endpoint `POST /api/config` và kiểm tra nạp key động trong runtime.
-3. **Kiểm thử tự động & Đẩy code lên GitHub**:
-   - Chạy toàn bộ test suite.
-   - Commit và push lên nhánh `main` để Botkeep tự động kéo bản mới nhất.
+### Bước 1: Xóa các file thừa khỏi Git và Workspace
+- Xóa 4 file di tích cũ:
+  - `setup.sh`
+  - `indicator-engine.service`
+  - `logrotate.conf`
+  - `crontab.example`
+- Lệnh thực hiện: `git rm setup.sh indicator-engine.service logrotate.conf crontab.example`
+
+### Bước 2: Rà soát và chuẩn hóa mã nguồn [`engine.py`](file:///d:/project/hosting-Indicator/engine.py)
+- Đảm bảo không còn bất kỳ import thừa hoặc đường dẫn tuyệt đối nào liên quan đến `/opt/indicator`.
+- Giữ nguyên các hàm cốt lõi và các test cases.
+
+### Bước 3: Kiểm thử tự động (Unit Test Verification)
+- Chạy toàn bộ test suite [`test_engine.py`](file:///d:/project/hosting-Indicator/test_engine.py) để khẳng định 100% chức năng không bị ảnh hưởng sau khi dọn dẹp.
+
+### Bước 4: Commit và Push lên GitHub
+- Tạo commit dọn dẹp: `chore: remove legacy VPS scripts (systemd, setup.sh, logrotate, crontab)`
+- Đẩy lên nhánh `main` để đồng bộ hoàn toàn với GitHub.
+
+---
+
+## 3. Cấu trúc thư mục tinh gọn sau dọn dẹp
+```
+hosting-Indicator/
+├── engine.py              ← Core Quant Engine + Web Dashboard + UI Config
+├── requirements.txt       ← Dependency siêu nhẹ (aiohttp==3.9.5)
+├── test_engine.py         ← Bộ kiểm thử tự động
+├── .env.example           ← Biến môi trường mẫu
+├── .gitignore             ← Chặn các file rác/cache
+├── implementation_plan.md ← Tài liệu kế hoạch phát triển
+└── README.md              ← Hướng dẫn triển khai chuẩn cho Botkeep
+```
