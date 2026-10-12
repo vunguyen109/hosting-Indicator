@@ -3,7 +3,8 @@ import os
 import unittest
 from engine import (
     Candle, CircularBuffer, IndicatorEngine, RuleEngine,
-    Signal, TelegramDispatcher, DashboardServer, IndicatorOrchestrator, CONFIG
+    Signal, TelegramDispatcher, DashboardServer, IndicatorOrchestrator,
+    TwelveDataFetcher, CONFIG, _parse_port, _load_dotenv
 )
 
 class TestEngine(unittest.TestCase):
@@ -43,6 +44,45 @@ class TestEngine(unittest.TestCase):
         orch = IndicatorOrchestrator()
         server = DashboardServer(orch, "127.0.0.1", 8080)
         self.assertIsNotNone(server._app)
+        # Check routes exist: /, /health, /api/snapshot, /api/health
+        routes = [r.resource.canonical for r in server._app.router.routes()]
+        self.assertIn("/", routes)
+        self.assertIn("/health", routes)
+        self.assertIn("/api/health", routes)
+        self.assertIn("/api/snapshot", routes)
+
+    def test_parse_port_safety(self):
+        # Empty string should fallback to default
+        os.environ["SERVER_PORT"] = ""
+        os.environ["PORT"] = ""
+        self.assertEqual(_parse_port(8080), 8080)
+
+        # Leading colon format should be parsed correctly
+        os.environ["SERVER_PORT"] = ":3000"
+        self.assertEqual(_parse_port(8080), 3000)
+
+        # Standard number string
+        os.environ["SERVER_PORT"] = "9000"
+        self.assertEqual(_parse_port(8080), 9000)
+
+        # Invalid string should fallback
+        os.environ["SERVER_PORT"] = "invalid_port"
+        self.assertEqual(_parse_port(8080), 8080)
+
+        # Cleanup
+        os.environ.pop("SERVER_PORT", None)
+        os.environ.pop("PORT", None)
+
+    def test_twelvedata_zero_env_bypass(self):
+        fetcher = TwelveDataFetcher(None, "")
+        self.assertFalse(fetcher.is_configured)
+        candles = asyncio.run(fetcher.fetch_candles("XAU/USD", "15min"))
+        self.assertEqual(candles, [])
+
+        fetcher_placeholder = TwelveDataFetcher(None, "YOUR_TWELVE_KEY")
+        self.assertFalse(fetcher_placeholder.is_configured)
+        candles2 = asyncio.run(fetcher_placeholder.fetch_candles("WTI/USD", "1h"))
+        self.assertEqual(candles2, [])
 
 if __name__ == "__main__":
     unittest.main()

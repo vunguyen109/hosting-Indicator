@@ -31,8 +31,55 @@ from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
+# Force stdout/stderr unbuffered mode immediately for cloud container environments (Botkeep/Docker)
+os.environ["PYTHONUNBUFFERED"] = "1"
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+print("[BOOT] Indicator Engine bootstrapping...", flush=True)
+
 import aiohttp  # pip install aiohttp
 from aiohttp import web
+
+
+def _load_dotenv(filepath: str = ".env") -> None:
+    """Zero-dependency .env loader using standard library only."""
+    if not os.path.exists(filepath):
+        return
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
+
+def _parse_port(default: int = 8080) -> int:
+    """Safely parse web port from environment variables, handling empty/invalid strings."""
+    raw = os.environ.get("SERVER_PORT") or os.environ.get("PORT")
+    if not raw:
+        return default
+    raw_clean = str(raw).strip().lstrip(":")
+    try:
+        port = int(raw_clean)
+        return port if 1 <= port <= 65535 else default
+    except (ValueError, TypeError):
+        return default
 
 
 # =============================================================================
@@ -43,16 +90,16 @@ CONFIG = {
     # ---- Web Dashboard --------------------------------------------------
     # Botkeep assigns port via SERVER_PORT, or standard PORT env var
     "web_host":           os.environ.get("HOST", "0.0.0.0"),
-    "web_port":           int(os.environ.get("SERVER_PORT", os.environ.get("PORT", "8080"))),
+    "web_port":           _parse_port(8080),
 
     # ---- Telegram -------------------------------------------------------
     # Optional: If not provided or default placeholder, engine runs in Web/Console mode
-    "telegram_bot_token": os.environ.get("TG_BOT_TOKEN", "YOUR_BOT_TOKEN"),
-    "telegram_chat_id":   os.environ.get("TG_CHAT_ID",   "YOUR_CHAT_ID"),
+    "telegram_bot_token": os.environ.get("TG_BOT_TOKEN", "").strip(),
+    "telegram_chat_id":   os.environ.get("TG_CHAT_ID",   "").strip(),
 
     # ---- API Keys -------------------------------------------------------
     # TwelveData free tier: 800 requests/day (~33/hour). Used for XAU & OIL.
-    "twelvedata_api_key": os.environ.get("TWELVE_API_KEY", "YOUR_TWELVE_KEY"),
+    "twelvedata_api_key": os.environ.get("TWELVE_API_KEY", "").strip(),
 
     # ---- Asset definitions ----------------------------------------------
     "assets": {
@@ -461,16 +508,18 @@ class TelegramDispatcher:
     _API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
     def __init__(self, token: str, chat_id: str) -> None:
-        self._token   = token
-        self._chat_id = chat_id
+        token_str = (token or "").strip()
+        chat_id_str = (chat_id or "").strip()
+        self._token   = token_str
+        self._chat_id = chat_id_str
         self._session: Optional[aiohttp.ClientSession] = None
         self._is_enabled = bool(
-            token
-            and token.strip()
-            and token != "YOUR_BOT_TOKEN"
-            and chat_id
-            and chat_id.strip()
-            and chat_id != "YOUR_CHAT_ID"
+            token_str
+            and not token_str.startswith("YOUR_")
+            and not token_str.startswith("your_")
+            and chat_id_str
+            and not chat_id_str.startswith("YOUR_")
+            and not chat_id_str.startswith("your_")
         )
         if self._is_enabled:
             logger.info("Telegram notification is ENABLED.")
@@ -574,13 +623,22 @@ class TwelveDataFetcher:
 
     def __init__(self, session: aiohttp.ClientSession, api_key: str) -> None:
         self._session      = session
-        self._api_key      = api_key
+        self._api_key      = (api_key or "").strip()
         self._last_call    = 0.0
         self._min_gap      = 8.0   # seconds -- stays within 8 req/min
+        self.is_configured = bool(
+            self._api_key
+            and not self._api_key.startswith("YOUR_")
+            and not self._api_key.startswith("your_")
+        )
+        if not self.is_configured:
+            logger.info("TwelveData API key not set -> Skipping Gold & Oil requests (Zero-ENV standalone mode).")
 
     async def fetch_candles(
         self, symbol: str, interval: str, limit: int = 300
     ) -> list[Candle]:
+        if not self.is_configured:
+            return []
         # Throttle: wait until min_gap has elapsed since last request
         gap = time.time() - self._last_call
         if gap < self._min_gap:
@@ -1189,6 +1247,7 @@ class DashboardServer:
         self._port         = port
         self._app          = web.Application()
         self._app.router.add_get("/",             self.handle_index)
+        self._app.router.add_get("/health",       self.handle_health)
         self._app.router.add_get("/api/snapshot", self.handle_snapshot)
         self._app.router.add_get("/api/health",   self.handle_health)
         self._runner: Optional[web.AppRunner] = None
@@ -1425,36 +1484,50 @@ class IndicatorOrchestrator:
 
 def setup_logging() -> logging.Logger:
     """
-    Rotating file logger + stdout handler.
+    Rotating file logger + unbuffered stdout handler.
     5 MB per file, 2 backup files => max 15 MB logs on disk.
+    Gracefully falls back to stdout if file write permission is denied in container.
     """
-    log_dir = os.path.dirname(CONFIG["log_file"])
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-    fh = RotatingFileHandler(
-        CONFIG["log_file"],
-        maxBytes=CONFIG["log_max_bytes"],
-        backupCount=CONFIG["log_backup_count"],
-        encoding="utf-8",
-    )
-    fh.setFormatter(fmt)
-    fh.setLevel(logging.DEBUG)
+    handlers: list[logging.Handler] = []
+
+    try:
+        log_dir = os.path.dirname(CONFIG["log_file"])
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        fh = RotatingFileHandler(
+            CONFIG["log_file"],
+            maxBytes=CONFIG["log_max_bytes"],
+            backupCount=CONFIG["log_backup_count"],
+            encoding="utf-8",
+        )
+        fh.setFormatter(fmt)
+        fh.setLevel(logging.DEBUG)
+        handlers.append(fh)
+    except Exception as exc:
+        print(f"[WARN] Cannot create file logger ({exc}) -> Fallback to Console-only", flush=True)
+
     try:
         if hasattr(sys.stdout, "reconfigure"):
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     except Exception:
         pass
+
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     ch.setLevel(logging.INFO)
+    handlers.append(ch)
+
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    root.addHandler(fh)
-    root.addHandler(ch)
+    # Clear existing handlers to prevent duplicate lines
+    root.handlers.clear()
+    for h in handlers:
+        root.addHandler(h)
+
     return logging.getLogger("indicator")
 
 
@@ -1462,15 +1535,30 @@ logger = setup_logging()
 
 
 def main() -> None:
-    logger.info("=" * 60)
-    logger.info("  HOSTING INDICATOR ENGINE v1.0  (low-resource edition)")
-    logger.info(f"  Python {sys.version.split()[0]}")
-    logger.info(f"  Dashboard available at http://{CONFIG['web_host']}:{CONFIG['web_port']}")
-    logger.info("=" * 60)
     try:
+        logger.info("=" * 60)
+        logger.info("  HOSTING INDICATOR ENGINE v1.0  (low-resource edition)")
+        logger.info(f"  Python {sys.version.split()[0]}")
+        logger.info(f"  Dashboard available at http://{CONFIG['web_host']}:{CONFIG['web_port']}")
+        logger.info("=" * 60)
         asyncio.run(IndicatorOrchestrator().run())
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt -- shutting down.")
+        logger.info("KeyboardInterrupt -- shutting down cleanly.")
+    except BaseException as exc:
+        import traceback
+        print("\n" + "!" * 60, file=sys.stderr, flush=True)
+        print(f"  [FATAL BOOT CRASH] Unhandled Exception: {exc}", file=sys.stderr, flush=True)
+        print("  Traceback:", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        print("!" * 60 + "\n", file=sys.stderr, flush=True)
+        try:
+            sys.stderr.flush()
+            sys.stdout.flush()
+        except Exception:
+            pass
+        # Pause 15 seconds so cloud dashboard has time to ingest and display full error logs
+        time.sleep(15)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -141,11 +141,16 @@ Trong giao diện quản lý server trên Botkeep, vào mục **Settings → Env
 
 ## 7. Lệnh khởi động (Start Command)
 
-Trong ô **Start Command** trên Botkeep, nhập chính xác:
+Trong ô **Start Command** trên Botkeep, nhập lệnh khuyến nghị để đảm bảo tự động cài thư viện và hiển thị log trực tiếp (unbuffered):
 
 ```bash
-python engine.py
+pip install -r requirements.txt && python -u engine.py
 ```
+
+*(Hoặc nếu Botkeep đã có sẵn aiohttp: `python -u engine.py`)*
+
+> 💡 **Cờ `-u` (Unbuffered):** Cực kỳ quan trọng trên container PaaS/Botkeep, giúp toàn bộ log và traceback được đẩy trực tiếp ra màn hình console ngay lập tức, không bị giữ lại trong bộ đệm.
+> 💡 **Chế độ Zero-ENV:** Khi vừa tạo server trên Botkeep, bạn chưa thể nhập ENV ngay. Engine đã tích hợp sẵn chế độ an toàn: tự động chạy BTC (Binance không cần key), bỏ qua nến Vàng/Dầu trong 0 giây, và mở Dashboard ngay lập tức để vượt qua Health Check của Botkeep mà không bao giờ bị restart liên tục! Sau khi server chạy ổn định, bạn có thể vào mục Settings để thêm `TWELVE_API_KEY` nếu muốn kích hoạt thêm Vàng & Dầu.
 
 ### Chạy thử nghiệm trên máy tính cá nhân (Local Test)
 ```bash
