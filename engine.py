@@ -69,6 +69,39 @@ def _load_dotenv(filepath: str = ".env") -> None:
 _load_dotenv()
 
 
+def _update_dotenv(updates: dict[str, str], filepath: str = ".env") -> None:
+    """Safely update or append key-value pairs to .env file."""
+    lines: list[str] = []
+    keys_updated: set[str] = set()
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            lines = []
+
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k = stripped.split("=", 1)[0].strip()
+            if k in updates:
+                new_lines.append(f"{k}={updates[k]}\n")
+                keys_updated.add(k)
+                continue
+        new_lines.append(line)
+
+    for k, v in updates.items():
+        if k not in keys_updated and v:
+            new_lines.append(f"{k}={v}\n")
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+    except Exception as exc:
+        print(f"[WARN] Failed to write to {filepath}: {exc}", flush=True)
+
+
 def _parse_port(default: int = 8080) -> int:
     """Safely parse web port from environment variables, handling empty/invalid strings."""
     raw = os.environ.get("SERVER_PORT") or os.environ.get("PORT")
@@ -563,6 +596,24 @@ class TelegramDispatcher:
         ok = await self.send(sig.message)
         logger.info(f"[SIGNAL {'SENT' if ok else 'FAIL'}] {sig.asset} {sig.timeframe} {sig.signal_type}")
 
+    def update_config(self, token: str, chat_id: str) -> None:
+        token_str = (token or "").strip()
+        chat_id_str = (chat_id or "").strip()
+        self._token   = token_str
+        self._chat_id = chat_id_str
+        self._is_enabled = bool(
+            token_str
+            and not token_str.startswith("YOUR_")
+            and not token_str.startswith("your_")
+            and chat_id_str
+            and not chat_id_str.startswith("YOUR_")
+            and not chat_id_str.startswith("your_")
+        )
+        if self._is_enabled:
+            logger.info("Telegram notification ENABLED dynamically via UI!")
+        else:
+            logger.info("Telegram bot disabled or incomplete token.")
+
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
@@ -633,6 +684,17 @@ class TwelveDataFetcher:
         )
         if not self.is_configured:
             logger.info("TwelveData API key not set -> Skipping Gold & Oil requests (Zero-ENV standalone mode).")
+
+    def update_key(self, new_key: str) -> None:
+        clean = (new_key or "").strip()
+        self._api_key = clean
+        self.is_configured = bool(
+            clean
+            and not clean.startswith("YOUR_")
+            and not clean.startswith("your_")
+        )
+        if self.is_configured:
+            logger.info("TwelveData API key configured dynamically via Web UI!")
 
     async def fetch_candles(
         self, symbol: str, interval: str, limit: int = 300
@@ -1040,6 +1102,61 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Live Configuration Panel on Web UI -->
+    <div class="table-card" style="margin-bottom: 24px;">
+      <div class="table-header" style="cursor: pointer;" onclick="toggleConfigPanel()">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <h2>⚙️ System & API Configuration</h2>
+          <span class="pill" id="twelveStatusPill" style="font-size:0.75rem;">Detecting...</span>
+        </div>
+        <span style="font-size: 0.8rem; color: var(--accent); font-weight: 600;" id="configToggleText">Show / Edit Settings ▼</span>
+      </div>
+      <div id="configPanelBody" style="padding: 20px; display: block; border-top: 1px solid var(--card-border);">
+        <form id="configForm" onsubmit="saveConfiguration(event)">
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px;">
+            <div>
+              <label style="display: block; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); margin-bottom: 6px;">
+                TWELVEDATA API KEY (Gold & Crude Oil)
+              </label>
+              <div style="display: flex; gap: 8px;">
+                <input type="password" id="twelveKeyInput" placeholder="Nhập TwelveData API Key..." 
+                  style="flex: 1; background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff; padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; outline: none;">
+                <button type="button" onclick="togglePasswordVis('twelveKeyInput')" 
+                  style="background: rgba(255,255,255,0.08); border: 1px solid var(--card-border); color: var(--text-muted); padding: 0 12px; border-radius: 8px; cursor: pointer;">👁️</button>
+              </div>
+              <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">Miễn phí 800 req/ngày tại <a href="https://twelvedata.com" target="_blank" style="color: var(--accent); text-decoration: underline;">twelvedata.com</a>. Để trống để chạy riêng BTC.</p>
+            </div>
+
+            <div>
+              <label style="display: block; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); margin-bottom: 6px;">
+                TELEGRAM BOT TOKEN (Tùy chọn)
+              </label>
+              <input type="password" id="tgTokenInput" placeholder="123456:ABC-DEF..." 
+                style="width: 100%; background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff; padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; outline: none;">
+              <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">Để trống nếu chỉ xem qua Web UI & Logs.</p>
+            </div>
+
+            <div>
+              <label style="display: block; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); margin-bottom: 6px;">
+                TELEGRAM CHAT ID (Tùy chọn)
+              </label>
+              <input type="text" id="tgChatInput" placeholder="-100123456789 hoặc @channel" 
+                style="width: 100%; background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff; padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; outline: none;">
+              <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">ID nhóm hoặc chat riêng nhận tín hiệu.</p>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+            <div id="configStatusMsg" style="font-size: 0.85rem; font-weight: 600;"></div>
+            <button type="submit" id="saveConfigBtn" 
+              style="background: var(--accent); color: #fff; border: none; padding: 10px 24px; border-radius: 8px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: 0.2s;">
+              💾 Save & Apply in Realtime
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+
     <div class="table-card">
       <div class="table-header">
         <h2>Live Technical Indicators</h2>
@@ -1086,6 +1203,63 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   </div>
 
   <script>
+    function togglePasswordVis(id) {
+      const el = document.getElementById(id);
+      el.type = el.type === 'password' ? 'text' : 'password';
+    }
+
+    function toggleConfigPanel() {
+      const panel = document.getElementById('configPanelBody');
+      const text = document.getElementById('configToggleText');
+      if (panel.style.display === 'none') {
+        panel.style.display = 'block';
+        text.textContent = 'Hide Settings ▲';
+      } else {
+        panel.style.display = 'none';
+        text.textContent = 'Show / Edit Settings ▼';
+      }
+    }
+
+    async function saveConfiguration(e) {
+      e.preventDefault();
+      const btn = document.getElementById('saveConfigBtn');
+      const statusMsg = document.getElementById('configStatusMsg');
+      const twelveKey = document.getElementById('twelveKeyInput').value.trim();
+      const tgToken = document.getElementById('tgTokenInput').value.trim();
+      const tgChat = document.getElementById('tgChatInput').value.trim();
+
+      btn.disabled = true;
+      btn.textContent = '⏳ Saving & Reloading...';
+      statusMsg.textContent = '';
+
+      try {
+        const res = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            twelvedata_api_key: twelveKey,
+            telegram_bot_token: tgToken,
+            telegram_chat_id: tgChat
+          })
+        });
+        const data = await res.json();
+        if (res.ok && data.status === 'ok') {
+          statusMsg.style.color = 'var(--green)';
+          statusMsg.textContent = '✓ ' + data.message;
+          updateDashboard();
+        } else {
+          statusMsg.style.color = 'var(--red)';
+          statusMsg.textContent = '✗ ' + (data.message || 'Error saving settings');
+        }
+      } catch (err) {
+        statusMsg.style.color = 'var(--red)';
+        statusMsg.textContent = '✗ Network error: ' + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '💾 Save & Apply in Realtime';
+      }
+    }
+
     async function updateDashboard() {
       try {
         const res = await fetch('/api/snapshot');
@@ -1096,6 +1270,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById('uptimeDisplay').textContent = data.uptime_formatted || '--';
         document.getElementById('serverTimeDisplay').textContent = data.server_time || '--';
         document.getElementById('engineStatusText').textContent = data.status.toUpperCase();
+
+        // 1.1 TwelveData status pill
+        const twelvePill = document.getElementById('twelveStatusPill');
+        if (twelvePill) {
+          if (data.twelvedata_configured) {
+            twelvePill.className = 'pill pill-bull';
+            twelvePill.textContent = 'XAU & OIL Active';
+          } else {
+            twelvePill.className = 'pill pill-gold';
+            twelvePill.textContent = 'BTC Only (Click to configure TwelveData)';
+          }
+        }
 
         // 2. Telegram mode
         const tgMetric = document.getElementById('tgModeMetric');
@@ -1250,6 +1436,7 @@ class DashboardServer:
         self._app.router.add_get("/health",       self.handle_health)
         self._app.router.add_get("/api/snapshot", self.handle_snapshot)
         self._app.router.add_get("/api/health",   self.handle_health)
+        self._app.router.add_post("/api/config",  self.handle_save_config)
         self._runner: Optional[web.AppRunner] = None
         self._site:   Optional[web.TCPSite]   = None
 
@@ -1265,10 +1452,50 @@ class DashboardServer:
             "uptime_formatted": str(datetime.timedelta(seconds=uptime_sec)),
             "server_time": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "telegram_enabled": self._orchestrator._tg.is_enabled if self._orchestrator._tg else False,
+            "twelvedata_configured": bool(self._orchestrator._twelve and self._orchestrator._twelve.is_configured),
             "indicators": self._orchestrator._latest_indicators,
             "signals": list(self._orchestrator._recent_signals),
         }
         return web.json_response(data)
+
+    async def handle_save_config(self, request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
+
+        twelve_key = str(data.get("twelvedata_api_key", "")).strip()
+        tg_token   = str(data.get("telegram_bot_token", "")).strip()
+        tg_chat    = str(data.get("telegram_chat_id", "")).strip()
+
+        updates_to_save: dict[str, str] = {}
+
+        if twelve_key:
+            CONFIG["twelvedata_api_key"] = twelve_key
+            updates_to_save["TWELVE_API_KEY"] = twelve_key
+            if self._orchestrator._twelve:
+                self._orchestrator._twelve.update_key(twelve_key)
+                asyncio.create_task(self._orchestrator.reload_asset_buffers(["XAU", "OIL"]))
+
+        if tg_token or tg_chat:
+            if tg_token:
+                CONFIG["telegram_bot_token"] = tg_token
+                updates_to_save["TG_BOT_TOKEN"] = tg_token
+            if tg_chat:
+                CONFIG["telegram_chat_id"] = tg_chat
+                updates_to_save["TG_CHAT_ID"] = tg_chat
+            if self._orchestrator._tg:
+                self._orchestrator._tg.update_config(CONFIG["telegram_bot_token"], CONFIG["telegram_chat_id"])
+
+        if updates_to_save:
+            _update_dotenv(updates_to_save)
+
+        return web.json_response({
+            "status": "ok",
+            "message": "Configuration saved & applied in realtime!",
+            "twelvedata_configured": bool(self._orchestrator._twelve and self._orchestrator._twelve.is_configured),
+            "telegram_enabled": bool(self._orchestrator._tg and self._orchestrator._tg.is_enabled),
+        })
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({
@@ -1347,6 +1574,27 @@ class IndicatorOrchestrator:
                     ind = IndicatorEngine.compute_all(buf)
                     self._latest_indicators.setdefault(asset, {})[tf] = ind
                 await asyncio.sleep(1)   # respect rate limits during init
+
+    async def reload_asset_buffers(self, asset_names: list[str]) -> None:
+        """Fetch historical candles and compute indicators for specific assets in background."""
+        logger.info(f"Reloading historical buffers for assets: {asset_names}...")
+        for asset in asset_names:
+            if asset not in CONFIG["assets"]:
+                continue
+            cfg = CONFIG["assets"][asset]
+            for tf in cfg["timeframes"]:
+                buf = self._bufs.get(asset, {}).get(tf)
+                if not buf:
+                    buf = CircularBuffer(CONFIG["buffer_size"], asset, tf)
+                    self._bufs.setdefault(asset, {})[tf] = buf
+                candles = await self._fetch(asset, cfg, tf, limit=300)
+                for c in candles:
+                    buf.push(c)
+                logger.info(f"  [{asset} {tf}] loaded {len(buf)} candles (hot-reload)")
+                if len(buf) > 0:
+                    ind = IndicatorEngine.compute_all(buf)
+                    self._latest_indicators.setdefault(asset, {})[tf] = ind
+                await asyncio.sleep(1)
 
     # --------------------------------------------------------------- fetching
     async def _fetch(

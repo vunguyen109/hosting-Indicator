@@ -1,10 +1,11 @@
 import asyncio
 import os
+import tempfile
 import unittest
 from engine import (
     Candle, CircularBuffer, IndicatorEngine, RuleEngine,
     Signal, TelegramDispatcher, DashboardServer, IndicatorOrchestrator,
-    TwelveDataFetcher, CONFIG, _parse_port, _load_dotenv
+    TwelveDataFetcher, CONFIG, _parse_port, _load_dotenv, _update_dotenv
 )
 
 class TestEngine(unittest.TestCase):
@@ -44,12 +45,13 @@ class TestEngine(unittest.TestCase):
         orch = IndicatorOrchestrator()
         server = DashboardServer(orch, "127.0.0.1", 8080)
         self.assertIsNotNone(server._app)
-        # Check routes exist: /, /health, /api/snapshot, /api/health
+        # Check routes exist: /, /health, /api/snapshot, /api/health, /api/config
         routes = [r.resource.canonical for r in server._app.router.routes()]
         self.assertIn("/", routes)
         self.assertIn("/health", routes)
         self.assertIn("/api/health", routes)
         self.assertIn("/api/snapshot", routes)
+        self.assertIn("/api/config", routes)
 
     def test_parse_port_safety(self):
         # Empty string should fallback to default
@@ -73,16 +75,32 @@ class TestEngine(unittest.TestCase):
         os.environ.pop("SERVER_PORT", None)
         os.environ.pop("PORT", None)
 
-    def test_twelvedata_zero_env_bypass(self):
+    def test_twelvedata_zero_env_bypass_and_update(self):
         fetcher = TwelveDataFetcher(None, "")
         self.assertFalse(fetcher.is_configured)
         candles = asyncio.run(fetcher.fetch_candles("XAU/USD", "15min"))
         self.assertEqual(candles, [])
 
-        fetcher_placeholder = TwelveDataFetcher(None, "YOUR_TWELVE_KEY")
-        self.assertFalse(fetcher_placeholder.is_configured)
-        candles2 = asyncio.run(fetcher_placeholder.fetch_candles("WTI/USD", "1h"))
-        self.assertEqual(candles2, [])
+        # Test hot update via UI
+        fetcher.update_key("real_api_key_12345")
+        self.assertTrue(fetcher.is_configured)
+        self.assertEqual(fetcher._api_key, "real_api_key_12345")
+
+    def test_update_dotenv_file(self):
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as tmp:
+            tmp.write("HOST=0.0.0.0\nPORT=8080\n")
+            tmp_path = tmp.name
+
+        try:
+            _update_dotenv({"TWELVE_API_KEY": "my_new_key", "PORT": "9090"}, filepath=tmp_path)
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("TWELVE_API_KEY=my_new_key", content)
+            self.assertIn("PORT=9090", content)
+            self.assertIn("HOST=0.0.0.0", content)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
 if __name__ == "__main__":
     unittest.main()

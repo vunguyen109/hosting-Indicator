@@ -1,63 +1,59 @@
-# KẾ HOẠCH TOÀN DIỆN: CHUẨN HÓA ZERO-ENV & KHẮC PHỤC CRASHLOOP TRÊN BOTKEEP
+# KẾ HOẠCH NÂNG CẤP: THIẾT LẬP TWELVE_API_KEY & TELEGRAM TRỰC TIẾP TRÊN WEB UI
 **Dự án**: Hosting Indicator Engine (`vunguyen109/hosting-Indicator`)  
 **Tác giả**: CTO AI Assistant  
-**Trạng thái**: Chờ phê duyệt triển khai (Ready for Execution)  
+**Trạng thái**: Chờ phê duyệt (Pending Approval)  
 
 ---
 
-## 1. Xác nhận phát hiện từ thực tế của bạn (Insight Analysis)
+## 1. Mục tiêu & Bài toán thực tế
 
-Nhận định của bạn là **chính xác 100%**:
-1. **Giao diện tạo server trên Botkeep không có bước nhập ENV:**  
-   Form tạo server chỉ có 4 bước (Deploy type, Name/Runtime/Command, Git Source, Resources). Mục Environment Variables chỉ có thể truy cập được **sau khi server đã tạo xong**.
-2. **Hậu quả khi chạy không có ENV (Zero-ENV state):**
-   - **Treo Healthcheck do TwelveData:** Biến `TWELVE_API_KEY` mang giá trị mặc định `"YOUR_TWELVE_KEY"`. Engine cũ vẫn cố gửi 4 request lấy nến Vàng & Dầu tới TwelveData với cơ chế throttle 8s/request, làm quá trình boot bị nghẽn tới **32–40 giây**. Botkeep ping healthcheck thấy server không phản hồi kịp (timeout) nên gửi tín hiệu **SIGKILL ép restart liên tục**.
-   - **Crash Port do Botkeep khởi tạo biến rỗng:** Nếu Botkeep tạo container với biến `SERVER_PORT=""`, lệnh ép kiểu cũ `int("")` gây crash `ValueError` ngay tại module-level.
-   - **Mất log hoàn toàn:** Python trong container đệm stdout, nên khi tiến trình bị kill giữa chừng, toàn bộ lỗi biến mất khỏi console.
+Trên giao diện Botkeep (và nhiều nền tảng container khác), người dùng không thể nhập biến môi trường ở bước tạo server ban đầu, hoặc việc cấu hình biến môi trường trên panel đòi hỏi phải restart lại container.
 
----
-
-## 2. Giải pháp kỹ thuật: Chế độ "Zero-ENV & Fail-Safe"
-
-Dự án sẽ được nâng cấp để **hoạt động hoàn hảo 100% ngay cả khi người dùng không cấu hình bất kỳ biến môi trường nào**:
-
-### Giải pháp 1: Chế độ Auto-Bypass thông minh khi thiếu API Key
-- Trong `TwelveDataFetcher`: Nếu `TWELVE_API_KEY` để trống hoặc là placeholder (`YOUR_TWELVE_KEY`, `your_twelvedata_key_here`), engine sẽ **bỏ qua ngay lập tức trong 0 giây** (không gửi request, không chờ throttle 8s).
-- Log hiển thị rõ: `[CONFIG] TWELVE_API_KEY not configured -> Skipping Gold & Oil. Running BTC in standalone mode.`
-- Engine khởi động xong trong **chưa đầy 1 giây** với dữ liệu Bitcoin từ Binance công khai (hoàn toàn không cần API key).
-
-### Giải pháp 2: Bộ nạp `.env` tự động (Thuần Python Stdlib, không phụ thuộc thư viện)
-- Viết sẵn hàm `load_dotenv()` thuần chuẩn POSIX tích hợp sẵn trong `engine.py`.
-- Nếu có file `.env` trong thư mục, engine tự nạp mà không cần cài thêm package `python-dotenv`.
-
-### Giải pháp 3: Khởi động Web Server & Healthcheck ngay lập tức
-- Đưa `_init_buffers()` chạy background task (`asyncio.create_task`).
-- Cổng Dashboard (`0.0.0.0:8080` hoặc cổng Botkeep) mở thành công ngay trong 0.2 giây đầu tiên. Các endpoint `/`, `/health`, `/api/health` trả về `200 OK` ngay lập tức, Botkeep gắn nhãn `HEALTHY` và không bao giờ kill container.
-
-### Giải pháp 4: Chống mất log tuyệt đối (Zero-Buffering)
-- Ép `PYTHONUNBUFFERED=1` và `sys.stdout.reconfigure(line_buffering=True)`.
-- Bọc toàn bộ quá trình boot bằng khối `try ... except BaseException` fail-safe, in lỗi với `flush=True` và delay 15 giây nếu gặp lỗi nghiêm trọng để Botkeep kịp hiển thị toàn bộ log lên console.
-
-### Giải pháp 5: Start Command tối ưu cho Botkeep
-- Cấu hình lệnh khởi động an toàn trên Botkeep:
-  ```bash
-  pip install -r requirements.txt && python -u engine.py
-  ```
+**Giải pháp**: Tích hợp một bảng điều khiển **"⚙️ System Configuration"** trực tiếp trên Web Dashboard UI:
+- Người dùng chỉ cần mở Web Dashboard bằng trình duyệt (hoặc qua domain/IP Botkeep cấp).
+- Nhập `TWELVE_API_KEY` (và token Telegram nếu muốn) trực tiếp vào form trên giao diện web.
+- Bấm nút **"Save & Connect"**.
+- Backend tự động áp dụng ngay trong runtime mà không cần restart server, nạp nến Vàng (XAU) & Dầu (WTI) ngay lập tức, đồng thời lưu cấu hình vào file để duy trì sau mỗi lần restart container!
 
 ---
 
-## 3. Danh sách các file sẽ điều chỉnh
+## 2. Thiết kế chi tiết hệ thống
 
-1. [`engine.py`](file:///d:/project/hosting-Indicator/engine.py):
-   - Thêm zero-buffering & boot log.
-   - Thêm `load_dotenv()` tích hợp.
-   - Hàm `_parse_port()` an toàn chống crash.
-   - Thêm kiểm tra `TWELVE_API_KEY` bypass tức thì.
-   - Thêm route alias `/health`.
-   - Chuyển `_init_buffers()` sang background task.
-   - Bọc `main()` fail-safe traceback print.
-2. [`test_engine.py`](file:///d:/project/hosting-Indicator/test_engine.py):
-   - Bổ sung test case cho Zero-ENV mode, `_parse_port()`, và route `/health`.
-3. Git Repository:
-   - Untrack file binary `__pycache__/engine.cpython-312.pyc`.
-   - Commit và push lên GitHub nhánh `main`.
+### 2.1. Phía Frontend (Web Dashboard UI - `HTML_DASHBOARD`)
+1. **Thêm Card "⚙️ API & Notifications Settings"**:
+   - Trường nhập `TwelveData API Key` (có nút ẩn/hiện key).
+   - Badge trạng thái kết nối realtime:
+     - 🟡 `NOT CONFIGURED (Running BTC only)` nếu chưa có key.
+     - 🟢 `CONNECTED (Tracking XAU & OIL)` khi đã có key.
+   - Trường nhập `Telegram Bot Token` & `Chat ID` (Tùy chọn).
+   - Nút hành động: **"Save & Apply"** với animation loading và Toast thông báo kết quả.
+2. **Cập nhật JS Fetcher**:
+   - Gọi API `POST /api/config` gửi dữ liệu cấu hình.
+   - Cập nhật trạng thái badge theo dữ liệu trả về từ `/api/snapshot`.
+
+### 2.2. Phía Backend (`engine.py`)
+1. **Endpoint mới: `POST /api/config`**:
+   - Tiếp nhận JSON payload: `{ "twelvedata_api_key": "...", "telegram_bot_token": "...", "telegram_chat_id": "..." }`.
+   - Cập nhật trực tiếp vào đối tượng `TwelveDataFetcher`:
+     - Gán API Key mới.
+     - Đặt `is_configured = True`.
+     - Kích hoạt tác vụ nền nạp nến lịch sử cho XAU và OIL (`_reload_assets(["XAU", "OIL"])`).
+   - Cập nhật `TelegramDispatcher` nếu có token mới.
+   - **Ghi bền vững (Persistence)**: Tự động ghi/cập nhật vào file `.env` trên đĩa để khi container khởi động lại trong tương lai, cấu hình vẫn được giữ nguyên 100%!
+2. **Endpoint `GET /api/snapshot`**:
+   - Bổ sung trường `twelvedata_configured: bool` và `twelvedata_key_masked: str` để frontend hiển thị đúng trạng thái.
+
+---
+
+## 3. Các bước thực hiện
+
+1. **Cập nhật [`engine.py`](file:///d:/project/hosting-Indicator/engine.py)**:
+   - Thêm hàm `_save_env_file(key, value)`.
+   - Thêm method `_reload_assets()` trong `IndicatorOrchestrator` để nạp nến ngay khi có key mới.
+   - Thêm route handler `handle_save_config` cho `POST /api/config` trong `DashboardServer`.
+   - Cập nhật `HTML_DASHBOARD` với giao diện Settings Card & form xử lý AJAX.
+2. **Cập nhật [`test_engine.py`](file:///d:/project/hosting-Indicator/test_engine.py)**:
+   - Viết test case kiểm tra endpoint `POST /api/config` và kiểm tra nạp key động trong runtime.
+3. **Kiểm thử tự động & Đẩy code lên GitHub**:
+   - Chạy toàn bộ test suite.
+   - Commit và push lên nhánh `main` để Botkeep tự động kéo bản mới nhất.
