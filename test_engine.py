@@ -45,13 +45,39 @@ class TestEngine(unittest.TestCase):
         orch = IndicatorOrchestrator()
         server = DashboardServer(orch, "127.0.0.1", 8080)
         self.assertIsNotNone(server._app)
-        # Check routes exist: /, /health, /api/snapshot, /api/health, /api/config
+        # Check routes exist: /, /health, /api/snapshot, /api/candles, /api/health, /api/config
         routes = [r.resource.canonical for r in server._app.router.routes()]
         self.assertIn("/", routes)
         self.assertIn("/health", routes)
         self.assertIn("/api/health", routes)
         self.assertIn("/api/snapshot", routes)
+        self.assertIn("/api/candles", routes)
         self.assertIn("/api/config", routes)
+
+    def test_candles_endpoint_and_buffer_slice(self):
+        orch = IndicatorOrchestrator()
+        buf = CircularBuffer(50, "BTC", "15m")
+        for i in range(20):
+            buf.push(Candle(ts=1700000000 + i * 900, open=60000.0, high=60500.0, low=59500.0, close=60200.0 + i))
+        orch._bufs["BTC"] = {"15m": buf}
+        
+        server = DashboardServer(orch, "127.0.0.1", 8080)
+        
+        # Mock request with query parameters
+        class MockRequest:
+            def __init__(self, query):
+                self.query = query
+
+        req = MockRequest({"asset": "BTC", "tf": "15m", "limit": "10"})
+        resp = asyncio.run(server.handle_candles(req))
+        self.assertEqual(resp.status, 200)
+        import json
+        data = json.loads(resp.text)
+        self.assertEqual(len(data), 10)
+        self.assertIn("time", data[0])
+        self.assertIn("open", data[0])
+        self.assertIn("close", data[0])
+        self.assertEqual(data[-1]["close"], 60219.0)
 
     def test_parse_port_safety(self):
         # Empty string should fallback to default

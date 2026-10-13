@@ -879,60 +879,75 @@ def seconds_until_next_close(tf_seconds: int, offset: int = 5) -> float:
 # =============================================================================
 
 HTML_DASHBOARD = """<!DOCTYPE html>
-<html lang="en">
+<html lang="vi">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Indicator Engine - Live Dashboard</title>
+  <title>Bảng Chỉ Báo Tài Chính Tự Động - Quant Dashboard</title>
+  <!-- TradingView Lightweight Charts v4 (Canvas 60fps, ~45KB gzipped, Apache 2.0) -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
   <style>
     :root {
-      --bg: #0b0f19;
+      --bg: #090d16;
       --card-bg: #111827;
-      --card-border: #1f2937;
-      --text: #f9fafb;
-      --text-muted: #9ca3af;
+      --card-border: #1f293d;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
       --accent: #3b82f6;
       --green: #10b981;
+      --green-glow: rgba(16, 185, 129, 0.2);
       --red: #ef4444;
+      --red-glow: rgba(239, 68, 68, 0.2);
       --gold: #f59e0b;
       --purple: #8b5cf6;
+      --cyan: #06b6d4;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       background-color: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      padding: 16px 20px;
       line-height: 1.5;
     }
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 1320px; margin: 0 auto; }
+
+    /* Header */
     header {
       display: flex;
       flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
-      padding-bottom: 20px;
+      padding-bottom: 16px;
       border-bottom: 1px solid var(--card-border);
-      margin-bottom: 24px;
-      gap: 16px;
+      margin-bottom: 18px;
+      gap: 12px;
     }
     .brand { display: flex; align-items: center; gap: 12px; }
-    .brand h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.02em; }
+    .brand-icon {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.25rem;
+    }
+    .brand-title h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
+    .brand-title p { font-size: 0.8rem; color: var(--text-muted); }
+    .header-actions { display: flex; align-items: center; gap: 12px; }
     .status-badge {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      padding: 4px 10px;
+      padding: 5px 12px;
       border-radius: 9999px;
       font-size: 0.75rem;
       font-weight: 600;
-      background: rgba(16, 185, 129, 0.15);
+      background: rgba(16, 185, 129, 0.12);
       color: var(--green);
       border: 1px solid rgba(16, 185, 129, 0.3);
     }
     .pulse-dot {
-      width: 8px;
-      height: 8px;
+      width: 8px; height: 8px;
       border-radius: 50%;
       background: var(--green);
       box-shadow: 0 0 8px var(--green);
@@ -940,298 +955,1008 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
     @keyframes pulse {
       0% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.4; transform: scale(0.9); }
+      50% { opacity: 0.3; transform: scale(0.9); }
       100% { opacity: 1; transform: scale(1); }
     }
-    .meta-info {
-      display: flex;
-      gap: 16px;
-      font-size: 0.85rem;
-      color: var(--text-muted);
+    .btn-config {
+      background: #1e293b;
+      color: var(--text);
+      border: 1px solid var(--card-border);
+      padding: 6px 14px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      display: inline-flex;
       align-items: center;
+      gap: 6px;
+      transition: background 0.2s;
     }
-    .meta-item { display: flex; align-items: center; gap: 6px; }
-    .meta-value { color: var(--text); font-weight: 600; font-family: monospace; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .btn-config:hover { background: #334155; }
+
+    /* Control Tabs */
+    .controls-bar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      padding: 10px 16px;
+      border-radius: 12px;
+      margin-bottom: 18px;
+      gap: 12px;
+    }
+    .tabs-group { display: flex; align-items: center; gap: 8px; }
+    .group-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); font-weight: 600; margin-right: 4px; }
+    .tab-btn {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text-muted);
+      border: 1px solid transparent;
+      padding: 6px 14px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+    .tab-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.08); }
+    .tab-btn.active {
+      background: #2563eb;
+      color: #fff;
+      border-color: #3b82f6;
+      box-shadow: 0 0 12px rgba(37, 99, 235, 0.4);
+    }
+
+    /* Main Grid: Chart & Composite Gauge */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 18px;
+      margin-bottom: 20px;
+    }
+    @media (max-width: 1024px) {
+      .main-grid { grid-template-columns: 1fr; }
+    }
+
     .card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
       border-radius: 12px;
-      padding: 16px 20px;
-    }
-    .card-title {
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      margin-bottom: 8px;
-    }
-    .card-metric { font-size: 1.5rem; font-weight: 700; font-family: monospace; }
-    .card-sub { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
-    .table-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 12px;
       overflow: hidden;
-      margin-bottom: 24px;
+      display: flex;
+      flex-direction: column;
     }
-    .table-header {
-      padding: 16px 20px;
+    .card-header {
+      padding: 14px 18px;
       border-bottom: 1px solid var(--card-border);
       display: flex;
       justify-content: space-between;
       align-items: center;
     }
-    .table-header h2 { font-size: 1.05rem; font-weight: 600; }
-    .table-wrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; }
+    .card-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-body { padding: 16px 18px; flex: 1; position: relative; }
+
+    /* Chart Container */
+    #chartContainer {
+      width: 100%;
+      height: 380px;
+      position: relative;
+    }
+    .chart-legend {
+      position: absolute;
+      top: 10px;
+      left: 14px;
+      z-index: 10;
+      font-size: 0.78rem;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(4px);
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .legend-val { font-weight: 700; color: #fff; }
+
+    /* Composite Gauge */
+    .gauge-card-body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 20px 16px;
+    }
+    .gauge-score-display {
+      font-size: 3.2rem;
+      font-weight: 800;
+      line-height: 1;
+      margin-bottom: 6px;
+      letter-spacing: -0.02em;
+    }
+    .gauge-badge {
+      display: inline-block;
+      padding: 6px 16px;
+      border-radius: 9999px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      margin-bottom: 14px;
+      letter-spacing: 0.02em;
+    }
+    .gauge-bar-track {
+      width: 100%;
+      height: 14px;
+      background: #1e293b;
+      border-radius: 9999px;
+      position: relative;
+      margin: 12px 0 18px 0;
+      overflow: hidden;
+    }
+    .gauge-bar-gradient {
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(to right, #ef4444 0%, #f97316 25%, #eab308 50%, #10b981 75%, #06b6d4 100%);
+    }
+    .gauge-needle {
+      position: absolute;
+      top: -3px;
+      bottom: -3px;
+      width: 4px;
+      background: #ffffff;
+      box-shadow: 0 0 8px #ffffff;
+      border-radius: 2px;
+      transition: left 0.4s ease;
+    }
+    .gauge-explanation {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+      margin-bottom: 18px;
+      padding: 10px 14px;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.04);
+      width: 100%;
+    }
+    .gauge-components {
+      width: 100%;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      text-align: center;
+      border-top: 1px solid var(--card-border);
+      padding-top: 14px;
+    }
+    .component-item small { font-size: 0.7rem; color: var(--text-muted); display: block; }
+    .component-item span { font-size: 0.82rem; font-weight: 700; }
+
+    /* Tables & Plain Language Badges */
+    .table-responsive { width: 100%; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
     th {
       background: rgba(255, 255, 255, 0.02);
       color: var(--text-muted);
-      font-weight: 600;
       font-size: 0.75rem;
       text-transform: uppercase;
+      letter-spacing: 0.05em;
       padding: 12px 16px;
       border-bottom: 1px solid var(--card-border);
     }
     td {
-      padding: 14px 16px;
+      padding: 12px 16px;
+      font-size: 0.88rem;
       border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-      font-family: monospace;
     }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: rgba(255, 255, 255, 0.02); }
-    .asset-tag {
+
+    .tag-status {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      font-weight: 700;
-      color: var(--text);
-    }
-    .pill {
-      display: inline-block;
-      padding: 3px 8px;
+      padding: 4px 10px;
       border-radius: 6px;
       font-size: 0.8rem;
       font-weight: 600;
     }
-    .pill-bull { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
-    .pill-bear { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }
-    .pill-neutral { background: rgba(156, 163, 175, 0.15); color: var(--text-muted); border: 1px solid rgba(156, 163, 175, 0.2); }
-    .pill-gold { background: rgba(245, 158, 11, 0.15); color: var(--gold); border: 1px solid rgba(245, 158, 11, 0.3); }
-    .pill-purple { background: rgba(139, 92, 246, 0.15); color: var(--purple); border: 1px solid rgba(139, 92, 246, 0.3); }
+    .status-safe { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .status-warning { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }
+    .status-neutral { background: rgba(245, 158, 11, 0.15); color: var(--gold); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .status-calm { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); border: 1px solid rgba(148, 163, 184, 0.2); }
+
+    /* Tooltip Glossary */
+    .has-tip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: help;
+      position: relative;
+    }
+    .tip-icon {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      border-radius: 50%;
+      border: 1px solid var(--text-muted);
+      width: 13px; height: 13px;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    .tip-box {
+      display: none;
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      width: 240px;
+      background: #1e293b;
+      color: #f1f5f9;
+      font-size: 0.75rem;
+      font-weight: normal;
+      line-height: 1.4;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      z-index: 100;
+      pointer-events: none;
+      text-transform: none;
+    }
+    .has-tip:hover .tip-box { display: block; }
+
+    /* Signals Story Feed */
     .signals-box {
       max-height: 380px;
       overflow-y: auto;
       padding: 12px 16px;
     }
-    .signal-item {
+    .story-item {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      padding: 10px 12px;
+      padding: 12px 14px;
       border-radius: 8px;
       margin-bottom: 8px;
       background: rgba(255, 255, 255, 0.02);
       border: 1px solid rgba(255, 255, 255, 0.05);
-      gap: 8px;
+      gap: 10px;
+      transition: background 0.15s;
     }
-    .signal-item:last-child { margin-bottom: 0; }
-    .sig-left { display: flex; align-items: center; gap: 10px; }
-    .sig-time { font-size: 0.75rem; color: var(--text-muted); font-family: monospace; }
-    .sig-msg { font-size: 0.85rem; color: #d1d5db; }
-    .sig-price { font-size: 0.85rem; font-weight: 700; font-family: monospace; }
-    .empty-signals {
-      padding: 32px 16px;
-      text-align: center;
-      color: var(--text-muted);
-      font-size: 0.9rem;
+    .story-item:hover { background: rgba(255, 255, 255, 0.04); }
+    .story-left { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 260px; }
+    .story-icon { font-size: 1.25rem; }
+    .story-text { font-size: 0.88rem; line-height: 1.4; }
+    .story-meta { display: flex; align-items: center; gap: 12px; font-size: 0.8rem; color: var(--text-muted); }
+    .conf-tag {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
     }
-    footer {
-      text-align: center;
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      padding: 20px 0;
+    .conf-high { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .conf-mid { background: rgba(245, 158, 11, 0.15); color: var(--gold); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .conf-alert { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }
+
+    /* Modal */
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.75);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
     }
+    .modal-card {
+      background: #111827;
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      width: 90%;
+      max-width: 480px;
+      padding: 24px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+    }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+    .modal-title { font-size: 1.1rem; font-weight: 700; }
+    .modal-close { background: none; border: none; color: var(--text-muted); font-size: 1.25rem; cursor: pointer; }
+    .form-group { margin-bottom: 14px; }
+    .form-group label { display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 6px; }
+    .form-input {
+      width: 100%;
+      background: #1e293b;
+      border: 1px solid #334155;
+      padding: 8px 12px;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 0.85rem;
+    }
+    .modal-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+    .btn-primary { background: #2563eb; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+    .btn-secondary { background: #334155; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
   </style>
 </head>
 <body>
   <div class="container">
+    <!-- Header -->
     <header>
       <div class="brand">
-        <h1>Hosting Indicator Engine</h1>
-        <div class="status-badge" id="engineStatusBadge">
-          <span class="pulse-dot"></span>
-          <span id="engineStatusText">ONLINE</span>
+        <div class="brand-icon">📈</div>
+        <div class="brand-title">
+          <h1>Chỉ Báo Thị Trường Tự Động</h1>
+          <p>Hệ thống giám sát định lượng thời gian thực — Dành cho mọi nhà đầu tư</p>
         </div>
       </div>
-      <div class="meta-info">
-        <div class="meta-item">
-          <span>Uptime:</span>
-          <span class="meta-value" id="uptimeDisplay">--:--:--</span>
+      <div class="header-actions">
+        <div class="status-badge">
+          <div class="pulse-dot"></div>
+          <span id="systemStatusLabel">HỆ THỐNG ONLINE</span>
         </div>
-        <div class="meta-item">
-          <span>Server Time:</span>
-          <span class="meta-value" id="serverTimeDisplay">--:--:-- UTC</span>
-        </div>
+        <button class="btn-config" onclick="openConfigModal()">⚙️ Cấu hình</button>
       </div>
     </header>
 
-    <div class="grid">
-      <div class="card">
-        <div class="card-title">Assets Tracked</div>
-        <div class="card-metric" style="color: var(--accent);">BTC • XAU • OIL</div>
-        <div class="card-sub">Timeframes: 15m & 1h (6 Streams)</div>
+    <!-- Controls Bar -->
+    <div class="controls-bar">
+      <div class="tabs-group">
+        <span class="group-label">Tài sản:</span>
+        <button class="tab-btn active" id="btnAssetBTC" onclick="selectAsset('BTC')">₿ Bitcoin (BTC)</button>
+        <button class="tab-btn" id="btnAssetXAU" onclick="selectAsset('XAU')">🟡 Vàng (XAU)</button>
+        <button class="tab-btn" id="btnAssetOIL" onclick="selectAsset('OIL')">🛢️ Dầu thô (WTI)</button>
       </div>
-      <div class="card">
-        <div class="card-title">Telegram Mode</div>
-        <div class="card-metric" id="tgModeMetric">Detecting...</div>
-        <div class="card-sub" id="tgModeSub">Optional Bot Fallback</div>
-      </div>
-      <div class="card">
-        <div class="card-title">Signal Memory</div>
-        <div class="card-metric" id="signalsCountMetric">0</div>
-        <div class="card-sub">Circular ring buffer (Max 50)</div>
-      </div>
-      <div class="card">
-        <div class="card-title">Resource Profile</div>
-        <div class="card-metric" style="color: var(--green);">&lt; 120 MB RAM</div>
-        <div class="card-sub">1.5 vCore • Low Overhead Engine</div>
+      <div class="tabs-group">
+        <span class="group-label">Khung giờ:</span>
+        <button class="tab-btn active" id="btnTf15m" onclick="selectTimeframe('15m')">15 Phút (Ngắn hạn)</button>
+        <button class="tab-btn" id="btnTf1h" onclick="selectTimeframe('1h')">1 Giờ (Trung hạn)</button>
       </div>
     </div>
 
-    <!-- Live Configuration Panel on Web UI -->
-    <div class="table-card" style="margin-bottom: 24px;">
-      <div class="table-header" style="cursor: pointer;" onclick="toggleConfigPanel()">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <h2>⚙️ System & API Configuration</h2>
-          <span class="pill" id="twelveStatusPill" style="font-size:0.75rem;">Detecting...</span>
+    <!-- Main Grid: Chart & Composite Signal Gauge -->
+    <div class="main-grid">
+      <!-- Candlestick Chart -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <span>📊 Biểu Đồ Nến Trực Quan</span>
+            <span id="activeChartTitle" style="color:var(--accent);font-size:0.85rem;">[BTC · 15m]</span>
+          </div>
+          <div style="font-size:0.75rem;color:var(--text-muted);">
+            🟡 EMA 20 &nbsp;|&nbsp; 🔵 EMA 50 &nbsp;|&nbsp; 🟣 Bollinger
+          </div>
         </div>
-        <span style="font-size: 0.8rem; color: var(--accent); font-weight: 600;" id="configToggleText">Show / Edit Settings ▼</span>
+        <div class="card-body">
+          <div class="chart-legend" id="chartLegend">
+            <span>Giá: <span class="legend-val" id="legPrice">--</span></span>
+            <span>Mở: <span class="legend-val" id="legOpen">--</span></span>
+            <span>Cao: <span class="legend-val" id="legHigh">--</span></span>
+            <span>Thấp: <span class="legend-val" id="legLow">--</span></span>
+          </div>
+          <div id="chartContainer"></div>
+        </div>
       </div>
-      <div id="configPanelBody" style="padding: 20px; display: block; border-top: 1px solid var(--card-border);">
-        <form id="configForm" onsubmit="saveConfiguration(event)">
-          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px;">
-            <div>
-              <label style="display: block; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); margin-bottom: 6px;">
-                TWELVEDATA API KEY (Gold & Crude Oil)
-              </label>
-              <div style="display: flex; gap: 8px;">
-                <input type="password" id="twelveKeyInput" placeholder="Nhập TwelveData API Key..." 
-                  style="flex: 1; background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff; padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; outline: none;">
-                <button type="button" onclick="togglePasswordVis('twelveKeyInput')" 
-                  style="background: rgba(255,255,255,0.08); border: 1px solid var(--card-border); color: var(--text-muted); padding: 0 12px; border-radius: 8px; cursor: pointer;">👁️</button>
-              </div>
-              <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">Miễn phí 800 req/ngày tại <a href="https://twelvedata.com" target="_blank" style="color: var(--accent); text-decoration: underline;">twelvedata.com</a>. Để trống để chạy riêng BTC.</p>
-            </div>
 
-            <div>
-              <label style="display: block; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); margin-bottom: 6px;">
-                TELEGRAM BOT TOKEN (Tùy chọn)
-              </label>
-              <input type="password" id="tgTokenInput" placeholder="123456:ABC-DEF..." 
-                style="width: 100%; background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff; padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; outline: none;">
-              <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">Để trống nếu chỉ xem qua Web UI & Logs.</p>
-            </div>
-
-            <div>
-              <label style="display: block; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); margin-bottom: 6px;">
-                TELEGRAM CHAT ID (Tùy chọn)
-              </label>
-              <input type="text" id="tgChatInput" placeholder="-100123456789 hoặc @channel" 
-                style="width: 100%; background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff; padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; outline: none;">
-              <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">ID nhóm hoặc chat riêng nhận tín hiệu.</p>
+      <!-- Composite Signal Gauge -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <span>🧭 Thước Đo Tâm Lý Thị Trường</span>
+          </div>
+          <div class="has-tip">
+            <span class="tip-icon">ℹ</span>
+            <div class="tip-box">
+              Chỉ số tổng hợp từ 3 tín hiệu kỹ thuật (Xu hướng 40%, Sức mua 35%, Biên độ 25%). Điểm càng cao phe mua càng áp đảo, điểm càng thấp phe bán càng chiếm ưu thế.
             </div>
           </div>
-
-          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
-            <div id="configStatusMsg" style="font-size: 0.85rem; font-weight: 600;"></div>
-            <button type="submit" id="saveConfigBtn" 
-              style="background: var(--accent); color: #fff; border: none; padding: 10px 24px; border-radius: 8px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: 0.2s;">
-              💾 Save & Apply in Realtime
-            </button>
+        </div>
+        <div class="gauge-card-body">
+          <div class="gauge-score-display" id="gaugeScore">50</div>
+          <div class="gauge-badge" id="gaugeBadge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
+            ⚖️ TRUNG LẬP
           </div>
-        </form>
+          <div class="gauge-bar-track">
+            <div class="gauge-bar-gradient"></div>
+            <div class="gauge-needle" id="gaugeNeedle" style="left:50%;"></div>
+          </div>
+          <div class="gauge-explanation" id="gaugeExplanation">
+            Thị trường đang ở trạng thái cân bằng. Lực mua và lực bán giằng co, chưa rõ xu hướng bứt phá.
+          </div>
+          <div class="gauge-components">
+            <div class="component-item">
+              <small>Xu Hướng (EMA)</small>
+              <span id="compEma">--</span>
+            </div>
+            <div class="component-item">
+              <small>Sức Mua (RSI)</small>
+              <span id="compRsi">--</span>
+            </div>
+            <div class="component-item">
+              <small>Vị Trí Dải (BB)</small>
+              <span id="compBb">--</span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
-    <div class="table-card">
-      <div class="table-header">
-        <h2>Live Technical Indicators</h2>
-        <span style="font-size: 0.8rem; color: var(--text-muted);">Auto-refreshes every 3s</span>
+    <!-- Table: Live Indicators Overview -->
+    <div class="card" style="margin-bottom:20px;">
+      <div class="card-header">
+        <div class="card-title">
+          <span>📋 Bảng Theo Dõi Sức Khỏe Thị Trường (Diễn giải ngôn ngữ đời thường)</span>
+        </div>
+        <div style="font-size:0.75rem;color:var(--text-muted);">
+          Cập nhật tự động mỗi 3 giây
+        </div>
       </div>
-      <div class="table-wrap">
+      <div class="table-responsive">
         <table>
           <thead>
             <tr>
-              <th>Asset</th>
-              <th>TF</th>
-              <th>Close Price</th>
-              <th>RSI (14)</th>
-              <th>EMA Trend (20 / 50)</th>
-              <th>Bollinger Bands (Low / Mid / High)</th>
-              <th>ATR (14)</th>
-              <th>Last Update</th>
+              <th>Tài sản</th>
+              <th>Khung giờ</th>
+              <th>Giá hiện tại</th>
+              <th>
+                <span class="has-tip">
+                  Sức Mua / Bán <span class="tip-icon">ℹ</span>
+                  <div class="tip-box">Đo lường thị trường có đang bị mua quá đà (dễ đảo chiều giảm) hay bán tháo quá mức (dễ hồi phục).</div>
+                </span>
+              </th>
+              <th>
+                <span class="has-tip">
+                  Xu Hướng Chính <span class="tip-icon">ℹ</span>
+                  <div class="tip-box">Đánh giá phe nào đang làm chủ cuộc chơi: Phe mua (Tăng) hay Phe bán (Giảm).</div>
+                </span>
+              </th>
+              <th>
+                <span class="has-tip">
+                  Dải Biến Động <span class="tip-icon">ℹ</span>
+                  <div class="tip-box">Biên độ giá chạy thông thường. Vượt ra khỏi biên cảnh báo giá đang biến động dị thường.</div>
+                </span>
+              </th>
+              <th>
+                <span class="has-tip">
+                  Mức Độ Rung Lắc <span class="tip-icon">ℹ</span>
+                  <div class="tip-box">Biên độ giật sóng của giá. Cao là thị trường bão tố giật mạnh, Thấp là sóng êm đềm.</div>
+                </span>
+              </th>
             </tr>
           </thead>
           <tbody id="indicatorsTbody">
-            <tr>
-              <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 24px;">
-                Loading indicator streams...
-              </td>
-            </tr>
+            <tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:24px;">Đang nạp dữ liệu thị trường...</td></tr>
           </tbody>
         </table>
       </div>
     </div>
 
-    <div class="table-card">
-      <div class="table-header">
-        <h2>Live Signals Feed</h2>
-        <span style="font-size: 0.8rem; color: var(--text-muted);" id="signalsTotalLabel">0 triggered</span>
+    <!-- Live Signals Story Feed -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>🔔 Dòng Tín Hiệu & Câu Chuyện Thị Trường</span>
+        </div>
+        <span style="font-size:0.8rem;color:var(--text-muted);" id="signalsCountBadge">0 tín hiệu</span>
       </div>
       <div class="signals-box" id="signalsFeedBox">
-        <div class="empty-signals">No signals triggered yet. Waiting for candle closes...</div>
+        <div style="text-align:center;color:var(--text-muted);padding:30px;">
+          Chưa có tín hiệu bất thường. Hệ thống đang theo dõi 24/7...
+        </div>
       </div>
     </div>
+  </div>
 
-    <footer>
-      Hosting Indicator Engine v1.0 • Designed for low-resource hosting (Botkeep, VPS, Local)
-    </footer>
+  <!-- Modal Cấu hình -->
+  <div class="modal-backdrop" id="configModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">⚙️ Cấu Hình Kết Nối API</div>
+        <button class="modal-close" onclick="closeConfigModal()">✕</button>
+      </div>
+      <div class="form-group">
+        <label>TwelveData API Key (Cho Vàng & Dầu)</label>
+        <input type="password" id="cfgTwelveKey" class="form-input" placeholder="Nhập API key TwelveData">
+      </div>
+      <div class="form-group">
+        <label>Telegram Bot Token (Tùy chọn)</label>
+        <input type="password" id="cfgTgToken" class="form-input" placeholder="123456789:ABCdef...">
+      </div>
+      <div class="form-group">
+        <label>Telegram Chat ID (Tùy chọn)</label>
+        <input type="text" id="cfgTgChat" class="form-input" placeholder="-100xxxxxxxxxx">
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="closeConfigModal()">Đóng</button>
+        <button class="btn-primary" onclick="saveConfig()">Lưu cấu hình</button>
+      </div>
+    </div>
   </div>
 
   <script>
-    function togglePasswordVis(id) {
-      const el = document.getElementById(id);
-      el.type = el.type === 'password' ? 'text' : 'password';
+    // --- BIẾN TRẠNG THÁI CLIENT ---
+    let currentAsset = 'BTC';
+    let currentTimeframe = '15m';
+    let chartInstance = null;
+    let candleSeries = null;
+    let ema20Series = null;
+    let ema50Series = null;
+    let bbUpperSeries = null;
+    let bbLowerSeries = null;
+    let cachedSnapshot = null;
+
+    // --- KHỞI TẠO LIGHTWEIGHT CHARTS (CANVAS 60FPS) ---
+    function initChart() {
+      const container = document.getElementById('chartContainer');
+      if (!container) return;
+
+      chartInstance = LightweightCharts.createChart(container, {
+        layout: {
+          background: { color: '#111827' },
+          textColor: '#94a3b8',
+        },
+        grid: {
+          vertLines: { color: 'rgba(31, 41, 55, 0.6)' },
+          horzLines: { color: 'rgba(31, 41, 55, 0.6)' },
+        },
+        crosshair: {
+          mode: LightweightCharts.CrosshairMode.Normal,
+        },
+        rightPriceScale: {
+          borderColor: '#1f2937',
+        },
+        timeScale: {
+          borderColor: '#1f2937',
+          timeVisible: true,
+          secondsVisible: false,
+        },
+      });
+
+      // Series nến
+      candleSeries = chartInstance.addCandlestickSeries({
+        upColor: '#10b981',
+        downColor: '#ef4444',
+        borderVisible: false,
+        wickUpColor: '#10b981',
+        wickDownColor: '#ef4444',
+      });
+
+      // Overlay EMA 20
+      ema20Series = chartInstance.addLineSeries({
+        color: '#eab308',
+        lineWidth: 2,
+        title: 'EMA 20',
+      });
+
+      // Overlay EMA 50
+      ema50Series = chartInstance.addLineSeries({
+        color: '#38bdf8',
+        lineWidth: 2,
+        title: 'EMA 50',
+      });
+
+      // Overlay Bollinger Upper & Lower
+      bbUpperSeries = chartInstance.addLineSeries({
+        color: 'rgba(168, 85, 247, 0.6)',
+        lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        title: 'BB Upper',
+      });
+      bbLowerSeries = chartInstance.addLineSeries({
+        color: 'rgba(168, 85, 247, 0.6)',
+        lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        title: 'BB Lower',
+      });
+
+      // Lắng nghe di chuột để hiển thị legend O, H, L, C
+      chartInstance.subscribeCrosshairMove(param => {
+        if (!param || !param.time || !param.seriesData.get(candleSeries)) {
+          return;
+        }
+        const data = param.seriesData.get(candleSeries);
+        document.getElementById('legPrice').textContent = '$' + Number(data.close).toFixed(2);
+        document.getElementById('legOpen').textContent  = '$' + Number(data.open).toFixed(2);
+        document.getElementById('legHigh').textContent  = '$' + Number(data.high).toFixed(2);
+        document.getElementById('legLow').textContent   = '$' + Number(data.low).toFixed(2);
+      });
+
+      window.addEventListener('resize', () => {
+        if (chartInstance && container) {
+          chartInstance.applyOptions({
+            width: container.clientWidth,
+            height: container.clientHeight,
+          });
+        }
+      });
     }
 
-    function toggleConfigPanel() {
-      const panel = document.getElementById('configPanelBody');
-      const text = document.getElementById('configToggleText');
-      if (panel.style.display === 'none') {
-        panel.style.display = 'block';
-        text.textContent = 'Hide Settings ▲';
-      } else {
-        panel.style.display = 'none';
-        text.textContent = 'Show / Edit Settings ▼';
+    // --- TÍNH TOÁN OVERLAYS TẠI CLIENT (<1ms) ---
+    function computeClientOverlays(candles) {
+      const ema20 = [];
+      const ema50 = [];
+      const bbUp = [];
+      const bbLow = [];
+
+      const calcEma = (period) => {
+        const k = 2 / (period + 1);
+        let prev = null;
+        const out = [];
+        for (let i = 0; i < candles.length; i++) {
+          const c = candles[i].close;
+          if (prev === null) {
+            if (i === period - 1) {
+              let sum = 0;
+              for (let j = 0; j < period; j++) sum += candles[j].close;
+              prev = sum / period;
+              out.push({ time: candles[i].time, value: prev });
+            }
+          } else {
+            prev = c * k + prev * (1 - k);
+            out.push({ time: candles[i].time, value: prev });
+          }
+        }
+        return out;
+      };
+
+      // Bollinger Bands (20, 2)
+      for (let i = 19; i < candles.length; i++) {
+        let sum = 0;
+        for (let j = i - 19; j <= i; j++) sum += candles[j].close;
+        const mean = sum / 20;
+        let sumSq = 0;
+        for (let j = i - 19; j <= i; j++) sumSq += Math.pow(candles[j].close - mean, 2);
+        const std = Math.sqrt(sumSq / 20);
+        bbUp.push({ time: candles[i].time, value: mean + 2 * std });
+        bbLow.push({ time: candles[i].time, value: mean - 2 * std });
+      }
+
+      return {
+        ema20: calcEma(20),
+        ema50: calcEma(50),
+        bbUp,
+        bbLow,
+      };
+    }
+
+    // --- TẢI DỮ LIỆU NẾN CHO CHART ---
+    async function fetchCandleData() {
+      try {
+        const tfParam = (currentAsset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        const res = await fetch(`/api/candles?asset=${currentAsset}&tf=${tfParam}&limit=100`);
+        if (!res.ok) return;
+        const candles = await res.json();
+        if (!candles || candles.length === 0) return;
+
+        candleSeries.setData(candles);
+
+        const overlays = computeClientOverlays(candles);
+        ema20Series.setData(overlays.ema20);
+        ema50Series.setData(overlays.ema50);
+        bbUpperSeries.setData(overlays.bbUp);
+        bbLowerSeries.setData(overlays.bbLow);
+
+        // Cập nhật legend giá đóng cửa nến cuối
+        const lastBar = candles[candles.length - 1];
+        document.getElementById('legPrice').textContent = '$' + Number(lastBar.close).toFixed(2);
+        document.getElementById('legOpen').textContent  = '$' + Number(lastBar.open).toFixed(2);
+        document.getElementById('legHigh').textContent  = '$' + Number(lastBar.high).toFixed(2);
+        document.getElementById('legLow').textContent   = '$' + Number(lastBar.low).toFixed(2);
+
+        // Marker tín hiệu gần nhất nếu có trong feed
+        if (cachedSnapshot && cachedSnapshot.signals) {
+          const sigs = cachedSnapshot.signals.filter(s => s.asset === currentAsset);
+          if (sigs.length > 0) {
+            const markers = [];
+            sigs.slice(0, 3).forEach(s => {
+              const isBull = s.signal_type.includes('UP') || s.signal_type.includes('OVERSOLD');
+              markers.push({
+                time: lastBar.time,
+                position: isBull ? 'belowBar' : 'aboveBar',
+                color: isBull ? '#10b981' : '#ef4444',
+                shape: isBull ? 'arrowUp' : 'arrowDown',
+                text: isBull ? 'Tín hiệu Tăng' : 'Tín hiệu Giảm',
+              });
+            });
+            candleSeries.setMarkers(markers);
+          }
+        }
+
+        chartInstance.timeScale().fitContent();
+      } catch (err) {
+        console.warn('Lỗi tải dữ liệu nến:', err);
       }
     }
 
-    async function saveConfiguration(e) {
-      e.preventDefault();
-      const btn = document.getElementById('saveConfigBtn');
-      const statusMsg = document.getElementById('configStatusMsg');
-      const twelveKey = document.getElementById('twelveKeyInput').value.trim();
-      const tgToken = document.getElementById('tgTokenInput').value.trim();
-      const tgChat = document.getElementById('tgChatInput').value.trim();
+    // --- TÍNH TOÁN VÀ CẬP NHẬT COMPOSITE SIGNAL GAUGE ---
+    function updateCompositeGauge(assetData) {
+      if (!assetData) return;
 
-      btn.disabled = true;
-      btn.textContent = '⏳ Saving & Reloading...';
-      statusMsg.textContent = '';
+      const rsi = assetData.rsi != null ? Number(assetData.rsi) : 50;
+      const ef  = assetData.ema_fast != null ? Number(assetData.ema_fast) : 0;
+      const es  = assetData.ema_slow != null ? Number(assetData.ema_slow) : 0;
+      const close = assetData.close != null ? Number(assetData.close) : 0;
+      const bLow  = assetData.bb_lower != null ? Number(assetData.bb_lower) : 0;
+      const bUp   = assetData.bb_upper != null ? Number(assetData.bb_upper) : 0;
 
+      // 1. Điểm Xu hướng EMA (40%)
+      let scoreEma = 50;
+      let textEma = '↔️ Đi ngang';
+      if (ef > 0 && es > 0) {
+        if (close > ef && ef > es) { scoreEma = 100; textEma = '📈 Tăng mạnh'; }
+        else if (close < ef && ef < es) { scoreEma = 0; textEma = '📉 Giảm mạnh'; }
+        else if (ef > es) { scoreEma = 75; textEma = '↗️ Nghiêng tăng'; }
+        else { scoreEma = 25; textEma = '↘️ Nghiêng giảm'; }
+      }
+
+      // 2. Điểm Xung lực RSI (35%)
+      const scoreRsi = Math.max(0, Math.min(100, rsi));
+      let textRsi = '⚖️ Cân bằng';
+      if (rsi >= 70) textRsi = '🔥 Quá mua';
+      else if (rsi <= 30) textRsi = '❄️ Quá bán';
+
+      // 3. Điểm Vị trí Bollinger Bands (25%)
+      let scoreBb = 50;
+      let textBb = '🛡️ An toàn';
+      if (bUp > bLow && bUp !== 0) {
+        const rawBb = ((close - bLow) / (bUp - bLow)) * 100;
+        scoreBb = Math.max(0, Math.min(100, rawBb));
+        if (close > bUp) textBb = '⚠️ Vượt đỉnh';
+        else if (close < bLow) textBb = '🔻 Thủng đáy';
+      }
+
+      // Điểm tổng hợp (0 - 100)
+      const totalScore = Math.round((0.40 * scoreEma) + (0.35 * scoreRsi) + (0.25 * scoreBb));
+
+      // Cập nhật giao diện Gauge
+      document.getElementById('gaugeScore').textContent = totalScore;
+      document.getElementById('gaugeNeedle').style.left = totalScore + '%';
+      document.getElementById('compEma').textContent = textEma;
+      document.getElementById('compRsi').textContent = `${textRsi} (${rsi.toFixed(1)})`;
+      document.getElementById('compBb').textContent = textBb;
+
+      const badge = document.getElementById('gaugeBadge');
+      const desc = document.getElementById('gaugeExplanation');
+
+      if (totalScore >= 76) {
+        badge.textContent = '💎 MUA MẠNH';
+        badge.style = 'background:rgba(6,182,212,0.15);color:#06b6d4;border:1px solid rgba(6,182,212,0.3);';
+        desc.textContent = 'Thị trường hưng phấn tột độ! Phe mua kiểm soát hoàn toàn, đà tăng giá cực mạnh.';
+      } else if (totalScore >= 56) {
+        badge.textContent = '🟢 NGHIÊNG TĂNG';
+        badge.style = 'background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3);';
+        desc.textContent = 'Phe mua đang thắng thế rõ rệt. Động lực tăng giá đang được duy trì tốt.';
+      } else if (totalScore >= 45) {
+        badge.textContent = '🟡 TRUNG LẬP';
+        badge.style = 'background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);';
+        desc.textContent = 'Thị trường đi ngang và giằng co. Hai bên mua bán cân bằng, chưa rõ hướng bứt phá.';
+      } else if (totalScore >= 25) {
+        badge.textContent = '🟠 NGHIÊNG GIẢM';
+        badge.style = 'background:rgba(249,115,22,0.15);color:#f97316;border:1px solid rgba(249,115,22,0.3);';
+        desc.textContent = 'Áp lực bán đang đè nặng. Thị trường trượt giá dần, phe bán chiếm ưu thế.';
+      } else {
+        badge.textContent = '🔴 BÁN MẠNH';
+        badge.style = 'background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);';
+        desc.textContent = 'Tâm lý bi quan bao trùm! Áp lực bán tháo dữ dội, rủi ro cao, không nên mua bắt đáy vội.';
+      }
+    }
+
+    // --- CẬP NHẬT TOÀN BỘ DASHBOARD TỪ SNAPSHOT ---
+    async function updateDashboard() {
+      try {
+        const res = await fetch('/api/snapshot');
+        if (!res.ok) return;
+        const data = await res.json();
+        cachedSnapshot = data;
+
+        // 1. Cập nhật bảng chỉ báo với ngôn ngữ đời thường
+        const tbody = document.getElementById('indicatorsTbody');
+        const indMap = data.indicators || {};
+        let rowsHtml = '';
+        const assets = ['BTC', 'XAU', 'OIL'];
+
+        assets.forEach(asset => {
+          const tfs = indMap[asset] || {};
+          Object.keys(tfs).forEach(tf => {
+            const item = tfs[tf];
+            if (!item) return;
+
+            const price = item.close != null ? Number(item.close).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4}) : '--';
+
+            // Dịch RSI
+            let rsiTag = '<span class="tag-status status-calm">--</span>';
+            if (item.rsi != null) {
+              const r = Number(item.rsi);
+              if (r >= 70) {
+                rsiTag = `<span class="tag-status status-warning">🔥 Tăng quá nóng (${r.toFixed(1)})</span>`;
+              } else if (r <= 30) {
+                rsiTag = `<span class="tag-status status-neutral">❄️ Bán tháo quá đà (${r.toFixed(1)})</span>`;
+              } else {
+                rsiTag = `<span class="tag-status status-safe">⚖️ Cân bằng (${r.toFixed(1)})</span>`;
+              }
+            }
+
+            // Dịch Xu hướng EMA
+            let trendTag = '<span class="tag-status status-calm">--</span>';
+            if (item.ema_fast != null && item.ema_slow != null) {
+              const ef = Number(item.ema_fast);
+              const es = Number(item.ema_slow);
+              const cl = Number(item.close || 0);
+              if (cl > ef && ef > es) {
+                trendTag = `<span class="tag-status status-safe">📈 TĂNG RÕ RỆT</span>`;
+              } else if (cl < ef && ef < es) {
+                trendTag = `<span class="tag-status status-warning">📉 GIẢM RÕ RỆT</span>`;
+              } else if (ef > es) {
+                trendTag = `<span class="tag-status status-safe">↗️ Nghiêng Tăng</span>`;
+              } else {
+                trendTag = `<span class="tag-status status-warning">↘️ Nghiêng Giảm</span>`;
+              }
+            }
+
+            // Dịch Bollinger Bands
+            let bbTag = '<span class="tag-status status-calm">--</span>';
+            if (item.bb_lower != null && item.bb_upper != null && item.close != null) {
+              const cl = Number(item.close);
+              const up = Number(item.bb_upper);
+              const low = Number(item.bb_lower);
+              if (cl > up) {
+                bbTag = `<span class="tag-status status-warning">⚠️ Vượt đỉnh biên</span>`;
+              } else if (cl < low) {
+                bbTag = `<span class="tag-status status-neutral">🔻 Thủng đáy biên</span>`;
+              } else {
+                bbTag = `<span class="tag-status status-safe">🛡️ Vùng bình thường</span>`;
+              }
+            }
+
+            // Dịch ATR (Biến động)
+            let atrTag = '<span class="tag-status status-calm">--</span>';
+            if (item.atr != null) {
+              const a = Number(item.atr);
+              atrTag = `<span class="tag-status status-safe">🍃 Sóng êm (${a.toFixed(2)})</span>`;
+            }
+
+            let assetName = '₿ Bitcoin (BTC)';
+            if (asset === 'XAU') assetName = '🟡 Vàng (XAU)';
+            if (asset === 'OIL') assetName = '🛢️ Dầu thô (WTI)';
+
+            let tfName = tf.includes('15') ? '15 Phút' : '1 Giờ';
+
+            rowsHtml += `
+              <tr>
+                <td style="font-weight:700;">${assetName}</td>
+                <td><span class="tag-status status-calm">${tfName}</span></td>
+                <td style="font-weight:700;color:#fff;">$${price}</td>
+                <td>${rsiTag}</td>
+                <td>${trendTag}</td>
+                <td>${bbTag}</td>
+                <td>${atrTag}</td>
+              </tr>
+            `;
+          });
+        });
+
+        if (rowsHtml) tbody.innerHTML = rowsHtml;
+
+        // 2. Cập nhật Gauge cho tài sản đang được chọn
+        const targetTf = (currentAsset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        const activeAssetData = indMap[currentAsset]?.[targetTf];
+        if (activeAssetData) {
+          updateCompositeGauge(activeAssetData);
+        }
+
+        // 3. Dịch Signals Feed sang câu chuyện có ngữ cảnh
+        const signals = data.signals || [];
+        document.getElementById('signalsCountBadge').textContent = `${signals.length} tín hiệu ghi nhận`;
+        const feedBox = document.getElementById('signalsFeedBox');
+
+        if (signals.length === 0) {
+          feedBox.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:30px;">Chưa có tín hiệu bất thường. Hệ thống đang theo dõi 24/7...</div>';
+        } else {
+          feedBox.innerHTML = signals.map(s => {
+            let story = '';
+            let icon = '🔔';
+            let confHtml = '<span class="conf-tag conf-mid">🟡 ĐỘ TIN CẬY: VỪA</span>';
+
+            const assetLabel = s.asset === 'BTC' ? 'Bitcoin' : (s.asset === 'XAU' ? 'Vàng' : 'Dầu thô');
+            const tfLabel = s.timeframe.includes('15') ? '15 phút' : '1 giờ';
+            const priceStr = '$' + Number(s.price).toFixed(2);
+
+            if (s.signal_type.includes('BB_BREAKOUT_DOWN')) {
+              icon = '🔻';
+              story = `<strong>${assetLabel} (${tfLabel})</strong> vừa giảm mạnh xuyên qua vùng đáy biên quen thuộc, rớt về <strong>${priceStr}</strong>. Cần chú ý nhịp hồi phục kỹ thuật hoặc nguy cơ giảm sâu tiếp.`;
+              confHtml = '<span class="conf-tag conf-mid">🟡 ĐỘ TIN CẬY: VỪA</span>';
+            } else if (s.signal_type.includes('BB_BREAKOUT_UP')) {
+              icon = '⚠️';
+              story = `<strong>${assetLabel} (${tfLabel})</strong> vừa bứt phá vượt qua đỉnh dải biên dao động tại mức <strong>${priceStr}</strong>. Động lực tăng mạnh nhưng rủi ro chốt lời đang tăng dần.`;
+              confHtml = '<span class="conf-tag conf-mid">🟡 ĐỘ TIN CẬY: VỪA</span>';
+            } else if (s.signal_type.includes('EMA_CROSS') && s.signal_type.includes('UP')) {
+              icon = '🚀';
+              story = `<strong>${assetLabel} (${tfLabel})</strong> vừa xác nhận mở ra chu kỳ TĂNG mới khi đường giá ngắn hạn vượt qua đường dài hạn tại mức <strong>${priceStr}</strong>.`;
+              confHtml = '<span class="conf-tag conf-high">🟢 ĐỘ TIN CẬY: CAO</span>';
+            } else if (s.signal_type.includes('EMA_CROSS')) {
+              icon = '📉';
+              story = `<strong>${assetLabel} (${tfLabel})</strong> vừa xác nhận tín hiệu trượt dốc GIẢM khi xu hướng ngắn hạn cắt xuống đường dài hạn tại mức <strong>${priceStr}</strong>.`;
+              confHtml = '<span class="conf-tag conf-high">🟢 ĐỘ TIN CẬY: CAO</span>';
+            } else if (s.signal_type.includes('OVERBOUGHT')) {
+              icon = '🔥';
+              story = `<strong>${assetLabel} (${tfLabel})</strong> đang tăng quá nóng ở mức <strong>${priceStr}</strong>. Lực mua bắt đầu đuối sức, cẩn trọng nhịp đảo chiều giảm.`;
+              confHtml = '<span class="conf-tag conf-high">🟢 ĐỘ TIN CẬY: CAO</span>';
+            } else if (s.signal_type.includes('OVERSOLD')) {
+              icon = '❄️';
+              story = `<strong>${assetLabel} (${tfLabel})</strong> rơi vào vùng bán tháo quá mức tại giá <strong>${priceStr}</strong>. Áp lực xả hàng đang suy yếu, mở ra cơ hội phục hồi.`;
+              confHtml = '<span class="conf-tag conf-high">🟢 ĐỘ TIN CẬY: CAO</span>';
+            } else if (s.signal_type.includes('SPIKE')) {
+              icon = '⚡';
+              story = `<strong>${assetLabel} (${tfLabel})</strong> ghi nhận biên độ biến động giật mạnh bất thường tại giá <strong>${priceStr}</strong>. Thị trường đang nhiều bão tố, nên thận trọng.`;
+              confHtml = '<span class="conf-tag conf-alert">⚡ CẢNH BÁO RỦI RO</span>';
+            } else {
+              story = `<strong>${assetLabel} (${tfLabel})</strong>: ${s.message || s.signal_type} tại mức ${priceStr}.`;
+            }
+
+            return `
+              <div class="story-item">
+                <div class="story-left">
+                  <div class="story-icon">${icon}</div>
+                  <div class="story-text">${story}</div>
+                </div>
+                <div class="story-meta">
+                  ${confHtml}
+                  <span>${s.time_str || ''}</span>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+
+      } catch (err) {
+        console.warn('Lỗi fetch snapshot:', err);
+      }
+    }
+
+    // --- CHUYỂN ĐỔI TÀI SẢN & KHUNG GIỜ ---
+    function selectAsset(asset) {
+      currentAsset = asset;
+      ['BTC', 'XAU', 'OIL'].forEach(a => {
+        const btn = document.getElementById('btnAsset' + a);
+        if (btn) btn.classList.toggle('active', a === asset);
+      });
+      document.getElementById('activeChartTitle').textContent = `[${asset} · ${currentTimeframe}]`;
+      fetchCandleData();
+      if (cachedSnapshot && cachedSnapshot.indicators) {
+        const tf = (asset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        updateCompositeGauge(cachedSnapshot.indicators[asset]?.[tf]);
+      }
+    }
+
+    function selectTimeframe(tf) {
+      currentTimeframe = tf;
+      document.getElementById('btnTf15m').classList.toggle('active', tf === '15m');
+      document.getElementById('btnTf1h').classList.toggle('active', tf === '1h');
+      document.getElementById('activeChartTitle').textContent = `[${currentAsset} · ${tf}]`;
+      fetchCandleData();
+      if (cachedSnapshot && cachedSnapshot.indicators) {
+        const targetTf = (currentAsset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
+        updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[targetTf]);
+      }
+    }
+
+    // --- MODAL CẤU HÌNH ---
+    function openConfigModal() {
+      document.getElementById('configModal').style.display = 'flex';
+    }
+    function closeConfigModal() {
+      document.getElementById('configModal').style.display = 'none';
+    }
+    async function saveConfig() {
+      const twelveKey = document.getElementById('cfgTwelveKey').value.trim();
+      const tgToken   = document.getElementById('cfgTgToken').value.trim();
+      const tgChat    = document.getElementById('cfgTgChat').value.trim();
       try {
         const res = await fetch('/api/config', {
           method: 'POST',
@@ -1243,174 +1968,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           })
         });
         const data = await res.json();
-        if (res.ok && data.status === 'ok') {
-          statusMsg.style.color = 'var(--green)';
-          statusMsg.textContent = '✓ ' + data.message;
-          updateDashboard();
-        } else {
-          statusMsg.style.color = 'var(--red)';
-          statusMsg.textContent = '✗ ' + (data.message || 'Error saving settings');
-        }
+        alert(data.message || 'Đã cập nhật cấu hình thành công!');
+        closeConfigModal();
+        updateDashboard();
       } catch (err) {
-        statusMsg.style.color = 'var(--red)';
-        statusMsg.textContent = '✗ Network error: ' + err.message;
-      } finally {
-        btn.disabled = false;
-        btn.textContent = '💾 Save & Apply in Realtime';
+        alert('Lỗi lưu cấu hình: ' + err);
       }
     }
 
-    async function updateDashboard() {
-      try {
-        const res = await fetch('/api/snapshot');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
+    // --- VÒNG LẶP CẬP NHẬT (PERFORMANCE GUARDRAILS) ---
+    window.addEventListener('DOMContentLoaded', () => {
+      initChart();
+      updateDashboard();
+      fetchCandleData();
 
-        // 1. Header meta
-        document.getElementById('uptimeDisplay').textContent = data.uptime_formatted || '--';
-        document.getElementById('serverTimeDisplay').textContent = data.server_time || '--';
-        document.getElementById('engineStatusText').textContent = data.status.toUpperCase();
+      // Snapshot số liệu & tín hiệu: mỗi 3 giây
+      setInterval(updateDashboard, 3000);
 
-        // 1.1 TwelveData status pill
-        const twelvePill = document.getElementById('twelveStatusPill');
-        if (twelvePill) {
-          if (data.twelvedata_configured) {
-            twelvePill.className = 'pill pill-bull';
-            twelvePill.textContent = 'XAU & OIL Active';
-          } else {
-            twelvePill.className = 'pill pill-gold';
-            twelvePill.textContent = 'BTC Only (Click to configure TwelveData)';
-          }
-        }
-
-        // 2. Telegram mode
-        const tgMetric = document.getElementById('tgModeMetric');
-        const tgSub = document.getElementById('tgModeSub');
-        if (data.telegram_enabled) {
-          tgMetric.textContent = 'ACTIVE';
-          tgMetric.style.color = 'var(--green)';
-          tgSub.textContent = 'Dispatching to Telegram Chat';
-        } else {
-          tgMetric.textContent = 'WEB / LOGS';
-          tgMetric.style.color = 'var(--gold)';
-          tgSub.textContent = 'Running Standalone (No Bot Token)';
-        }
-
-        // 3. Signals count
-        const signals = data.signals || [];
-        document.getElementById('signalsCountMetric').textContent = signals.length;
-        document.getElementById('signalsTotalLabel').textContent = signals.length + ' stored';
-
-        // 4. Render Indicators Table
-        const tbody = document.getElementById('indicatorsTbody');
-        const indMap = data.indicators || {};
-        let rowsHtml = '';
-        const assetsOrder = ['BTC', 'XAU', 'OIL'];
-
-        assetsOrder.forEach(asset => {
-          const tfs = indMap[asset] || {};
-          Object.keys(tfs).forEach(tf => {
-            const item = tfs[tf];
-            if (!item) return;
-
-            // Price format
-            const price = item.close != null ? Number(item.close).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4}) : '--';
-
-            // RSI format & badge
-            let rsiBadge = '<span class="pill pill-neutral">N/A</span>';
-            if (item.rsi != null) {
-              const r = Number(item.rsi);
-              if (r >= 70) {
-                rsiBadge = `<span class="pill pill-bear">${r.toFixed(1)} [OB]</span>`;
-              } else if (r <= 30) {
-                rsiBadge = `<span class="pill pill-bull">${r.toFixed(1)} [OS]</span>`;
-              } else {
-                rsiBadge = `<span class="pill pill-neutral">${r.toFixed(1)}</span>`;
-              }
-            }
-
-            // EMA Trend
-            let emaTrend = '<span class="pill pill-neutral">N/A</span>';
-            if (item.ema_fast != null && item.ema_slow != null) {
-              const ef = Number(item.ema_fast);
-              const es = Number(item.ema_slow);
-              if (ef > es) {
-                emaTrend = `<span class="pill pill-bull">BULLISH ▲</span> <span style="color:var(--text-muted);font-size:0.75rem;">(${ef.toFixed(1)} / ${es.toFixed(1)})</span>`;
-              } else {
-                emaTrend = `<span class="pill pill-bear">BEARISH ▼</span> <span style="color:var(--text-muted);font-size:0.75rem;">(${ef.toFixed(1)} / ${es.toFixed(1)})</span>`;
-              }
-            }
-
-            // Bollinger Bands
-            let bbStr = '<span style="color:var(--text-muted);">N/A</span>';
-            if (item.bb_lower != null && item.bb_mid != null && item.bb_upper != null) {
-              bbStr = `${Number(item.bb_lower).toFixed(2)} | ${Number(item.bb_mid).toFixed(2)} | ${Number(item.bb_upper).toFixed(2)}`;
-            }
-
-            // ATR
-            const atrStr = item.atr != null ? Number(item.atr).toFixed(4) : 'N/A';
-
-            // Time
-            const timeStr = item.ts ? new Date(item.ts * 1000).toLocaleTimeString() : '--';
-
-            let assetIcon = '📊';
-            if (asset === 'BTC') assetIcon = '₿';
-            if (asset === 'XAU') assetIcon = '🟡';
-            if (asset === 'OIL') assetIcon = '🛢️';
-
-            rowsHtml += `
-              <tr>
-                <td><span class="asset-tag">${assetIcon} ${asset}</span></td>
-                <td><span class="pill pill-neutral">${tf}</span></td>
-                <td style="font-weight:700;color:var(--text);">$${price}</td>
-                <td>${rsiBadge}</td>
-                <td>${emaTrend}</td>
-                <td style="font-size:0.8rem;color:var(--text-muted);">${bbStr}</td>
-                <td>${atrStr}</td>
-                <td style="font-size:0.8rem;color:var(--text-muted);">${timeStr}</td>
-              </tr>
-            `;
-          });
-        });
-
-        if (rowsHtml) {
-          tbody.innerHTML = rowsHtml;
-        }
-
-        // 5. Render Signals Feed
-        const feedBox = document.getElementById('signalsFeedBox');
-        if (signals.length === 0) {
-          feedBox.innerHTML = '<div class="empty-signals">No signals triggered yet. Waiting for candle closes...</div>';
-        } else {
-          feedBox.innerHTML = signals.map(sig => {
-            let pillClass = 'pill-gold';
-            if (sig.signal_type.includes('UP') || sig.signal_type.includes('OVERSOLD')) pillClass = 'pill-bull';
-            if (sig.signal_type.includes('DOWN') || sig.signal_type.includes('OVERBOUGHT')) pillClass = 'pill-bear';
-            if (sig.signal_type.includes('SPIKE')) pillClass = 'pill-purple';
-
-            const cleanMsg = (sig.message || '').replace(/\\*|_|`/g, '');
-            return `
-              <div class="signal-item">
-                <div class="sig-left">
-                  <span class="pill ${pillClass}">${sig.signal_type}</span>
-                  <span style="font-weight:700;">${sig.asset} (${sig.timeframe})</span>
-                  <span class="sig-msg">${cleanMsg}</span>
-                </div>
-                <div style="display:flex;align-items:center;gap:12px;">
-                  <span class="sig-price">$${Number(sig.price).toFixed(4)}</span>
-                  <span class="sig-time">${sig.time_str || ''}</span>
-                </div>
-              </div>
-            `;
-          }).join('');
-        }
-      } catch (err) {
-        console.warn('Dashboard fetch error:', err);
-      }
-    }
-
-    setInterval(updateDashboard, 3000);
-    window.addEventListener('load', updateDashboard);
+      // Biểu đồ nến: mỗi 15 giây (tiết kiệm băng thông & tải render canvas)
+      setInterval(fetchCandleData, 15000);
+    });
   </script>
 </body>
 </html>
@@ -1435,13 +2012,61 @@ class DashboardServer:
         self._app.router.add_get("/",             self.handle_index)
         self._app.router.add_get("/health",       self.handle_health)
         self._app.router.add_get("/api/snapshot", self.handle_snapshot)
+        self._app.router.add_get("/api/candles",  self.handle_candles)
         self._app.router.add_get("/api/health",   self.handle_health)
         self._app.router.add_post("/api/config",  self.handle_save_config)
         self._runner: Optional[web.AppRunner] = None
         self._site:   Optional[web.TCPSite]   = None
 
     async def handle_index(self, request: web.Request) -> web.Response:
-        return web.Response(text=HTML_DASHBOARD, content_type="text/html", charset="utf-8")
+        content = HTML_DASHBOARD
+        dash_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+        if os.path.exists(dash_path):
+            try:
+                with open(dash_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                pass
+        return web.Response(text=content, content_type="text/html", charset="utf-8")
+
+    async def handle_candles(self, request: web.Request) -> web.Response:
+        """
+        Lightweight read-only endpoint returning OHLC candle history for charting.
+        Pulls directly from circular buffer in RAM without heavy computation.
+        """
+        asset = request.query.get("asset", "BTC").upper()
+        tf = request.query.get("tf", "15m").lower()
+        limit_str = request.query.get("limit", "100")
+        try:
+            limit = min(max(int(limit_str), 10), 300)
+        except ValueError:
+            limit = 100
+
+        # Support timeframe alias between 15m and 15min
+        buf = None
+        asset_bufs = self._orchestrator._bufs.get(asset, {})
+        if tf in asset_bufs:
+            buf = asset_bufs[tf]
+        elif tf == "15m" and "15min" in asset_bufs:
+            buf = asset_bufs["15min"]
+        elif tf == "15min" and "15m" in asset_bufs:
+            buf = asset_bufs["15m"]
+
+        if not buf:
+            return web.json_response([], status=200)
+
+        candles = buf.last_n_candles(limit)
+        data = [
+            {
+                "time": int(c.ts),
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+            }
+            for c in candles
+        ]
+        return web.json_response(data)
 
     async def handle_snapshot(self, request: web.Request) -> web.Response:
         now = time.time()
