@@ -625,7 +625,7 @@
         <span class="group-label">Tài sản:</span>
         <button class="tab-btn active" id="btnAssetBTC" onclick="selectAsset('BTC')">₿ Bitcoin (BTC)</button>
         <button class="tab-btn" id="btnAssetXAU" onclick="selectAsset('XAU')">🟡 Vàng (XAU)</button>
-        <button class="tab-btn" id="btnAssetOIL" onclick="selectAsset('OIL')">🛢️ Dầu thô (WTI)</button>
+        <button class="tab-btn" id="btnAssetOIL" onclick="selectAsset('OIL')">🛢️ Dầu thô (USO)</button>
       </div>
       <div class="tabs-group">
         <span class="group-label">Khung giờ:</span>
@@ -678,6 +678,9 @@
             <div class="gauge-badge" id="gaugeBadge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
               ⚖️ TRUNG LẬP
             </div>
+            <p style="font-size:0.75rem; color:var(--text-muted); margin: 6px 0 10px 0; text-align:center; line-height:1.4;">
+              ℹ️ Đây là chỉ số tâm lý thị trường tổng quát. Xem khuyến nghị hành động cụ thể kèm độ tin cậy riêng ở khung <strong>"Khuyến Nghị Giao Dịch"</strong> bên dưới.
+            </p>
             <div class="gauge-bar-track">
               <div class="gauge-bar-gradient"></div>
               <div class="gauge-needle" id="gaugeNeedle" style="left:50%;"></div>
@@ -723,7 +726,15 @@
                 <span id="adviceActionText">WAIT</span>
               </div>
               <div class="advice-conf-box">
-                <div class="advice-conf-label" id="adviceConfLabel">Độ tin cậy: Thấp (0/5)</div>
+                <div class="advice-conf-label" style="display:flex; align-items:center; justify-content:flex-end; gap:4px;">
+                  <span id="adviceConfLabel">Độ tin cậy: Thấp (0/5)</span>
+                  <span class="has-tip" style="cursor:help;">
+                    <span class="tip-icon" style="width:13px; height:13px; font-size:0.7rem;">ℹ</span>
+                    <div class="tip-box" style="right:0; left:auto; transform:none; width:250px;">
+                      Độ tin cậy được tính từ số lượng yếu tố kỹ thuật (Xu hướng, RSI, Vị trí dải giá, Tín hiệu mâu thuẫn, Đa khung thời gian) đang đồng thuận với nhau. Đây là thang đo RIÊNG, khác với Thước Đo Tâm Lý Thị Trường ở trên, nhưng cả hai đều phản ánh cùng một xu hướng thị trường.
+                    </div>
+                  </span>
+                </div>
                 <div class="advice-conf-bar-track">
                   <div class="advice-conf-bar-fill" id="adviceConfBar" style="width: 20%;"></div>
                 </div>
@@ -1217,7 +1228,7 @@
 
             let assetName = '₿ Bitcoin (BTC)';
             if (asset === 'XAU') assetName = '🟡 Vàng (XAU)';
-            if (asset === 'OIL') assetName = '🛢️ Dầu thô (WTI)';
+            if (asset === 'OIL') assetName = '🛢️ Dầu thô (USO)';
 
             let tfName = tf.includes('15') ? '15 Phút' : '1 Giờ';
 

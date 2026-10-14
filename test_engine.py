@@ -253,6 +253,68 @@ class TestEngine(unittest.TestCase):
         self.assertIn("confidence", btc_advice)
         self.assertIn("disclaimer", btc_advice)
 
+    def test_mtf_label_dynamic_not_hardcoded(self):
+        """Lỗi 1: Khi đang ở khung 1h, label phải nói '15 phút (ngắn hạn hơn)', KHÔNG được nói 'khung lớn'."""
+        engine = ConfluenceDecisionEngine(CONFIG)
+        label = engine._get_relative_tf_label("1h", "15m")
+        self.assertIn("ngắn hạn hơn", label)
+        self.assertNotIn("lớn", label.lower())
+
+    def test_counter_move_detected_on_vshape_bounce(self):
+        """Lỗi 2 - Regression test: Tái hiện đúng case XAU 1h đã quan sát.
+        Giá giảm sâu rồi bật mạnh ngược trend EMA giảm PHẢI được gắn cờ conflict, dẫn tới action=WAIT."""
+        class FakeCandle:
+            def __init__(self, close):
+                self.close = close
+
+        candles = [
+            FakeCandle(close=4148.69),  # đáy
+            FakeCandle(close=4163.00),
+            FakeCandle(close=4188.83),  # bật mạnh ~3.7x ATR
+        ]
+        snapshot = {
+            "close": 4188.83, "ema_fast": 4158.11, "ema_slow": 4162.64,
+            "rsi": 40.4, "bb_upper": 4164.63, "bb_lower": 4151.95,
+            "atr": 10.81,
+        }
+        engine = ConfluenceDecisionEngine(CONFIG)
+        advice = engine.decide(
+            asset="XAU", timeframe="1h", snapshot=snapshot,
+            recent_signals=[], recent_candles=candles
+        )
+
+        self.assertTrue(advice.counter_move_detected)
+        self.assertEqual(
+            advice.action, "WAIT",
+            "Phải chuyển thành WAIT khi phát hiện counter-move mạnh, không được giữ nguyên SELL như lỗi cũ"
+        )
+        self.assertTrue(any("biến động giá tăng mạnh bất thường" in r for r in advice.reasoning))
+
+    def test_no_false_positive_counter_move_in_normal_trend(self):
+        """Đảm bảo patch mới KHÔNG gây false positive khi trend đang diễn biến bình thường, không có biến động bất thường."""
+        class FakeCandle:
+            def __init__(self, close):
+                self.close = close
+
+        candles = [
+            FakeCandle(close=4160.0), 
+            FakeCandle(close=4158.0), 
+            FakeCandle(close=4156.0),  # giảm đều, đúng với trend giảm
+        ]
+        snapshot = {
+            "close": 4156.0, "ema_fast": 4158.0, "ema_slow": 4164.0,
+            "rsi": 45.0, "bb_upper": 4170.0, "bb_lower": 4150.0,
+            "atr": 10.0,
+        }
+        engine = ConfluenceDecisionEngine(CONFIG)
+        advice = engine.decide(
+            asset="XAU", timeframe="1h", snapshot=snapshot,
+            recent_signals=[], recent_candles=candles
+        )
+
+        self.assertFalse(advice.counter_move_detected)
+        self.assertEqual(advice.action, "SELL")
+
 
 if __name__ == "__main__":
     unittest.main()

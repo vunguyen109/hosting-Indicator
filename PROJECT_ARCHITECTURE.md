@@ -90,6 +90,17 @@ hosting-Indicator/
 | **Section 11: Orchestrator** | `IndicatorOrchestrator` | Bộ điều phối chính: Khởi tạo HTTP session dùng chung, pre-fill lịch sử 300 nến vào RAM, quản lý 8 tasks chạy nền song song, hỗ trợ `reload_asset_buffers` khi người dùng nạp API key mới từ UI. |
 | **Section 12: Logging** | `setup_logging`, `main` | Rotating log (5MB x 2 file backup = tối đa 15MB disk). Cấu hình unbuffered stdout để log hiển thị tức thì trên bảng điều khiển cloud container. |
 
+### Section 4.5: Confluence Decision Engine
+Phân tích hợp lưu đa khung thời gian để sinh khuyến nghị BUY/SELL/WAIT:
+- **Heuristics:** Phân loại Trend EMA (20/50), RSI (14), Bollinger Bands, Tín hiệu mâu thuẫn (RuleEngine) và Biến động ngược chiều (Counter-Move).
+- **Phạm vi:** Chỉ phục vụ hiển thị UI qua `/api/snapshot`, **KHÔNG tích hợp với TelegramDispatcher**.
+
+### Changelog v1.1 (Patch sau kiểm thử thực tế)
+- [Fixed] Reasoning text MTF agreement giờ mô tả ĐÚNG hướng so sánh thực tế (ngắn hạn/dài hạn) thay vì hard-code "khung lớn".
+- [Fixed] Bổ sung `detect_counter_move()` để bắt các cú biến động giá mạnh dạng V-shape không trùng khớp với Signal rời rạc nào của RuleEngine — khắc phục điểm mù khiến hệ thống bỏ sót mâu thuẫn rõ ràng giữa EMA Trend và diễn biến giá tức thời.
+- [UX] Thêm chú giải liên kết giữa Gauge (thang 0-100, tính client) và Confidence Score (thang 0-5, tính server) để tránh người dùng hiểu lầm đây là 2 kết luận trái ngược.
+- Nguồn gốc patch: phát hiện qua live testing case thực tế XAU/USD khung 1h ngày quan sát, giá bật từ $4,148 lên $4,188 (~3.7x ATR) mà không được hệ thống gắn cờ cảnh báo.
+
 ---
 
 ## 5. Đặc Tả Giao Diện API (API Specifications)
@@ -161,10 +172,12 @@ Server lắng nghe mặc định tại `0.0.0.0:${SERVER_PORT:-8080}`:
             "RSI nghiêng mua, còn dư địa tăng",
             "Giá áp sát biên trên (ủng hộ xu hướng tăng)",
             "Không có tín hiệu mâu thuẫn gần đây",
-            "Khung thời gian lớn ĐỒNG THUẬN xu hướng"
+            "khung 1 giờ (dài hạn hơn) cũng ĐỒNG THUẬN xu hướng"
           ],
           "conflict_detected": false,
           "mtf_agreement": true,
+          "counter_move_detected": false,
+          "counter_move_magnitude_atr": 0.0,
           "disclaimer": "Đây là khuyến nghị dựa trên thuật toán kỹ thuật, KHÔNG PHẢI lời khuyên đầu tư..."
         }
       }

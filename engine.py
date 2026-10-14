@@ -2,7 +2,7 @@
 HOSTING INDICATOR ENGINE v1.0
 Low-Resource Quant Engine | 1.5vCore - 2GB RAM - 2GB Disk
 
-Assets  : BTC/USDT - XAU/USD - WTI (OIL/USD)
+Assets  : BTC/USDT - XAU/USD - USO (Crude Oil ETF)
 Signals : EMA crossover - RSI OB/OS - BB squeeze - ATR breakout
 Stack   : Python 3.11+ - asyncio - aiohttp (with aiohttp.web Dashboard) - stdlib only
 
@@ -149,9 +149,9 @@ CONFIG = {
             "timeframes": ["15min", "1h"],
         },
         "OIL": {
-            "name":       "Crude Oil (WTI)",
+            "name":       "Crude Oil (USO)",
             "source":     "twelvedata",
-            "symbol":     "WTI/USD",
+            "symbol":     "USO",
             "timeframes": ["15min", "1h"],
         },
     },
@@ -196,6 +196,11 @@ CONFIG = {
 
     # Ngưỡng coi là "giá đã gần EMA20, có thể entry ngay" thay vì "chờ pullback"
     "ENTRY_PULLBACK_ATR_THRESHOLD": 0.3,
+
+    # Số nến gần nhất dùng để phát hiện biến động ngược dòng mạnh
+    "COUNTER_MOVE_LOOKBACK_CANDLES": 3,
+    # Ngưỡng: biến động giá (đơn vị lần ATR) trong N nến gần nhất được coi là "counter-move" đủ mạnh để nghi ngờ xu hướng EMA
+    "COUNTER_MOVE_ATR_THRESHOLD":    2.0,
 
     # ---- Polling timing -------------------------------------------------
     # Poll 5 seconds after candle close for exchange data to settle
@@ -609,6 +614,8 @@ class TradeAdvice:
     reasoning: list[str]           # checklist lý do (để hiển thị UI)
     conflict_detected: bool
     mtf_agreement: Optional[bool]  # None nếu không có dữ liệu khung kia
+    counter_move_detected: bool = False
+    counter_move_magnitude_atr: float = 0.0
     disclaimer: str = (
         "Đây là khuyến nghị dựa trên thuật toán kỹ thuật, "
         "KHÔNG PHẢI lời khuyên đầu tư. Người dùng tự chịu "
@@ -630,8 +637,13 @@ class TradeAdvice:
             "reasoning": self.reasoning,
             "conflict_detected": self.conflict_detected,
             "mtf_agreement": self.mtf_agreement,
+            "counter_move_detected": self.counter_move_detected,
+            "counter_move_magnitude_atr": round(self.counter_move_magnitude_atr, 4),
             "disclaimer": self.disclaimer,
         }
+
+
+TIMEFRAME_ORDER = {"15m": 1, "15min": 1, "1h": 2}
 
 
 class ConfluenceDecisionEngine:
@@ -649,6 +661,52 @@ class ConfluenceDecisionEngine:
 
     def __init__(self, config: dict) -> None:
         self.cfg = config
+
+    def _get_relative_tf_label(self, current_tf: str, other_tf: Optional[str]) -> str:
+        """Trả về mô tả tương đối chính xác về mặt ngữ nghĩa, không giả định cố định 'khung lớn' hay 'khung nhỏ'."""
+        if not other_tf:
+            return "khung thời gian khác"
+        current_rank = TIMEFRAME_ORDER.get(current_tf, 0)
+        other_rank = TIMEFRAME_ORDER.get(other_tf, 0)
+        other_tf_display = {"15m": "15 phút", "15min": "15 phút", "1h": "1 giờ"}.get(other_tf, other_tf)
+        if other_rank > current_rank:
+            return f"khung {other_tf_display} (dài hạn hơn)"
+        elif other_rank < current_rank:
+            return f"khung {other_tf_display} (ngắn hạn hơn)"
+        else:
+            return f"khung {other_tf_display}"
+
+    def detect_counter_move(
+        self, recent_candles: Optional[list], atr: float, trend: TrendState
+    ) -> tuple[bool, float]:
+        """
+        Phát hiện biến động giá ngược chiều với xu hướng EMA hiện tại trong N nến gần nhất,
+        kể cả khi không có Signal rời rạc nào được RuleEngine kích hoạt.
+        Trả về: (có_phát_hiện: bool, độ_lớn_theo_ATR: float)
+        """
+        n = self.cfg.get("COUNTER_MOVE_LOOKBACK_CANDLES", 3)
+        if not recent_candles or len(recent_candles) < n or atr <= 0:
+            return False, 0.0
+
+        window = recent_candles[-n:]
+        c_first = getattr(window[0], "close", None) if not isinstance(window[0], dict) else window[0].get("close")
+        c_last = getattr(window[-1], "close", None) if not isinstance(window[-1], dict) else window[-1].get("close")
+        if c_first is None or c_last is None:
+            return False, 0.0
+
+        price_change = float(c_last) - float(c_first)
+        change_in_atr = price_change / atr
+        threshold = self.cfg.get("COUNTER_MOVE_ATR_THRESHOLD", 2.0)
+
+        trend_is_down = trend in (TrendState.STRONG_DOWN, TrendState.LEAN_DOWN)
+        trend_is_up = trend in (TrendState.STRONG_UP, TrendState.LEAN_UP)
+
+        # Counter-move = giá tăng mạnh NGƯỢC xu hướng giảm, hoặc ngược lại
+        if trend_is_down and change_in_atr > threshold:
+            return True, change_in_atr
+        if trend_is_up and change_in_atr < -threshold:
+            return True, change_in_atr
+        return False, change_in_atr
 
     def classify_ema_trend(self, ema_fast: float, ema_slow: float, atr: float) -> TrendState:
         if atr <= 0:
@@ -735,7 +793,9 @@ class ConfluenceDecisionEngine:
         timeframe: str,
         snapshot: dict,
         recent_signals: list,
+        recent_candles: Optional[list] = None,
         other_tf_snapshot: Optional[dict] = None,
+        other_timeframe: Optional[str] = None,
     ) -> TradeAdvice:
         """
         snapshot: dict với các key close, ema_fast, ema_slow, rsi, bb_upper, bb_mid, bb_lower, atr.
@@ -765,6 +825,8 @@ class ConfluenceDecisionEngine:
                 reasoning=["Đang thu thập đủ dữ liệu nến để tính toán chỉ báo..."],
                 conflict_detected=False,
                 mtf_agreement=None,
+                counter_move_detected=False,
+                counter_move_magnitude_atr=0.0,
             )
 
         close = snapshot["close"]
@@ -772,7 +834,10 @@ class ConfluenceDecisionEngine:
         trend = self.classify_ema_trend(snapshot["ema_fast"], snapshot["ema_slow"], atr)
         rsi_zone = self.classify_rsi(snapshot["rsi"])
         bb_pos = self.classify_bb_position(close, snapshot["bb_upper"], snapshot["bb_lower"])
-        conflict = self.detect_conflict(recent_signals, asset, timeframe, trend)
+        
+        conflict_from_signals = self.detect_conflict(recent_signals, asset, timeframe, trend)
+        counter_move_detected, counter_move_magnitude = self.detect_counter_move(recent_candles, atr, trend)
+        conflict = conflict_from_signals or counter_move_detected
 
         trend_other = None
         if other_tf_snapshot and all(
@@ -829,18 +894,27 @@ class ConfluenceDecisionEngine:
             reasoning.append("Giá trong vùng dao động bình thường")
 
         # 4. Conflict detection factor
-        if conflict:
+        if counter_move_detected:
+            direction = "tăng" if counter_move_magnitude > 0 else "giảm"
+            reasoning.append(
+                f"⚠️ Phát hiện biến động giá {direction} mạnh bất thường "
+                f"trong {self.cfg.get('COUNTER_MOVE_LOOKBACK_CANDLES', 3)} nến gần nhất "
+                f"(~{abs(counter_move_magnitude):.1f}x ATR) — ngược chiều với "
+                f"xu hướng EMA hiện tại, cần thận trọng"
+            )
+        elif conflict_from_signals:
             reasoning.append("⚠️ Phát hiện tín hiệu MÂU THUẪN gần đây trên chart — cần thận trọng")
         else:
             reasoning.append("Không có tín hiệu mâu thuẫn gần đây")
 
         # 5. Multi-timeframe agreement factor
         if mtf_agree is not None:
+            tf_label = self._get_relative_tf_label(timeframe, other_timeframe)
             if mtf_agree:
                 score += 1 if score > 0 else (-1 if score < 0 else 0)
-                reasoning.append("Khung thời gian lớn ĐỒNG THUẬN xu hướng")
+                reasoning.append(f"{tf_label} cũng ĐỒNG THUẬN xu hướng")
             else:
-                reasoning.append("⚠️ Khung thời gian lớn KHÔNG đồng thuận")
+                reasoning.append(f"⚠️ {tf_label} KHÔNG đồng thuận xu hướng")
 
         # Decision Matrix evaluation
         is_sideway = (trend == TrendState.NEUTRAL and bb_pos == BbPosition.MIDDLE)
@@ -919,6 +993,8 @@ class ConfluenceDecisionEngine:
             reasoning=reasoning,
             conflict_detected=conflict,
             mtf_agreement=mtf_agree,
+            counter_move_detected=counter_move_detected,
+            counter_move_magnitude_atr=round(counter_move_magnitude, 4),
         )
 
 
@@ -1062,7 +1138,7 @@ class BinanceFetcher:
 class TwelveDataFetcher:
     """
     TwelveData REST API -- free tier: 800 req/day, 8 req/min.
-    Used for XAU/USD (Gold) and WTI/USD (Crude Oil).
+    Used for XAU/USD (Gold) and USO (Crude Oil ETF).
     Built-in throttle enforces >= 8 seconds between requests.
     """
 
@@ -1901,7 +1977,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <span class="group-label">Tài sản:</span>
         <button class="tab-btn active" id="btnAssetBTC" onclick="selectAsset('BTC')">₿ Bitcoin (BTC)</button>
         <button class="tab-btn" id="btnAssetXAU" onclick="selectAsset('XAU')">🟡 Vàng (XAU)</button>
-        <button class="tab-btn" id="btnAssetOIL" onclick="selectAsset('OIL')">🛢️ Dầu thô (WTI)</button>
+        <button class="tab-btn" id="btnAssetOIL" onclick="selectAsset('OIL')">🛢️ Dầu thô (USO)</button>
       </div>
       <div class="tabs-group">
         <span class="group-label">Khung giờ:</span>
@@ -1954,6 +2030,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             <div class="gauge-badge" id="gaugeBadge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
               ⚖️ TRUNG LẬP
             </div>
+            <p style="font-size:0.75rem; color:var(--text-muted); margin: 6px 0 10px 0; text-align:center; line-height:1.4;">
+              ℹ️ Đây là chỉ số tâm lý thị trường tổng quát. Xem khuyến nghị hành động cụ thể kèm độ tin cậy riêng ở khung <strong>"Khuyến Nghị Giao Dịch"</strong> bên dưới.
+            </p>
             <div class="gauge-bar-track">
               <div class="gauge-bar-gradient"></div>
               <div class="gauge-needle" id="gaugeNeedle" style="left:50%;"></div>
@@ -1999,7 +2078,15 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
                 <span id="adviceActionText">WAIT</span>
               </div>
               <div class="advice-conf-box">
-                <div class="advice-conf-label" id="adviceConfLabel">Độ tin cậy: Thấp (0/5)</div>
+                <div class="advice-conf-label" style="display:flex; align-items:center; justify-content:flex-end; gap:4px;">
+                  <span id="adviceConfLabel">Độ tin cậy: Thấp (0/5)</span>
+                  <span class="has-tip" style="cursor:help;">
+                    <span class="tip-icon" style="width:13px; height:13px; font-size:0.7rem;">ℹ</span>
+                    <div class="tip-box" style="right:0; left:auto; transform:none; width:250px;">
+                      Độ tin cậy được tính từ số lượng yếu tố kỹ thuật (Xu hướng, RSI, Vị trí dải giá, Tín hiệu mâu thuẫn, Đa khung thời gian) đang đồng thuận với nhau. Đây là thang đo RIÊNG, khác với Thước Đo Tâm Lý Thị Trường ở trên, nhưng cả hai đều phản ánh cùng một xu hướng thị trường.
+                    </div>
+                  </span>
+                </div>
                 <div class="advice-conf-bar-track">
                   <div class="advice-conf-bar-fill" id="adviceConfBar" style="width: 20%;"></div>
                 </div>
@@ -2493,7 +2580,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
             let assetName = '₿ Bitcoin (BTC)';
             if (asset === 'XAU') assetName = '🟡 Vàng (XAU)';
-            if (asset === 'OIL') assetName = '🛢️ Dầu thô (WTI)';
+            if (asset === 'OIL') assetName = '🛢️ Dầu thô (USO)';
 
             let tfName = tf.includes('15') ? '15 Phút' : '1 Giờ';
 
@@ -3014,12 +3101,18 @@ class IndicatorOrchestrator:
         other_tf = next((t for t in cfg_tfs if t != tf), None)
         other_tf_snapshot = self._latest_indicators.get(asset, {}).get(other_tf) if other_tf else None
 
+        buf = self._bufs.get(asset, {}).get(tf)
+        n_candles = CONFIG.get("COUNTER_MOVE_LOOKBACK_CANDLES", 3)
+        recent_candles = buf.last_n_candles(n_candles) if buf else []
+
         advice = self._confluence_engine.decide(
             asset=asset,
             timeframe=tf,
             snapshot=ind,
             recent_signals=list(self._recent_signals),
+            recent_candles=recent_candles,
             other_tf_snapshot=other_tf_snapshot,
+            other_timeframe=other_tf,
         )
         self._latest_advice.setdefault(asset, {})[tf] = advice
 

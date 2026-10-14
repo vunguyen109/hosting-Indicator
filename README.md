@@ -1,7 +1,7 @@
 # Hosting Indicator Engine
 
 **Low-Resource Quant Signal Service & Web Dashboard** — Python 3.11 | asyncio | aiohttp  
-Tài sản: BTC/USDT · XAU/USD (Gold) · WTI Crude Oil | Khung thời gian: M15 · H1  
+Tài sản: BTC/USDT · XAU/USD (Gold) · Dầu thô (USO ETF Proxy) | Khung thời gian: M15 · H1  
 Tín hiệu: EMA Cross · RSI OB/OS · Bollinger Bands · ATR Volatility Spike  
 Giao diện: **Web UI Dashboard (Dark Mode)** · Live Console · Telegram Bot *(Tùy chọn)*
 
@@ -62,7 +62,7 @@ Trước khi deploy, bạn cần chuẩn bị:
 
 ### 3.1. Chưa có Telegram Bot thì xem thông tin ở đâu?
 Hệ thống được tích hợp sẵn **Single-page Web Dashboard** và **REST API** bằng `aiohttp.web`:
-1. **Bảng chỉ báo Realtime (Live Indicators Table):** Cập nhật giá đóng cửa, RSI (14), Trend EMA (20/50), Bollinger Bands (Lower / Mid / Upper), ATR (14) của cả 3 tài sản (BTC, Vàng XAU, Dầu WTI) trên khung 15m và 1h.
+1. **Bảng chỉ báo Realtime (Live Indicators Table):** Cập nhật giá đóng cửa, RSI (14), Trend EMA (20/50), Bollinger Bands (Lower / Mid / Upper), ATR (14) của cả 3 tài sản (BTC, Vàng XAU, Dầu thô USO) trên khung 15m và 1h.
 2. **Dòng tín hiệu trực tiếp (Live Signals Feed):** Lưu bộ đệm 50 tín hiệu gần nhất trong RAM, phân loại rõ ràng:
    - `BULLISH ▲ / BEARISH ▼`
    - `RSI OVERBOUGHT / RSI OVERSOLD`
