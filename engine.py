@@ -202,6 +202,25 @@ CONFIG = {
     # Ngưỡng: biến động giá (đơn vị lần ATR) trong N nến gần nhất được coi là "counter-move" đủ mạnh để nghi ngờ xu hướng EMA
     "COUNTER_MOVE_ATR_THRESHOLD":    2.0,
 
+    # Đòn bẩy và % vốn mặc định — dùng để quy đổi và hiển thị minh họa
+    "DEFAULT_LEVERAGE":             5,
+    "DEFAULT_ACCOUNT_RISK_PCT":     0.10,
+
+    # SL cho swing trading khung 1h/4h (bội số ATR)
+    "SWING_SL_ATR_MULTIPLIER":      1.5,
+
+    # Multi-tier TP định nghĩa trực tiếp bằng % LỢI NHUẬN TRÊN VỐN KÝ QUỸ mong muốn
+    # price_move_pct = margin_profit_pct / leverage (với leverage=5, margin 5% -> giá 1%)
+    "SWING_TP_LEVELS_MARGIN_PCT": [
+        {"margin_profit_pct": 5.0,  "close_pct": 0.40, "label": "TP1 - Chốt lời sớm"},
+        {"margin_profit_pct": 7.5,  "close_pct": 0.35, "label": "TP2 - Mục tiêu chính"},
+        {"margin_profit_pct": 10.0, "close_pct": 0.25, "label": "TP3 - Mục tiêu tối đa"},
+    ],
+
+    # Ngưỡng đánh giá tính khả thi — tính theo % BIẾN ĐỘNG GIÁ thực tế (đã quy đổi từ margin %)
+    "PRICE_MOVE_FEASIBLE_MAX_PCT":      0.03,  # price move > 3% mới coi là "tham vọng"
+    "PRICE_MOVE_FEASIBLE_MIN_ATR_MULT": 1.0,   # price move < 1x ATR thì "quá gần, dễ đạt nhưng R:R kém"
+
     # ---- Polling timing -------------------------------------------------
     # Poll 5 seconds after candle close for exchange data to settle
     "poll_offset_seconds": 5,
@@ -616,6 +635,11 @@ class TradeAdvice:
     mtf_agreement: Optional[bool]  # None nếu không có dữ liệu khung kia
     counter_move_detected: bool = False
     counter_move_magnitude_atr: float = 0.0
+    swing_mode: bool = False
+    tp_levels: list = field(default_factory=list)
+    sl_margin_loss_pct: float = 0.0
+    target_feasibility: str = ""
+    estimated_holding_time: str = ""
     disclaimer: str = (
         "Đây là khuyến nghị dựa trên thuật toán kỹ thuật, "
         "KHÔNG PHẢI lời khuyên đầu tư. Người dùng tự chịu "
@@ -639,6 +663,11 @@ class TradeAdvice:
             "mtf_agreement": self.mtf_agreement,
             "counter_move_detected": self.counter_move_detected,
             "counter_move_magnitude_atr": round(self.counter_move_magnitude_atr, 4),
+            "swing_mode": self.swing_mode,
+            "tp_levels": self.tp_levels,
+            "sl_margin_loss_pct": self.sl_margin_loss_pct,
+            "target_feasibility": self.target_feasibility,
+            "estimated_holding_time": self.estimated_holding_time,
             "disclaimer": self.disclaimer,
         }
 
@@ -707,6 +736,39 @@ class ConfluenceDecisionEngine:
         if trend_is_up and change_in_atr < -threshold:
             return True, change_in_atr
         return False, change_in_atr
+
+    def estimate_holding_period(self, price_distance: float, atr: float, timeframe: str) -> dict:
+        """
+        Ước tính thời gian cần thiết để giá di chuyển khoảng cách price_distance dựa trên ATR và timeframe.
+        Tốc độ dịch chuyển trung bình khi có trend ước tính ~0.46 ATR / nến.
+        """
+        if atr <= 0 or price_distance <= 0:
+            return {"candles": 1, "hours": 1.0, "time_label": "1h"}
+
+        drift_rate = 0.46 * atr
+        candles = max(1, round(price_distance / drift_rate))
+
+        tf_normalized = timeframe.lower()
+        if "15" in tf_normalized:
+            hours = candles * 0.25
+        elif "4h" in tf_normalized:
+            hours = candles * 4.0
+        elif "1d" in tf_normalized or "d" in tf_normalized:
+            hours = candles * 24.0
+        else:  # default 1h
+            hours = candles * 1.0
+
+        if hours < 24:
+            time_label = f"{int(round(hours))}h"
+        else:
+            days = round(hours / 24, 1)
+            time_label = f"{days:g}d"
+
+        return {
+            "candles": candles,
+            "hours": round(hours, 1),
+            "time_label": time_label,
+        }
 
     def classify_ema_trend(self, ema_fast: float, ema_slow: float, atr: float) -> TrendState:
         if atr <= 0:
@@ -827,6 +889,11 @@ class ConfluenceDecisionEngine:
                 mtf_agreement=None,
                 counter_move_detected=False,
                 counter_move_magnitude_atr=0.0,
+                swing_mode=False,
+                tp_levels=[],
+                sl_margin_loss_pct=0.0,
+                target_feasibility="",
+                estimated_holding_time="",
             )
 
         close = snapshot["close"]
@@ -949,6 +1016,11 @@ class ConfluenceDecisionEngine:
         entry_type, entry_price, entry_zone = "none", None, None
         sl = tp1 = tp2 = None
         tp2_rule = ""
+        swing_mode = False
+        tp_levels_result = []
+        sl_margin_loss_pct = 0.0
+        target_feasibility = ""
+        estimated_holding_time = ""
 
         if action in (Action.BUY, Action.SELL):
             ema20 = snapshot["ema_fast"]
@@ -964,20 +1036,73 @@ class ConfluenceDecisionEngine:
                 entry_price = None
 
             ref_price = entry_price if entry_price is not None else ema20
-            sl_mult = self.cfg["SL_ATR_MULTIPLIER"]
-            rr = self.cfg["TP1_RR_RATIO"]
-            tp2_mult = self.cfg["TP2_ATR_MULTIPLIER"]
 
-            if action == Action.BUY:
-                sl = ref_price - sl_mult * atr
-                tp1 = ref_price + sl_mult * atr * rr
-                tp2 = ref_price + tp2_mult * atr
-                tp2_rule = "Giữ lệnh đến khi Xu hướng EMA chuyển từ Tăng sang Cân bằng/Giảm"
+            # Swing trading logic for 1h / 4h
+            if timeframe in ("1h", "4h"):
+                leverage = self.cfg.get("DEFAULT_LEVERAGE", 5)
+                sl_mult = self.cfg.get("SWING_SL_ATR_MULTIPLIER", 1.5)
+
+                sl = (ref_price - sl_mult * atr) if action == Action.BUY else (ref_price + sl_mult * atr)
+                risk_distance = abs(ref_price - sl)
+                sl_price_move_pct = (risk_distance / ref_price * 100) if ref_price > 0 else 0.0
+                sl_margin_loss_pct = sl_price_move_pct * leverage  # % vốn mất nếu dính SL
+
+                for level in self.cfg.get("SWING_TP_LEVELS_MARGIN_PCT", []):
+                    margin_target = level["margin_profit_pct"]
+
+                    # === CÔNG THỨC CỐT LÕI ĐÃ SỬA ĐÚNG ===
+                    price_move_pct_needed = margin_target / leverage   # VD: 5%/5 = 1.0%
+                    price_distance = ref_price * (price_move_pct_needed / 100)
+
+                    tp_price = (ref_price + price_distance) if action == Action.BUY else (ref_price - price_distance)
+                    rr_ratio = (price_distance / risk_distance) if risk_distance > 0 else 0.0
+                    holding = self.estimate_holding_period(price_distance, atr, timeframe)
+
+                    tp_levels_result.append({
+                        "label": level["label"],
+                        "price": round(tp_price, 4),
+                        "price_move_pct": round(price_move_pct_needed, 2),      # % GIÁ
+                        "margin_profit_pct": margin_target,                      # % VỐN KÝ QUỸ
+                        "rr_ratio": round(rr_ratio, 2),
+                        "close_pct": int(level["close_pct"] * 100),
+                        "holding_estimate": holding["time_label"],
+                    })
+
+                farthest_price_move = (tp_levels_result[-1]["price_move_pct"] / 100) if tp_levels_result else 0.0
+                max_feasible = self.cfg.get("PRICE_MOVE_FEASIBLE_MAX_PCT", 0.03)
+
+                if farthest_price_move <= max_feasible:
+                    target_feasibility = (
+                        f"✅ Hoàn toàn khả thi — biến động giá cần thiết nằm trong biên độ dao động thông thường của khung {timeframe}"
+                    )
+                else:
+                    target_feasibility = (
+                        "⚠️ Cần biến động giá lớn hơn bình thường — có thể mất nhiều thời gian hơn ước tính hoặc không đạt nếu thị trường đi ngang"
+                    )
+
+                swing_mode = True
+                estimated_holding_time = tp_levels_result[-1]["holding_estimate"] if tp_levels_result else ""
+
+                if tp_levels_result:
+                    tp1 = tp_levels_result[0]["price"]
+                    tp2 = tp_levels_result[-1]["price"]
+                    tp2_rule = f"Chốt lời từng phần: {tp_levels_result[0]['label']} (40%), {tp_levels_result[1]['label']} (35%), {tp_levels_result[2]['label']} (25%)"
             else:
-                sl = ref_price + sl_mult * atr
-                tp1 = ref_price - sl_mult * atr * rr
-                tp2 = ref_price - tp2_mult * atr
-                tp2_rule = "Giữ lệnh đến khi Xu hướng EMA chuyển từ Giảm sang Cân bằng/Tăng"
+                # Scalping logic for intraday timeframes (e.g. 15m)
+                sl_mult = self.cfg["SL_ATR_MULTIPLIER"]
+                rr = self.cfg["TP1_RR_RATIO"]
+                tp2_mult = self.cfg["TP2_ATR_MULTIPLIER"]
+
+                if action == Action.BUY:
+                    sl = ref_price - sl_mult * atr
+                    tp1 = ref_price + sl_mult * atr * rr
+                    tp2 = ref_price + tp2_mult * atr
+                    tp2_rule = "Giữ lệnh đến khi Xu hướng EMA chuyển từ Tăng sang Cân bằng/Giảm"
+                else:
+                    sl = ref_price + sl_mult * atr
+                    tp1 = ref_price - sl_mult * atr * rr
+                    tp2 = ref_price - tp2_mult * atr
+                    tp2_rule = "Giữ lệnh đến khi Xu hướng EMA chuyển từ Giảm sang Cân bằng/Tăng"
 
         return TradeAdvice(
             action=action.value,
@@ -995,6 +1120,11 @@ class ConfluenceDecisionEngine:
             mtf_agreement=mtf_agree,
             counter_move_detected=counter_move_detected,
             counter_move_magnitude_atr=round(counter_move_magnitude, 4),
+            swing_mode=swing_mode,
+            tp_levels=tp_levels_result,
+            sl_margin_loss_pct=round(sl_margin_loss_pct, 2),
+            target_feasibility=target_feasibility,
+            estimated_holding_time=estimated_holding_time,
         )
 
 
@@ -1784,6 +1914,83 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       padding-top: 8px;
       line-height: 1.4;
     }
+    /* Multi-tier TP Container for Swing Mode */
+    .swing-tp-container {
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .swing-tp-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: #93c5fd;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 6px;
+    }
+    .leverage-badge {
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      color: #60a5fa;
+      font-size: 0.72rem;
+      padding: 2px 8px;
+      border-radius: 9999px;
+    }
+    .tp-table {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .tp-row {
+      display: grid;
+      grid-template-columns: 1.4fr 1.3fr 1.3fr 0.7fr auto;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 10px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 6px;
+      font-size: 0.8rem;
+    }
+    @media (max-width: 640px) {
+      .tp-row {
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+    }
+    .tp-row .tp-label { font-weight: 700; color: #f1f5f9; }
+    .tp-row .tp-price { font-weight: 700; color: #34d399; font-family: monospace; }
+    .tp-row .tp-price small { color: var(--text-muted); font-size: 0.72rem; margin-left: 2px; }
+    .tp-row .tp-margin-profit { color: #60a5fa; font-weight: 700; }
+    .tp-row .tp-holding { color: var(--text-muted); font-size: 0.72rem; }
+    .feasibility-box {
+      font-size: 0.78rem;
+      line-height: 1.4;
+      padding: 8px 10px;
+      background: rgba(16, 185, 129, 0.08);
+      border-left: 3px solid #10b981;
+      border-radius: 4px;
+      color: #d1fae5;
+    }
+    .feasibility-box.warn {
+      background: rgba(245, 158, 11, 0.08);
+      border-left-color: #f59e0b;
+      color: #fef3c7;
+    }
+    .tp-explanation-note {
+      font-size: 0.72rem;
+      color: #94a3b8;
+      line-height: 1.4;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 4px;
+      padding: 6px 8px;
+    }
     .copy-toast {
       position: fixed;
       bottom: 24px;
@@ -2074,8 +2281,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           <div class="advice-card-body">
             <!-- Action & Confidence -->
             <div class="advice-header-row">
-              <div id="adviceActionBadge" class="advice-action-badge action-wait">
-                <span id="adviceActionText">WAIT</span>
+              <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                <div id="adviceActionBadge" class="advice-action-badge action-wait">
+                  <span id="adviceActionText">WAIT</span>
+                </div>
+                <span id="adviceMetaBadge" class="leverage-badge" style="display:none;">⚡ Đòn bẩy x5 · Vốn 10%</span>
               </div>
               <div class="advice-conf-box">
                 <div class="advice-conf-label" style="display:flex; align-items:center; justify-content:flex-end; gap:4px;">
@@ -2109,7 +2319,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
                   <span class="level-value" id="adviceSlVal">--</span>
                   <button class="btn-copy-mini" onclick="copyValue('adviceSlVal')">📋 Copy</button>
                 </div>
-                <span class="level-sub">R:R 1:1 bảo toàn vốn</span>
+                <span class="level-sub" id="adviceSlSub">R:R 1:1 bảo toàn vốn</span>
               </div>
               <div class="level-card">
                 <span class="level-title" style="color:#34d399;">🎯 Chốt Lời (TP)</span>
@@ -2118,6 +2328,21 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
                   <button class="btn-copy-mini" onclick="copyValue('adviceTp1Val')">📋 Copy</button>
                 </div>
                 <span class="level-sub" id="adviceTp2Sub">TP2: --</span>
+              </div>
+            </div>
+
+            <!-- Multi-Tier TP Table cho Swing Mode (1h/4h) -->
+            <div id="adviceSwingTpBox" class="swing-tp-container" style="display:none;">
+              <div class="swing-tp-header">
+                <span>🎯 Mục Tiêu Chốt Lời Đa Tầng (Multi-Tier TP)</span>
+                <span class="leverage-badge">⚡ Lãi tính trên Vốn Ký Quỹ</span>
+              </div>
+              <div class="tp-table" id="adviceTpTable">
+                <!-- Rendered dynamically -->
+              </div>
+              <div class="feasibility-box" id="adviceFeasibilityBox"></div>
+              <div class="tp-explanation-note">
+                ⚠️ <strong>Lưu ý quan trọng:</strong> Cột "% Lãi trên vốn ký quỹ" đã nhân đòn bẩy x5. Đây KHÔNG phải % biến động giá thực tế của tài sản (chỉ cần di chuyển 1%–2% là đạt mục tiêu 5%–10% lãi).
               </div>
             </div>
 
@@ -2722,6 +2947,21 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       }, 1500);
     }
 
+    function copyRaw(val) {
+      if (!val) return;
+      navigator.clipboard.writeText(val.toString()).then(() => {
+        showToast('Đã copy: ' + val);
+      }).catch(() => {
+        const ta = document.createElement('textarea');
+        ta.value = val;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast('Đã copy: ' + val);
+      });
+    }
+
     // --- RENDER TRADE ADVICE CARD ---
     function renderAdviceCard(snapshot, asset, tf) {
       if (!snapshot || !snapshot.advice) return;
@@ -2731,18 +2971,23 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const badgeAsset = document.getElementById('adviceAssetBadge');
       if (badgeAsset) badgeAsset.textContent = `[${asset} · ${tf}]`;
 
+      const levelsGrid = document.getElementById('adviceLevelsGrid');
+      const swingTpBox = document.getElementById('adviceSwingTpBox');
+      const waitMessage = document.getElementById('adviceWaitMessage');
+      const metaBadge = document.getElementById('adviceMetaBadge');
+
       if (!advice) {
-        const waitBox = document.getElementById('adviceWaitMessage');
-        if (waitBox) {
-          waitBox.style.display = 'flex';
-          waitBox.innerHTML = '<span>⏳</span><span>Đang thu thập dữ liệu nến cho tài sản này...</span>';
+        if (waitMessage) {
+          waitMessage.style.display = 'flex';
+          waitMessage.innerHTML = '<span>⏳</span><span>Đang thu thập dữ liệu nến cho tài sản này...</span>';
         }
-        const levelsGrid = document.getElementById('adviceLevelsGrid');
         if (levelsGrid) levelsGrid.style.display = 'none';
+        if (swingTpBox) swingTpBox.style.display = 'none';
+        if (metaBadge) metaBadge.style.display = 'none';
         return;
       }
 
-      // Action Badge
+      // Action Badge & Meta Profile
       const actionBadge = document.getElementById('adviceActionBadge');
       const actionText = document.getElementById('adviceActionText');
       if (actionBadge && actionText) {
@@ -2751,6 +2996,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           advice.action === 'BUY' ? 'action-buy' :
           advice.action === 'SELL' ? 'action-sell' : 'action-wait'
         );
+      }
+      if (metaBadge) {
+        metaBadge.style.display = (advice.action !== 'WAIT') ? 'inline-block' : 'none';
       }
 
       // Confidence
@@ -2768,17 +3016,16 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       }
 
       // Entry / SL / TP
-      const levelsGrid = document.getElementById('adviceLevelsGrid');
-      const waitMessage = document.getElementById('adviceWaitMessage');
       if (advice.action === 'WAIT') {
         if (levelsGrid) levelsGrid.style.display = 'none';
+        if (swingTpBox) swingTpBox.style.display = 'none';
         if (waitMessage) {
           waitMessage.style.display = 'flex';
           waitMessage.innerHTML = '<span>⏸</span><span>Chưa có điểm vào lệnh phù hợp lúc này — hệ thống đang chờ tín hiệu rõ ràng hơn.</span>';
         }
       } else {
-        if (levelsGrid) levelsGrid.style.display = 'grid';
         if (waitMessage) waitMessage.style.display = 'none';
+        if (levelsGrid) levelsGrid.style.display = 'grid';
 
         const entryValEl = document.getElementById('adviceEntryVal');
         const entrySubEl = document.getElementById('adviceEntrySub');
@@ -2793,9 +3040,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         }
 
         const slValEl = document.getElementById('adviceSlVal');
+        const slSubEl = document.getElementById('adviceSlSub');
         if (slValEl) {
           slValEl.textContent = '$' + Number(advice.stop_loss).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           slValEl.setAttribute('data-raw', advice.stop_loss);
+        }
+        if (slSubEl) {
+          if (advice.swing_mode && advice.sl_margin_loss_pct) {
+            slSubEl.textContent = `Nếu dính SL: mất ~${advice.sl_margin_loss_pct}% vốn ký quỹ (x5)`;
+            slSubEl.style.color = '#f87171';
+          } else {
+            slSubEl.textContent = 'R:R 1:1 bảo toàn vốn';
+            slSubEl.style.color = 'var(--text-muted)';
+          }
         }
 
         const tp1ValEl = document.getElementById('adviceTp1Val');
@@ -2805,7 +3062,38 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           tp1ValEl.setAttribute('data-raw', advice.take_profit_1);
         }
         if (tp2SubEl) {
-          tp2SubEl.textContent = `TP2: $${Number(advice.take_profit_2).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})} (${advice.tp2_rule || 'Trailing EMA'})`;
+          if (advice.swing_mode && advice.tp_levels && advice.tp_levels.length > 0) {
+            tp2SubEl.textContent = 'Multi-Tier TP (Xem chi tiết bảng bên dưới)';
+          } else {
+            tp2SubEl.textContent = `TP2: $${Number(advice.take_profit_2).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})} (${advice.tp2_rule || 'Trailing EMA'})`;
+          }
+        }
+
+        // Render Swing Multi-Tier TP Table
+        if (swingTpBox) {
+          if (advice.swing_mode && advice.tp_levels && advice.tp_levels.length > 0) {
+            swingTpBox.style.display = 'flex';
+            const tpTableEl = document.getElementById('adviceTpTable');
+            if (tpTableEl) {
+              const sign = (advice.action === 'SELL') ? '−' : '+';
+              tpTableEl.innerHTML = advice.tp_levels.map(lvl => `
+                <div class="tp-row">
+                  <span class="tp-label">${lvl.label} (đóng ${lvl.close_pct}%)</span>
+                  <span class="tp-price">$${Number(lvl.price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})} <small>(${sign}${Math.abs(lvl.price_move_pct)}% giá)</small></span>
+                  <span class="tp-margin-profit">+${lvl.margin_profit_pct}% vốn ký quỹ</span>
+                  <span class="tp-holding">~${lvl.holding_estimate}</span>
+                  <button class="btn-copy-mini" onclick="copyRaw('${lvl.price}')">📋 Copy</button>
+                </div>
+              `).join('');
+            }
+            const feasEl = document.getElementById('adviceFeasibilityBox');
+            if (feasEl) {
+              feasEl.textContent = advice.target_feasibility;
+              feasEl.className = 'feasibility-box' + (advice.target_feasibility.includes('⚠️') ? ' warn' : '');
+            }
+          } else {
+            swingTpBox.style.display = 'none';
+          }
         }
       }
 

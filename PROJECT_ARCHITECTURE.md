@@ -101,6 +101,16 @@ Phân tích hợp lưu đa khung thời gian để sinh khuyến nghị BUY/SELL
 - [UX] Thêm chú giải liên kết giữa Gauge (thang 0-100, tính client) và Confidence Score (thang 0-5, tính server) để tránh người dùng hiểu lầm đây là 2 kết luận trái ngược.
 - Nguồn gốc patch: phát hiện qua live testing case thực tế XAU/USD khung 1h ngày quan sát, giá bật từ $4,148 lên $4,188 (~3.7x ATR) mà không được hệ thống gắn cờ cảnh báo.
 
+### Changelog v1.2 (Chuẩn hóa TP/SL Multi-Tier theo Đòn Bẩy)
+- [Fixed & Upgraded] **Chuẩn hóa công thức Take Profit / Stop Loss theo Đòn bẩy (Leverage):**
+  - Khắc phục triệt để sự nhầm lẫn giữa `% biến động giá tài sản` (Price Move %) và `% lãi trên vốn ký quỹ` (Margin Profit %).
+  - Công thức tính xuôi: `price_move_pct = margin_profit_pct / leverage` (với `DEFAULT_LEVERAGE = 5`: 5% margin -> 1.0% giá; 7.5% margin -> 1.5% giá; 10% margin -> 2.0% giá).
+  - Áp dụng cấu trúc Multi-Tier TP cho swing mode (1h, 4h): TP1 (đóng 50%), TP2 (đóng 30%), TP3 (đóng 20%).
+  - Stop Loss bảo toàn vốn cố định `1.5 * ATR`, bổ sung tính toán `% rủi ro trên vốn ký quỹ`: `sl_margin_loss_pct = (risk_distance / ref_price * 100) * leverage`.
+  - Bổ sung ước lượng thời gian giữ lệnh (`estimate_holding_period`): dựa trên tốc độ di chuyển giá định lượng `0.46 * ATR / nến` (~8h cho TP1, ~12h cho TP2, ~16h cho TP3 trên XAU 1h).
+  - Tự động đánh giá tính khả thi mục tiêu (`target_feasibility`): so sánh mục tiêu giá với ATR phiên.
+  - UI Web Dashboard: Hiển thị song song cả 2 đơn vị ("% giá" và "% vốn ký quỹ"), có badge đòn bẩy và nút copy tiện dụng. Đồng bộ 100% giữa file tĩnh `dashboard.html` và chuỗi nhúng `HTML_DASHBOARD` trong `engine.py`.
+
 ---
 
 ## 5. Đặc Tả Giao Diện API (API Specifications)
@@ -178,6 +188,44 @@ Server lắng nghe mặc định tại `0.0.0.0:${SERVER_PORT:-8080}`:
           "mtf_agreement": true,
           "counter_move_detected": false,
           "counter_move_magnitude_atr": 0.0,
+          "swing_mode": false,
+          "tp_levels": null,
+          "sl_margin_loss_pct": null,
+          "target_feasibility": null,
+          "estimated_holding_time": null,
+          "disclaimer": "Đây là khuyến nghị dựa trên thuật toán kỹ thuật, KHÔNG PHẢI lời khuyên đầu tư..."
+        }
+      },
+      "XAU": {
+        "1h": {
+          "action": "BUY",
+          "confidence": "Cao",
+          "confidence_score": 4,
+          "entry_type": "now",
+          "entry_price": 4159.3,
+          "entry_zone": null,
+          "stop_loss": 4142.54,
+          "take_profit_1": 4200.89,
+          "take_profit_2": 4221.69,
+          "tp2_rule": "Trailing EMA",
+          "reasoning": [
+            "Xu hướng EMA: Tăng rõ rệt (ủng hộ MUA)",
+            "RSI = 58.2 (còn dư địa tăng)",
+            "Mục tiêu TP1 (+1.0% giá) khả thi cao trong phiên giao dịch (~3.7 ATR)"
+          ],
+          "conflict_detected": false,
+          "mtf_agreement": true,
+          "counter_move_detected": false,
+          "counter_move_magnitude_atr": 0.0,
+          "swing_mode": true,
+          "tp_levels": [
+            {"label": "TP1", "close_pct": 50, "price": 4200.89, "price_move_pct": 1.0, "margin_profit_pct": 5.0, "atr_multiple": 3.72, "holding_estimate": "8 giờ (8 nến)"},
+            {"label": "TP2", "close_pct": 30, "price": 4221.69, "price_move_pct": 1.5, "margin_profit_pct": 7.5, "atr_multiple": 5.58, "holding_estimate": "12 giờ (12 nến)"},
+            {"label": "TP3", "close_pct": 20, "price": 4242.49, "price_move_pct": 2.0, "margin_profit_pct": 10.0, "atr_multiple": 7.45, "holding_estimate": "16 giờ (16 nến)"}
+          ],
+          "sl_margin_loss_pct": 2.01,
+          "target_feasibility": "✅ Khả thi cao: Mục tiêu TP1 (+1.0% giá) tương đương 3.72x ATR (nằm trong biên độ dao động thông thường của phiên).",
+          "estimated_holding_time": "8 - 16 giờ",
           "disclaimer": "Đây là khuyến nghị dựa trên thuật toán kỹ thuật, KHÔNG PHẢI lời khuyên đầu tư..."
         }
       }

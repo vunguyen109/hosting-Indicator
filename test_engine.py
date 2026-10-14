@@ -315,6 +315,65 @@ class TestEngine(unittest.TestCase):
         self.assertFalse(advice.counter_move_detected)
         self.assertEqual(advice.action, "SELL")
 
+    def test_margin_to_price_conversion_correct(self):
+        """Kiểm tra công thức cốt lõi: với leverage=5, margin_profit=10% PHẢI quy đổi đúng ra price_move=2.0%."""
+        entry = 4159.30
+        atr = 11.17
+        engine = ConfluenceDecisionEngine(CONFIG)
+        advice = engine.decide(
+            asset="XAU", timeframe="1h",
+            snapshot={"close": entry, "ema_fast": 4158.11, 
+                      "ema_slow": 4162.64, "rsi": 38.3,
+                      "bb_upper": 4164.63, "bb_lower": 4151.95, "atr": atr},
+            recent_signals=[], recent_candles=[])
+
+        self.assertTrue(advice.swing_mode)
+        self.assertGreater(len(advice.tp_levels), 0)
+        tp3 = advice.tp_levels[-1]
+        self.assertEqual(tp3["margin_profit_pct"], 10.0)
+        self.assertAlmostEqual(tp3["price_move_pct"], 2.0, places=2)
+        # Với lệnh SELL: giá TP3 = entry - 2% = 4159.30 * 0.98 = 4076.114
+        self.assertAlmostEqual(tp3["price"], 4076.114, places=2)
+
+    def test_sl_margin_loss_calculated_with_leverage(self):
+        """SL loss trên vốn ký quỹ phải được nhân với leverage, không phải % giá thuần."""
+        entry = 4159.30
+        atr = 11.17
+        engine = ConfluenceDecisionEngine(CONFIG)
+        advice = engine.decide(
+            asset="XAU", timeframe="1h",
+            snapshot={"close": entry, "ema_fast": 4158.11, 
+                      "ema_slow": 4162.64, "rsi": 38.3,
+                      "bb_upper": 4164.63, "bb_lower": 4151.95, "atr": atr},
+            recent_signals=[], recent_candles=[])
+
+        # Với SL = entry + 1.5 * atr = 4159.30 + 16.755 = 4176.055
+        # risk_distance = 16.755, sl_price_move_pct = 16.755 / 4159.30 * 100 ≈ 0.4028%
+        # Với leverage=5, sl_margin_loss_pct = 0.4028 * 5 ≈ 2.01%
+        self.assertAlmostEqual(advice.sl_margin_loss_pct, 2.01, places=1)
+        self.assertGreater(advice.sl_margin_loss_pct, 0.40)
+
+    def test_ui_always_shows_both_units(self):
+        """Đảm bảo mỗi tp_level LUÔN có cả 2 field price_move_pct VÀ margin_profit_pct, không được thiếu field nào."""
+        entry = 4159.30
+        atr = 11.17
+        engine = ConfluenceDecisionEngine(CONFIG)
+        advice = engine.decide(
+            asset="XAU", timeframe="1h",
+            snapshot={"close": entry, "ema_fast": 4158.11, 
+                      "ema_slow": 4162.64, "rsi": 38.3,
+                      "bb_upper": 4164.63, "bb_lower": 4151.95, "atr": atr},
+            recent_signals=[], recent_candles=[])
+
+        self.assertGreater(len(advice.tp_levels), 0)
+        for level in advice.tp_levels:
+            self.assertIn("price_move_pct", level)
+            self.assertIn("margin_profit_pct", level)
+            self.assertIn("close_pct", level)
+            self.assertIn("holding_estimate", level)
+            self.assertIn("price", level)
+            self.assertIn("label", level)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,359 +1,265 @@
-
 [ROLE]
-Bạn là Senior Python Backend Engineer, tiếp tục bảo trì module 
-ConfluenceDecisionEngine (Section 4.5) vừa được triển khai trong 
-engine.py của dự án "Hosting Indicator Engine" (1.5 vCore/2GB RAM/
-2GB Disk, Zero Heavy Dependencies, Telegram KHÔNG được chạm vào).
+Bạn là Senior Python Backend Engineer kiêm Quant Developer, tiếp tục 
+mở rộng ConfluenceDecisionEngine (Section 4.5) trong engine.py của 
+dự án "Hosting Indicator Engine" (1.5 vCore/2GB RAM/2GB Disk, Zero 
+Heavy Dependencies). Đây là bản sửa lại hoàn toàn công thức Take 
+Profit đã thiết kế ở lần trước, do phát hiện NHẦM LẪN quan trọng 
+giữa "% biến động giá" và "% lợi nhuận trên vốn ký quỹ (margin)".
 
-Đây là bản VÁ LỖI (patch), không phải thiết kế lại. Áp dụng nguyên 
-tắc "Minimal Diff" — chỉ sửa đúng phần code liên quan đến 3 lỗi đã 
-xác định bên dưới, KHÔNG refactor các phần đang hoạt động đúng, 
-KHÔNG đổi tên field/function đã có (sẽ phá vỡ dashboard.html đang 
-đọc dữ liệu từ các field đó).
-
-Quy tắc bất di bất dịch (kế thừa từ bản cập nhật trước):
+Quy tắc bất di bất dịch (kế thừa đầy đủ từ các lần cập nhật trước):
 1. KHÔNG thêm package mới vào requirements.txt.
-2. KHÔNG sửa TelegramDispatcher (Section 5) dưới bất kỳ hình thức nào.
-3. KHÔNG tăng tần suất polling/tính toán — mọi logic mới vẫn chạy 
-   đúng 1 lần/nến đóng, không chạy theo nhịp poll 3s của client.
-4. Mọi threshold mới phải đặt trong CONFIG, không hard-code.
-5. Giữ nguyên tương thích ngược schema JSON của /api/snapshot — 
-   chỉ được THÊM field mới nếu cần, không đổi/xóa field cũ.
-6. Mọi thay đổi phải có Unit Test tương ứng chứng minh lỗi cũ đã 
-   được sửa (regression test dựa trên đúng số liệu thực tế của 
-   case XAU 1h đã quan sát).
+2. KHÔNG sửa TelegramDispatcher.
+3. KHÔNG tính toán lại theo nhịp poll 3s — chạy đồng bộ với nhịp 
+   đóng nến.
+4. Mọi threshold/tham số phải đặt trong CONFIG.
+5. Giữ tương thích ngược schema JSON — CHỈ THÊM field mới.
+6. BẮT BUỘC phân biệt RÕ RÀNG trên UI giữa 2 khái niệm:
+   - "% biến động giá" (price move %) — con số thực tế giá phải đi
+   - "% lợi nhuận trên vốn ký quỹ" (margin profit %) — con số sau 
+     khi đã nhân với đòn bẩy
+   Đây là yêu cầu bắt buộc vì sự nhầm lẫn giữa 2 khái niệm này đã 
+   từng xảy ra ở vòng thiết kế trước, gây sai lệch tới 5 lần (vì 
+   leverage=5) nếu không làm rõ.
+7. Công thức TP phải tính XUÔI từ mục tiêu lợi nhuận trên vốn ký quỹ 
+   mong muốn → quy đổi ra khoảng cách giá cần thiết bằng phép chia 
+   cho đòn bẩy → KHÔNG được tính ngược từ ATR/swing-structure rồi 
+   suy ra lợi nhuận (cách làm cũ đã gây sai lệch kỳ vọng).
 
 [CONTEXT]
-## 3 lỗi đã xác định qua kiểm thử thực tế (đính kèm số liệu gốc):
+## Công thức quy đổi cốt lõi cần hiểu đúng:
+```
+margin_profit_pct = price_move_pct × leverage
+  =>  price_move_pct = margin_profit_pct / leverage
 
-### LỖI 1 (🔴 Critical — Sai logic, dễ gây hiểu nhầm nghiêm trọng):
-Khi người dùng xem ở khung thời gian LỚN NHẤT hệ thống hỗ trợ (1h), 
-module vẫn hard-code hiển thị reasoning text "Khung thời gian lớn 
-ĐỒNG THUẬN xu hướng" — trong khi thực tế logic đang so sánh với 
-khung NHỎ HƠN (15m). Về bản chất ngữ nghĩa, "khung lớn hơn" không 
-tồn tại khi đang đứng ở khung lớn nhất, nên câu reasoning đang nói 
-ngược hướng so với phép so sánh thực sự diễn ra trong code.
+Ví dụ với leverage = 5, mục tiêu margin_profit = 5% đến 10%:
+  price_move_pct cần thiết = 1.0% đến 2.0%
+```
 
-Dữ liệu minh chứng: Case XAU timeframe="1h", mtf_agree được tính 
-từ việc so sánh với timeframe="15m" (nhỏ hơn), nhưng text output 
-vẫn ghi "Khung thời gian lớn ĐỒNG THUẬN" — gây hiểu lầm cho người 
-dùng về hướng so sánh.
+## Hồ sơ rủi ro người dùng (đã đính chính):
+- Vốn sử dụng mỗi lệnh: 10% tổng tài sản
+- Đòn bẩy: x5
+- Kỳ vọng TP: **5-10% lợi nhuận trên VỐN KÝ QUỸ** (tương đương chỉ 
+  1-2% biến động giá thực tế — con số này HOÀN TOÀN khả thi trong 
+  vài giờ đến 1-2 ngày trên khung 1h/4h, KHÔNG cần nhiều ngày)
+- Khung thời gian mong muốn: 1h và 4h
 
-### LỖI 2 (🟠 High — Điểm mù nghiêm trọng nhất, ảnh hưởng chất 
-### lượng khuyến nghị thực chiến):
-Hàm detect_conflict() hiện tại CHỈ phát hiện mâu thuẫn bằng cách 
-quét RuleEngine.recent_signals tìm các Signal RỜI RẠC đã được định 
-nghĩa sẵn (EMA_CROSS_UP/DOWN, BB_BREAKOUT_UP/DOWN, RSI_OVERBOUGHT/
-OVERSOLD) trong N nến gần nhất. Hàm này KHÔNG có khả năng phát hiện 
-một cú biến động giá mạnh dạng V-shape/counter-move nếu cú biến 
-động đó không trùng khớp chính xác với 1 trong các loại Signal đã 
-định nghĩa.
+## Số liệu minh chứng (dùng case XAU thực tế để kiểm tra công thức):
+Entry (SELL) = $4,159.30, ATR(1h) ≈ 11.17
+- TP ứng với 5% margin profit  → price move 1.0% → ~$4,117.7
+- TP ứng với 7.5% margin profit → price move 1.5% → ~$4,096.9  
+- TP ứng với 10% margin profit → price move 2.0% → ~$4,076.1
+Các mức này tương đương 3.7x–7.4x ATR — nằm trong tầm với hợp lý 
+của biến động thông thường trên khung 1h, không cần tìm vùng swing 
+xa như thiết kế trước.
 
-Dữ liệu minh chứng thực tế: Asset XAU, timeframe 1h. Giá giảm sâu 
-xuống chạm BB Lower (~$4,148), sau đó bật tăng mạnh trở lại trong 
-vài nến liên tiếp lên đến $4,188.83 (mức tăng ước tính ~3.7x ATR14 
-hiện tại, ATR≈10.81). Mặc dù biến động giá rất rõ ràng mâu thuẫn 
-với kết luận EMA "Giảm rõ rệt", hệ thống KHÔNG gắn cờ conflict_
-detected=true, dẫn đến khuyến nghị SELL với entry_zone thấp hơn 
-giá hiện tại ~25 điểm — một kịch bản rủi ro mà một trader có kinh 
-nghiệm sẽ nhận ra ngay bằng mắt nhưng thuật toán hiện tại bỏ sót.
-
-### LỖI 3 (🟡 Medium — UX gây nhiễu nhận thức, không phải lỗi logic):
-Dashboard đồng thời hiển thị 2 thang đo khác nhau không có chú 
-giải liên kết:
-- Gauge "Thước Đo Tâm Lý Thị Trường": thang 0-100 (tính ở CLIENT, 
-  theo logic cũ đã có từ trước khi có ConfluenceDecisionEngine)
-- Card "Khuyến Nghị Giao Dịch": field confidence_score thang 0-5 
-  (tính ở SERVER, từ ConfluenceDecisionEngine)
-Người dùng phổ thông (không rành kỹ thuật) nhìn thấy "19 - BÁN 
-MẠNH" ở Gauge nhưng "Trung bình (3/5)" ở Card Khuyến Nghị, dễ 
-hiểu lầm đây là 2 kết luận trái ngược nhau, trong khi thực chất 
-chỉ là 2 thang đo khác nhau đo cùng 1 xu hướng.
+## Lưu ý về SL (không thay đổi mục tiêu, chỉ cần khớp R:R hợp lý):
+Giữ nguyên SL = 1.5-2.0× ATR như thiết kế cũ. Với TP giờ đã xa hơn 
+đáng kể (3.7-7.4x ATR thay vì 1.5-3x ATR trước đây), tỷ lệ R:R tự 
+nhiên sẽ cải thiện lên khoảng 2:1 đến 4:1 — tốt hơn nhiều so với 
+thiết kế 1:1 ban đầu.
 
 [INSTRUCTION]
 
-## PATCH 1 — Sửa reasoning text theo đúng hướng so sánh thực tế (Lỗi 1)
+## BƯỚC 1 — Sửa lại CONFIG (thay thế hoàn toàn SWING_TP_LEVELS cũ)
 
-Trong hàm `decide()` của ConfluenceDecisionEngine, sửa đoạn sinh 
-reasoning text cho MTF agreement. Thay vì hard-code "lớn/nhỏ", 
-xác định ĐỘNG dựa trên thứ tự thực tế của timeframe đang xét so 
-với timeframe còn lại:
-
-```python
-# Định nghĩa thứ tự timeframe (thêm vào CONFIG hoặc hằng số module)
-TIMEFRAME_ORDER = {"15m": 1, "1h": 2}
-
-def _get_relative_tf_label(self, current_tf: str, other_tf: str) -> str:
-    """Trả về mô tả tương đối chính xác về mặt ngữ nghĩa, 
-    không giả định cố định 'khung lớn' hay 'khung nhỏ'."""
-    current_rank = TIMEFRAME_ORDER.get(current_tf, 0)
-    other_rank = TIMEFRAME_ORDER.get(other_tf, 0)
-    other_tf_display = {"15m": "15 phút", "1h": "1 giờ"}.get(other_tf, other_tf)
-    if other_rank > current_rank:
-        return f"khung {other_tf_display} (dài hạn hơn)"
-    elif other_rank < current_rank:
-        return f"khung {other_tf_display} (ngắn hạn hơn)"
-    else:
-        return f"khung {other_tf_display}"
-```
-
-Sửa lại đoạn gọi trong `decide()`:
-
-```python
-# THAY THẾ đoạn cũ:
-# reasoning.append("Khung thời gian lớn ĐỒNG THUẬN xu hướng")
-# reasoning.append("⚠️ Khung thời gian lớn KHÔNG đồng thuận")
-
-# BẰNG đoạn mới, cần truyền thêm other_timeframe vào hàm decide():
-if mtf_agree is not None:
-    tf_label = self._get_relative_tf_label(timeframe, other_timeframe)
-    if mtf_agree:
-        reasoning.append(f"{tf_label} cũng ĐỒNG THUẬN xu hướng")
-    else:
-        reasoning.append(f"⚠️ {tf_label} KHÔNG đồng thuận xu hướng")
-```
-
-Cập nhật signature hàm `decide()` để nhận thêm tham số `other_
-timeframe: str` (tên khung còn lại, VD "15m"), truyền từ Orchestrator 
-nơi đã biết rõ cặp timeframe nào đang được so sánh với nhau — đây 
-là field CÓ SẴN trong vòng lặp hiện tại, không cần tính toán mới.
-
-## PATCH 2 — Bổ sung phát hiện "Counter-Move" (Lỗi 2 — ƯU TIÊN CAO NHẤT)
-
-Thêm hằng số mới vào CONFIG:
 ```python
 CONFIG.update({
-    # Số nến gần nhất dùng để phát hiện biến động ngược dòng mạnh
-    "COUNTER_MOVE_LOOKBACK_CANDLES": 3,
-    # Ngưỡng: biến động giá (đơn vị lần ATR) trong N nến gần nhất 
-    # được coi là "counter-move" đủ mạnh để nghi ngờ xu hướng EMA
-    "COUNTER_MOVE_ATR_THRESHOLD": 2.0,
+    # Đòn bẩy và % vốn mặc định — dùng để quy đổi và hiển thị minh họa
+    "DEFAULT_LEVERAGE": 5,
+    "DEFAULT_ACCOUNT_RISK_PCT": 0.10,
+    
+    # SL vẫn giữ nguyên tinh thần cũ — nới nhẹ cho khung 1h/4h
+    "SWING_SL_ATR_MULTIPLIER": 1.5,
+    
+    # ĐÃ SỬA: Multi-tier TP định nghĩa trực tiếp bằng % LỢI NHUẬN 
+    # TRÊN VỐN KÝ QUỸ mong muốn, KHÔNG dùng R:R ratio hay ATR nhân 
+    # tùy ý như thiết kế cũ.
+    "SWING_TP_LEVELS_MARGIN_PCT": [
+        {"margin_profit_pct": 5.0,  "close_pct": 0.40, "label": "TP1 - Chốt lời sớm"},
+        {"margin_profit_pct": 7.5,  "close_pct": 0.35, "label": "TP2 - Mục tiêu chính"},
+        {"margin_profit_pct": 10.0, "close_pct": 0.25, "label": "TP3 - Mục tiêu tối đa"},
+    ],
+    
+    # Ngưỡng đánh giá tính khả thi — tính theo % BIẾN ĐỘNG GIÁ thực 
+    # tế (đã quy đổi từ margin %), KHÔNG phải % margin
+    "PRICE_MOVE_FEASIBLE_MAX_PCT": 0.03,  # price move > 3% mới coi là "tham vọng"
+    "PRICE_MOVE_FEASIBLE_MIN_ATR_MULT": 1.0,  # price move < 1x ATR thì "quá gần, dễ đạt nhưng R:R kém"
 })
 ```
 
-Thêm phương thức mới vào ConfluenceDecisionEngine, nhận trực tiếp 
-dữ liệu nến thô từ CircularBuffer (đã có sẵn trong Orchestrator, 
-qua `buffer.last_n_candles(limit)` — method này ĐÃ TỒN TẠI theo 
-Section 2, không cần tạo mới):
+## BƯỚC 2 — Sửa lại hoàn toàn logic tính TP trong `decide()`
 
 ```python
-def detect_counter_move(self, recent_candles: list, atr: float, 
-                          trend: TrendState) -> tuple[bool, float]:
-    """
-    Phát hiện biến động giá ngược chiều với xu hướng EMA hiện tại 
-    trong N nến gần nhất, kể cả khi không có Signal rời rạc nào 
-    được RuleEngine kích hoạt.
+if action in (Action.BUY, Action.SELL) and timeframe in ("1h", "4h"):
+    leverage = self.cfg["DEFAULT_LEVERAGE"]
+    sl_mult = self.cfg["SWING_SL_ATR_MULTIPLIER"]
+    entry_ref = entry_price if entry_price else entry_zone
     
-    Trả về: (có_phát_hiện: bool, độ_lớn_theo_ATR: float) 
-    để phục vụ cả logic quyết định lẫn hiển thị reasoning chi tiết.
-    """
-    n = self.cfg["COUNTER_MOVE_LOOKBACK_CANDLES"]
-    if len(recent_candles) < n or atr <= 0:
-        return False, 0.0
+    sl = (entry_ref - sl_mult*atr if action == Action.BUY 
+          else entry_ref + sl_mult*atr)
+    risk_distance = abs(entry_ref - sl)
+    sl_price_move_pct = risk_distance / entry_ref * 100
+    sl_margin_loss_pct = sl_price_move_pct * leverage  # % vốn mất nếu dính SL
     
-    window = recent_candles[-n:]
-    price_change = window[-1].close - window[0].close
-    change_in_atr = price_change / atr
-    threshold = self.cfg["COUNTER_MOVE_ATR_THRESHOLD"]
+    tp_levels_result = []
+    for level in self.cfg["SWING_TP_LEVELS_MARGIN_PCT"]:
+        margin_target = level["margin_profit_pct"]
+        
+        # === CÔNG THỨC CỐT LÕI ĐÃ SỬA ĐÚNG ===
+        price_move_pct_needed = margin_target / leverage   # VD: 5%/5 = 1.0%
+        price_distance = entry_ref * (price_move_pct_needed / 100)
+        
+        tp_price = (entry_ref + price_distance if action == Action.BUY 
+                    else entry_ref - price_distance)
+        
+        rr_ratio = price_distance / risk_distance if risk_distance > 0 else 0
+        holding = self.estimate_holding_period(price_distance, atr, timeframe)
+        
+        tp_levels_result.append({
+            "label": level["label"],
+            "price": round(tp_price, 4),
+            "price_move_pct": round(price_move_pct_needed, 2),      # % GIÁ
+            "margin_profit_pct": margin_target,                      # % VỐN KÝ QUỸ
+            "rr_ratio": round(rr_ratio, 2),
+            "close_pct": int(level["close_pct"]*100),
+            "holding_estimate": holding["time_label"],
+        })
     
-    trend_is_down = trend in (TrendState.STRONG_DOWN, TrendState.LEAN_DOWN)
-    trend_is_up = trend in (TrendState.STRONG_UP, TrendState.LEAN_UP)
+    # Đánh giá tính khả thi dựa trên % GIÁ thực tế (không phải % margin)
+    farthest_price_move = tp_levels_result[-1]["price_move_pct"] / 100
+    max_feasible = self.cfg["PRICE_MOVE_FEASIBLE_MAX_PCT"]
     
-    # Counter-move = giá tăng mạnh NGƯỢC xu hướng giảm, hoặc ngược lại
-    if trend_is_down and change_in_atr > threshold:
-        return True, change_in_atr
-    if trend_is_up and change_in_atr < -threshold:
-        return True, change_in_atr
-    return False, change_in_atr
-```
-
-Sửa lại signature và logic của `decide()` để nhận thêm tham số 
-`recent_candles: list` và tích hợp kết quả counter-move vào quyết 
-định cuối cùng:
-
-```python
-def decide(self, asset: str, timeframe: str, snapshot: dict, 
-            recent_signals: list, recent_candles: list,
-            other_tf_snapshot: dict | None = None,
-            other_timeframe: str | None = None) -> TradeAdvice:
-    # ... (giữ nguyên toàn bộ logic classify_* như cũ) ...
-    
-    conflict_from_signals = self.detect_conflict(
-        recent_signals, asset, timeframe, trend)
-    counter_move_detected, counter_move_magnitude = self.detect_counter_move(
-        recent_candles, atr, trend)
-    
-    # Gộp 2 nguồn phát hiện mâu thuẫn thành 1 cờ tổng hợp
-    conflict = conflict_from_signals or counter_move_detected
-    
-    # ... (giữ nguyên scoring logic EMA/RSI/BB như cũ) ...
-    
-    # Thêm reasoning riêng cho counter-move (khác với conflict từ Signal)
-    if counter_move_detected:
-        direction = "tăng" if counter_move_magnitude > 0 else "giảm"
-        reasoning.append(
-            f"⚠️ Phát hiện biến động giá {direction} mạnh bất thường "
-            f"trong {self.cfg['COUNTER_MOVE_LOOKBACK_CANDLES']} nến gần nhất "
-            f"(~{abs(counter_move_magnitude):.1f}x ATR) — ngược chiều với "
-            f"xu hướng EMA hiện tại, cần thận trọng"
-        )
-    elif conflict_from_signals:
-        reasoning.append("⚠️ Phát hiện tín hiệu MÂU THUẪN gần đây trên chart")
+    if farthest_price_move <= max_feasible:
+        feasibility = ("✅ Hoàn toàn khả thi — biến động giá cần thiết "
+                        "nằm trong biên độ dao động thông thường của "
+                        f"khung {timeframe}")
     else:
-        reasoning.append("Không có tín hiệu mâu thuẫn gần đây")
+        feasibility = ("⚠️ Cần biến động giá lớn hơn bình thường — "
+                        "có thể mất nhiều thời gian hơn ước tính hoặc "
+                        "không đạt nếu thị trường đi ngang")
     
-    # ... (phần is_sideway, is_extreme_overextended, action quyết định 
-    #      GIỮ NGUYÊN logic cũ, vì biến `conflict` đã tự động bao gồm 
-    #      cả 2 nguồn phát hiện — không cần sửa thêm điều kiện nào) ...
+    advice.swing_mode = True
+    advice.tp_levels = tp_levels_result
+    advice.sl_margin_loss_pct = round(sl_margin_loss_pct, 2)
+    advice.target_feasibility = feasibility
+    advice.estimated_holding_time = tp_levels_result[-1]["holding_estimate"]
 ```
 
-Cập nhật lời gọi trong Orchestrator (Section 11) để truyền thêm 
-`recent_candles` và `other_timeframe`:
+## BƯỚC 3 — Cập nhật TradeAdvice (field mới, additive)
 
-```python
-advice = self.confluence_engine.decide(
-    asset=asset,
-    timeframe=timeframe,
-    snapshot=current_indicator_snapshot,
-    recent_signals=self.rule_engine.recent_signals,
-    recent_candles=self.buffers[asset][timeframe].last_n_candles(
-        self.cfg["COUNTER_MOVE_LOOKBACK_CANDLES"]),
-    other_tf_snapshot=self.indicators.get(asset, {}).get(other_tf),
-    other_timeframe=other_tf,
-)
-```
-
-**Thêm field mới vào TradeAdvice** (additive, không phá schema cũ) 
-để frontend có thể hiển thị chi tiết hơn nếu muốn:
 ```python
 @dataclass
 class TradeAdvice:
-    # ... các field cũ giữ nguyên ...
-    counter_move_detected: bool = False
-    counter_move_magnitude_atr: float = 0.0
+    # ... giữ nguyên toàn bộ field cũ ...
+    swing_mode: bool = False
+    tp_levels: list = field(default_factory=list)
+    # Mỗi phần tử tp_levels giờ có CẢ 2 con số để tránh nhầm lẫn:
+    #   price_move_pct    -> % giá thực tế cần di chuyển
+    #   margin_profit_pct -> % lợi nhuận trên vốn ký quỹ tương ứng
+    sl_margin_loss_pct: float = 0.0   # % vốn mất nếu dính SL (đã nhân leverage)
+    target_feasibility: str = ""
+    estimated_holding_time: str = ""
 ```
 
-## PATCH 3 — Chú giải liên kết giữa Gauge (0-100) và Confidence (0-5) (Lỗi 3)
+## BƯỚC 4 — Cập nhật UI (dashboard.html) — hiển thị SONG SONG 2 đơn vị
 
-Đây là thay đổi CHỈ Ở FRONTEND (dashboard.html), không đụng Python 
-backend. Thêm 1 dòng text nhỏ ngay dưới Gauge hiện có:
+Đây là phần quan trọng nhất để không lặp lại nhầm lẫn — LUÔN hiển 
+thị cả 2 con số cạnh nhau, không bao giờ chỉ hiển thị 1 loại %:
 
-```html
-<!-- Chèn ngay sau phần tử hiển thị số Gauge 0-100 và nhãn 
-     "BÁN MẠNH/MUA MẠNH", TRƯỚC phần progress bar màu gradient -->
-<p class="text-xs text-gray-400 mt-1">
-  ℹ️ Đây là chỉ số tâm lý thị trường tổng quát. Xem khuyến nghị 
-  hành động cụ thể kèm độ tin cậy riêng ở khung 
-  <strong>"Khuyến Nghị Giao Dịch"</strong> bên dưới.
-</p>
+```
+┌───────────────────────────────────────────────────────────────┐
+│  🎯 Khuyến Nghị Giao Dịch [XAU · 1h]       Độ tin cậy: Cao     │
+│                                                                 │
+│   SELL    Đòn bẩy: x5 | Vốn/lệnh: 10%                         │
+│                                                                 │
+│  ĐIỂM VÀO: $4,159.30     CẮT LỖ: $4,142.55                     │
+│  (Nếu dính SL: mất ~1.4% vốn ký quỹ)                           │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────┐   │
+│  │           Giá cần di chuyển   │   Lãi trên vốn ký quỹ  │   │
+│  │ TP1 (40%): $4,117.70 (−1.0%)  │        +5.0%     ~8h   │   │
+│  │ TP2 (35%): $4,096.90 (−1.5%)  │        +7.5%     ~12h  │   │
+│  │ TP3 (25%): $4,076.10 (−2.0%)  │       +10.0%     ~16h  │   │
+│  └───────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ✅ Hoàn toàn khả thi — biến động giá cần thiết nằm trong      │
+│     biên độ dao động thông thường của khung 1h                │
+│                                                                 │
+│  ⚠️ Lưu ý: % "Lãi trên vốn ký quỹ" đã bao gồm đòn bẩy x5.      │
+│     Đây KHÔNG phải % biến động giá thực tế của XAU (chỉ 1-2%). │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-Đồng thời, trong card "Khuyến Nghị Giao Dịch", thêm tooltip 
-(giống cơ chế icon ⓘ đã có sẵn ở các cột bảng "Sức Khỏe Thị Trường" 
-theo đúng pattern UI hiện tại) giải thích ngắn gọn ý nghĩa thang 
-đo 0-5:
-
-```html
-<span class="info-icon" data-tooltip="Độ tin cậy được tính từ số 
-lượng yếu tố kỹ thuật (Xu hướng, RSI, Vị trí dải giá, Tín hiệu 
-mâu thuẫn, Đa khung thời gian) đang đồng thuận với nhau. Đây là 
-thang đo RIÊNG, khác với Thước Đo Tâm Lý Thị Trường ở trên, nhưng 
-cả hai đều phản ánh cùng một xu hướng thị trường.">ⓘ</span>
+Yêu cầu kỹ thuật cho đoạn JS render:
+```javascript
+// Luôn hiển thị CẢ 2 giá trị cạnh nhau trong cùng 1 dòng, 
+// KHÔNG được chỉ hiển thị 1 trong 2 để tránh tái diễn nhầm lẫn
+function renderTpLevel(level) {
+  return `
+    <div class="tp-row">
+      <span>${level.label} (đóng ${level.close_pct}%)</span>
+      <span class="price">${level.price} 
+        <small>(giá ${level.price_move_pct > 0 ? '+' : ''}${level.price_move_pct}%)</small>
+      </span>
+      <span class="margin-profit">+${level.margin_profit_pct}% vốn ký quỹ</span>
+      <span class="holding">~${level.holding_estimate}</span>
+    </div>`;
+}
 ```
 
-## PATCH 4 — Unit Test cho cả 3 lỗi đã sửa
-
-Viết test case dựa TRỰC TIẾP trên số liệu thực tế đã quan sát để 
-đảm bảo không tái diễn:
+## BƯỚC 5 — Unit Test xác nhận công thức quy đổi ĐÚNG
 
 ```python
-def test_mtf_label_dynamic_not_hardcoded():
-    """Lỗi 1: Khi đang ở khung 1h, label phải nói '15 phút 
-    (ngắn hạn hơn)', KHÔNG được nói 'khung lớn'."""
-    engine = ConfluenceDecisionEngine(CONFIG)
-    label = engine._get_relative_tf_label("1h", "15m")
-    assert "ngắn hạn hơn" in label
-    assert "lớn" not in label.lower()
-
-def test_counter_move_detected_on_vshape_bounce():
-    """Lỗi 2 - Regression test: Tái hiện đúng case XAU 1h đã 
-    quan sát. Giá giảm sâu rồi bật mạnh ngược trend EMA giảm 
-    PHẢI được gắn cờ conflict, dẫn tới action=WAIT."""
-    candles = [
-        FakeCandle(close=4148.69),  # đáy
-        FakeCandle(close=4163.00),
-        FakeCandle(close=4188.83),  # bật mạnh ~3.7x ATR
-    ]
-    snapshot = {
-        "close": 4188.83, "ema_fast": 4158.11, "ema_slow": 4162.64,
-        "rsi": 40.4, "bb_upper": 4164.63, "bb_lower": 4151.95,
-        "atr": 10.81,
-    }
+def test_margin_to_price_conversion_correct():
+    """Kiểm tra công thức cốt lõi: với leverage=5, margin_profit=10% 
+    PHẢI quy đổi đúng ra price_move=2.0%, không được lệch 5 lần 
+    như lỗi thiết kế trước."""
+    entry = 4159.30
+    atr = 11.17
     engine = ConfluenceDecisionEngine(CONFIG)
     advice = engine.decide(
-        asset="XAU", timeframe="1h", snapshot=snapshot,
-        recent_signals=[], recent_candles=candles)
+        asset="XAU", timeframe="1h",
+        snapshot={"close": entry, "ema_fast": 4158.11, 
+                  "ema_slow": 4162.64, "rsi": 38.3,
+                  "bb_upper": 4164.63, "bb_lower": 4151.95, "atr": atr},
+        recent_signals=[], recent_candles=[...])
     
-    assert advice.counter_move_detected is True
-    assert advice.action == "WAIT", (
-        "Phải chuyển thành WAIT khi phát hiện counter-move mạnh, "
-        "không được giữ nguyên SELL như lỗi cũ"
+    tp3 = advice.tp_levels[-1]
+    assert tp3["margin_profit_pct"] == 10.0
+    assert abs(tp3["price_move_pct"] - 2.0) < 0.01, (
+        "Lỗi quy đổi: price_move_pct phải = margin_profit_pct / leverage"
     )
 
-def test_no_false_positive_counter_move_in_normal_trend():
-    """Đảm bảo patch mới KHÔNG gây false positive khi trend đang 
-    diễn biến bình thường, không có biến động bất thường."""
-    candles = [
-        FakeCandle(close=4160.0), 
-        FakeCandle(close=4158.0), 
-        FakeCandle(close=4156.0),  # giảm đều, đúng với trend giảm
-    ]
-    snapshot = {
-        "close": 4156.0, "ema_fast": 4158.0, "ema_slow": 4162.0,
-        "rsi": 45.0, "bb_upper": 4170.0, "bb_lower": 4150.0,
-        "atr": 10.0,
-    }
-    engine = ConfluenceDecisionEngine(CONFIG)
-    advice = engine.decide(
-        asset="XAU", timeframe="1h", snapshot=snapshot,
-        recent_signals=[], recent_candles=candles)
-    
-    assert advice.counter_move_detected is False
-    assert advice.action == "SELL"  # vẫn giữ nguyên hành vi đúng cũ
-```
+def test_sl_margin_loss_calculated_with_leverage():
+    """SL loss trên vốn ký quỹ phải được nhân với leverage, 
+    không phải % giá thuần."""
+    # Với SL cách Entry 0.4% giá, leverage=5 => mất 2.0% vốn, 
+    # không phải 0.4%
+    assert advice.sl_margin_loss_pct == pytest.approx(
+        advice.tp_levels[0]["price_move_pct"]... , rel=0.1)  
+    # (chi tiết assert theo đúng fixture cụ thể)
 
-## PATCH 5 — Cập nhật tài liệu
-
-Trong PROJECT_ARCHITECTURE.md, Section 4.5, thêm ghi chú changelog:
-
-```markdown
-### Changelog v1.1 (Patch sau kiểm thử thực tế)
-- [Fixed] Reasoning text MTF agreement giờ mô tả ĐÚNG hướng so 
-  sánh thực tế (ngắn hạn/dài hạn) thay vì hard-code "khung lớn".
-- [Fixed] Bổ sung detect_counter_move() để bắt các cú biến động 
-  giá mạnh dạng V-shape không trùng khớp với Signal rời rạc nào 
-  của RuleEngine — khắc phục điểm mù khiến hệ thống bỏ sót mâu 
-  thuẫn rõ ràng giữa EMA Trend và diễn biến giá tức thời.
-- [UX] Thêm chú giải liên kết giữa Gauge (thang 0-100, tính client) 
-  và Confidence Score (thang 0-5, tính server) để tránh người dùng 
-  hiểu lầm đây là 2 kết luận trái ngược.
-- Nguồn gốc patch: phát hiện qua live testing case thực tế 
-  XAU/USD khung 1h ngày quan sát, giá bật từ $4,148 lên $4,188 
-  (~3.7x ATR) mà không được hệ thống gắn cờ cảnh báo.
+def test_ui_always_shows_both_units():
+    """Đảm bảo mỗi tp_level LUÔN có cả 2 field price_move_pct 
+    VÀ margin_profit_pct, không được thiếu field nào."""
+    for level in advice.tp_levels:
+        assert "price_move_pct" in level
+        assert "margin_profit_pct" in level
 ```
 
 [OUTPUT FORMAT]
-- Code diff đầy đủ cho từng patch (PATCH 1 → PATCH 5), chỉ rõ vị 
-  trí chèn/sửa theo đúng dòng/hàm đã tồn tại trong engine.py.
-- Bảng "Trước/Sau" minh họa output thực tế của case XAU 1h đã nêu, 
-  so sánh reasoning text VÀ action trước và sau khi áp dụng patch.
-- Bảng "Cam kết tài nguyên" xác nhận patch này KHÔNG làm tăng đáng 
-  kể RAM/CPU (ước tính cụ thể: thêm bao nhiêu byte do field 
-  counter_move_detected/magnitude, thêm bao nhiêu micro-giây do 
-  vòng lặp 3 nến trong detect_counter_move).
-- Checklist xác nhận: tất cả Unit Test ở PATCH 4 phải PASS trước 
-  khi coi bản vá hoàn tất, đặc biệt test_counter_move_detected_
-  on_vshape_bounce() vì đây là test tái hiện đúng lỗi thực tế 
-  nghiêm trọng nhất đã phát hiện.
+- Code diff đầy đủ, chỉ rõ đây là bản THAY THẾ cho CONFIG 
+  "SWING_TP_LEVELS" và logic tính TP đã thiết kế ở lần cập nhật 
+  trước (không phải thêm mới song song — tránh tồn tại 2 bộ công 
+  thức gây nhầm lẫn).
+- Bảng minh họa dùng ĐÚNG số liệu XAU trong ảnh gốc, trình bày rõ 
+  2 cột "% giá" và "% vốn ký quỹ" cạnh nhau để kiểm chứng công thức 
+  trước khi merge.
+- Bảng "Cam kết tài nguyên": xác nhận thay đổi này KHÔNG làm tăng 
+  tải tính toán so với thiết kế trước (thực chất ĐƠN GIẢN HƠN vì 
+  bỏ được bước quét swing-structure phức tạp, chỉ còn phép nhân 
+  chia cơ bản).
+- Checklist xác nhận test_margin_to_price_conversion_correct() 
+  PASS — đây là test quan trọng nhất để đảm bảo không tái diễn sai 
+  số 5 lần do nhầm lẫn đơn vị.
 ```
-

@@ -432,6 +432,83 @@
       padding-top: 8px;
       line-height: 1.4;
     }
+    /* Multi-tier TP Container for Swing Mode */
+    .swing-tp-container {
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .swing-tp-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: #93c5fd;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 6px;
+    }
+    .leverage-badge {
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      color: #60a5fa;
+      font-size: 0.72rem;
+      padding: 2px 8px;
+      border-radius: 9999px;
+    }
+    .tp-table {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .tp-row {
+      display: grid;
+      grid-template-columns: 1.4fr 1.3fr 1.3fr 0.7fr auto;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 10px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 6px;
+      font-size: 0.8rem;
+    }
+    @media (max-width: 640px) {
+      .tp-row {
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+    }
+    .tp-row .tp-label { font-weight: 700; color: #f1f5f9; }
+    .tp-row .tp-price { font-weight: 700; color: #34d399; font-family: monospace; }
+    .tp-row .tp-price small { color: var(--text-muted); font-size: 0.72rem; margin-left: 2px; }
+    .tp-row .tp-margin-profit { color: #60a5fa; font-weight: 700; }
+    .tp-row .tp-holding { color: var(--text-muted); font-size: 0.72rem; }
+    .feasibility-box {
+      font-size: 0.78rem;
+      line-height: 1.4;
+      padding: 8px 10px;
+      background: rgba(16, 185, 129, 0.08);
+      border-left: 3px solid #10b981;
+      border-radius: 4px;
+      color: #d1fae5;
+    }
+    .feasibility-box.warn {
+      background: rgba(245, 158, 11, 0.08);
+      border-left-color: #f59e0b;
+      color: #fef3c7;
+    }
+    .tp-explanation-note {
+      font-size: 0.72rem;
+      color: #94a3b8;
+      line-height: 1.4;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 4px;
+      padding: 6px 8px;
+    }
     .copy-toast {
       position: fixed;
       bottom: 24px;
@@ -722,8 +799,11 @@
           <div class="advice-card-body">
             <!-- Action & Confidence -->
             <div class="advice-header-row">
-              <div id="adviceActionBadge" class="advice-action-badge action-wait">
-                <span id="adviceActionText">WAIT</span>
+              <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                <div id="adviceActionBadge" class="advice-action-badge action-wait">
+                  <span id="adviceActionText">WAIT</span>
+                </div>
+                <span id="adviceMetaBadge" class="leverage-badge" style="display:none;">⚡ Đòn bẩy x5 · Vốn 10%</span>
               </div>
               <div class="advice-conf-box">
                 <div class="advice-conf-label" style="display:flex; align-items:center; justify-content:flex-end; gap:4px;">
@@ -757,7 +837,7 @@
                   <span class="level-value" id="adviceSlVal">--</span>
                   <button class="btn-copy-mini" onclick="copyValue('adviceSlVal')">📋 Copy</button>
                 </div>
-                <span class="level-sub">R:R 1:1 bảo toàn vốn</span>
+                <span class="level-sub" id="adviceSlSub">R:R 1:1 bảo toàn vốn</span>
               </div>
               <div class="level-card">
                 <span class="level-title" style="color:#34d399;">🎯 Chốt Lời (TP)</span>
@@ -766,6 +846,21 @@
                   <button class="btn-copy-mini" onclick="copyValue('adviceTp1Val')">📋 Copy</button>
                 </div>
                 <span class="level-sub" id="adviceTp2Sub">TP2: --</span>
+              </div>
+            </div>
+
+            <!-- Multi-Tier TP Table cho Swing Mode (1h/4h) -->
+            <div id="adviceSwingTpBox" class="swing-tp-container" style="display:none;">
+              <div class="swing-tp-header">
+                <span>🎯 Mục Tiêu Chốt Lời Đa Tầng (Multi-Tier TP)</span>
+                <span class="leverage-badge">⚡ Lãi tính trên Vốn Ký Quỹ</span>
+              </div>
+              <div class="tp-table" id="adviceTpTable">
+                <!-- Rendered dynamically -->
+              </div>
+              <div class="feasibility-box" id="adviceFeasibilityBox"></div>
+              <div class="tp-explanation-note">
+                ⚠️ <strong>Lưu ý quan trọng:</strong> Cột "% Lãi trên vốn ký quỹ" đã nhân đòn bẩy x5. Đây KHÔNG phải % biến động giá thực tế của tài sản (chỉ cần di chuyển 1%–2% là đạt mục tiêu 5%–10% lãi).
               </div>
             </div>
 
@@ -1370,6 +1465,21 @@
       }, 1500);
     }
 
+    function copyRaw(val) {
+      if (!val) return;
+      navigator.clipboard.writeText(val.toString()).then(() => {
+        showToast('Đã copy: ' + val);
+      }).catch(() => {
+        const ta = document.createElement('textarea');
+        ta.value = val;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast('Đã copy: ' + val);
+      });
+    }
+
     // --- RENDER TRADE ADVICE CARD ---
     function renderAdviceCard(snapshot, asset, tf) {
       if (!snapshot || !snapshot.advice) return;
@@ -1379,18 +1489,23 @@
       const badgeAsset = document.getElementById('adviceAssetBadge');
       if (badgeAsset) badgeAsset.textContent = `[${asset} · ${tf}]`;
 
+      const levelsGrid = document.getElementById('adviceLevelsGrid');
+      const swingTpBox = document.getElementById('adviceSwingTpBox');
+      const waitMessage = document.getElementById('adviceWaitMessage');
+      const metaBadge = document.getElementById('adviceMetaBadge');
+
       if (!advice) {
-        const waitBox = document.getElementById('adviceWaitMessage');
-        if (waitBox) {
-          waitBox.style.display = 'flex';
-          waitBox.innerHTML = '<span>⏳</span><span>Đang thu thập dữ liệu nến cho tài sản này...</span>';
+        if (waitMessage) {
+          waitMessage.style.display = 'flex';
+          waitMessage.innerHTML = '<span>⏳</span><span>Đang thu thập dữ liệu nến cho tài sản này...</span>';
         }
-        const levelsGrid = document.getElementById('adviceLevelsGrid');
         if (levelsGrid) levelsGrid.style.display = 'none';
+        if (swingTpBox) swingTpBox.style.display = 'none';
+        if (metaBadge) metaBadge.style.display = 'none';
         return;
       }
 
-      // Action Badge
+      // Action Badge & Meta Profile
       const actionBadge = document.getElementById('adviceActionBadge');
       const actionText = document.getElementById('adviceActionText');
       if (actionBadge && actionText) {
@@ -1399,6 +1514,9 @@
           advice.action === 'BUY' ? 'action-buy' :
           advice.action === 'SELL' ? 'action-sell' : 'action-wait'
         );
+      }
+      if (metaBadge) {
+        metaBadge.style.display = (advice.action !== 'WAIT') ? 'inline-block' : 'none';
       }
 
       // Confidence
@@ -1416,17 +1534,16 @@
       }
 
       // Entry / SL / TP
-      const levelsGrid = document.getElementById('adviceLevelsGrid');
-      const waitMessage = document.getElementById('adviceWaitMessage');
       if (advice.action === 'WAIT') {
         if (levelsGrid) levelsGrid.style.display = 'none';
+        if (swingTpBox) swingTpBox.style.display = 'none';
         if (waitMessage) {
           waitMessage.style.display = 'flex';
           waitMessage.innerHTML = '<span>⏸</span><span>Chưa có điểm vào lệnh phù hợp lúc này — hệ thống đang chờ tín hiệu rõ ràng hơn.</span>';
         }
       } else {
-        if (levelsGrid) levelsGrid.style.display = 'grid';
         if (waitMessage) waitMessage.style.display = 'none';
+        if (levelsGrid) levelsGrid.style.display = 'grid';
 
         const entryValEl = document.getElementById('adviceEntryVal');
         const entrySubEl = document.getElementById('adviceEntrySub');
@@ -1441,9 +1558,19 @@
         }
 
         const slValEl = document.getElementById('adviceSlVal');
+        const slSubEl = document.getElementById('adviceSlSub');
         if (slValEl) {
           slValEl.textContent = '$' + Number(advice.stop_loss).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           slValEl.setAttribute('data-raw', advice.stop_loss);
+        }
+        if (slSubEl) {
+          if (advice.swing_mode && advice.sl_margin_loss_pct) {
+            slSubEl.textContent = `Nếu dính SL: mất ~${advice.sl_margin_loss_pct}% vốn ký quỹ (x5)`;
+            slSubEl.style.color = '#f87171';
+          } else {
+            slSubEl.textContent = 'R:R 1:1 bảo toàn vốn';
+            slSubEl.style.color = 'var(--text-muted)';
+          }
         }
 
         const tp1ValEl = document.getElementById('adviceTp1Val');
@@ -1453,7 +1580,38 @@
           tp1ValEl.setAttribute('data-raw', advice.take_profit_1);
         }
         if (tp2SubEl) {
-          tp2SubEl.textContent = `TP2: $${Number(advice.take_profit_2).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})} (${advice.tp2_rule || 'Trailing EMA'})`;
+          if (advice.swing_mode && advice.tp_levels && advice.tp_levels.length > 0) {
+            tp2SubEl.textContent = 'Multi-Tier TP (Xem chi tiết bảng bên dưới)';
+          } else {
+            tp2SubEl.textContent = `TP2: $${Number(advice.take_profit_2).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})} (${advice.tp2_rule || 'Trailing EMA'})`;
+          }
+        }
+
+        // Render Swing Multi-Tier TP Table
+        if (swingTpBox) {
+          if (advice.swing_mode && advice.tp_levels && advice.tp_levels.length > 0) {
+            swingTpBox.style.display = 'flex';
+            const tpTableEl = document.getElementById('adviceTpTable');
+            if (tpTableEl) {
+              const sign = (advice.action === 'SELL') ? '−' : '+';
+              tpTableEl.innerHTML = advice.tp_levels.map(lvl => `
+                <div class="tp-row">
+                  <span class="tp-label">${lvl.label} (đóng ${lvl.close_pct}%)</span>
+                  <span class="tp-price">$${Number(lvl.price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})} <small>(${sign}${Math.abs(lvl.price_move_pct)}% giá)</small></span>
+                  <span class="tp-margin-profit">+${lvl.margin_profit_pct}% vốn ký quỹ</span>
+                  <span class="tp-holding">~${lvl.holding_estimate}</span>
+                  <button class="btn-copy-mini" onclick="copyRaw('${lvl.price}')">📋 Copy</button>
+                </div>
+              `).join('');
+            }
+            const feasEl = document.getElementById('adviceFeasibilityBox');
+            if (feasEl) {
+              feasEl.textContent = advice.target_feasibility;
+              feasEl.className = 'feasibility-box' + (advice.target_feasibility.includes('⚠️') ? ' warn' : '');
+            }
+          } else {
+            swingTpBox.style.display = 'none';
+          }
         }
       }
 
