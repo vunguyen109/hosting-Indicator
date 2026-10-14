@@ -172,6 +172,31 @@ CONFIG = {
     "rsi_oversold":            30.0,
     "atr_breakout_multiplier": 1.5,   # ATR x1.5 spike = breakout signal
 
+    # ---- Confluence Decision Engine thresholds --------------------------
+    # Ngưỡng phân loại EMA Trend (đơn vị: số lần ATR giữa EMA20-EMA50)
+    "EMA_TREND_STRONG_ATR_MULT":    0.5,   # > 0.5*ATR => "rõ rệt"
+    "EMA_TREND_WEAK_ATR_MULT":      0.15,  # > 0.15*ATR => "nghiêng"
+
+    # Ngưỡng phân loại RSI Zone
+    "RSI_EXTREME_OVERSOLD":         25,
+    "RSI_LEAN_OVERSOLD":            40,
+    "RSI_LEAN_OVERBOUGHT":          60,
+    "RSI_EXTREME_OVERBOUGHT":       75,
+
+    # Ngưỡng phân loại vị trí Bollinger Band (% độ rộng dải)
+    "BB_EDGE_ZONE_PCT":             0.15,  # 15% sát biên => "chạm biên"
+
+    # Số nến gần nhất để kiểm tra tín hiệu mâu thuẫn
+    "CONFLICT_LOOKBACK_CANDLES":    2,
+
+    # Hệ số ATR cho Stop Loss / Take Profit
+    "SL_ATR_MULTIPLIER":            1.5,
+    "TP1_RR_RATIO":                 1.0,   # R:R 1:1 cho TP1
+    "TP2_ATR_MULTIPLIER":           3.0,   # TP2 tham khảo (song song rule trailing theo EMA)
+
+    # Ngưỡng coi là "giá đã gần EMA20, có thể entry ngay" thay vì "chờ pullback"
+    "ENTRY_PULLBACK_ATR_THRESHOLD": 0.3,
+
     # ---- Polling timing -------------------------------------------------
     # Poll 5 seconds after candle close for exchange data to settle
     "poll_offset_seconds": 5,
@@ -527,6 +552,377 @@ class RuleEngine:
 
 
 # =============================================================================
+# SECTION 4.5: CONFLUENCE DECISION ENGINE
+# =============================================================================
+
+from enum import Enum
+
+
+class TrendState(str, Enum):
+    STRONG_UP = "Tăng rõ rệt"
+    LEAN_UP = "Nghiêng tăng"
+    NEUTRAL = "Cân bằng"
+    LEAN_DOWN = "Nghiêng giảm"
+    STRONG_DOWN = "Giảm rõ rệt"
+
+
+class RsiZone(str, Enum):
+    EXTREME_OVERSOLD = "Quá bán sâu"
+    LEAN_OVERSOLD = "Nghiêng bán"
+    NEUTRAL = "Cân bằng"
+    LEAN_OVERBOUGHT = "Nghiêng mua"
+    EXTREME_OVERBOUGHT = "Quá mua sâu"
+
+
+class BbPosition(str, Enum):
+    BREAK_UPPER = "Vượt đỉnh"
+    NEAR_UPPER = "Chạm biên trên"
+    MIDDLE = "Trong dải"
+    NEAR_LOWER = "Chạm biên dưới"
+    BREAK_LOWER = "Thủng đáy"
+
+
+class Action(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+    WAIT = "WAIT"
+
+
+class Confidence(str, Enum):
+    HIGH = "Cao"
+    MEDIUM = "Trung bình"
+    LOW = "Thấp"
+
+
+@dataclass
+class TradeAdvice:
+    action: str                    # BUY / SELL / WAIT
+    confidence: str                # Cao / Trung bình / Thấp
+    confidence_score: int          # 0-5, số yếu tố đồng thuận
+    entry_type: str                # "now" / "wait_pullback" / "none"
+    entry_price: Optional[float]
+    entry_zone: Optional[float]    # giá EMA20 (vùng chờ pullback)
+    stop_loss: Optional[float]
+    take_profit_1: Optional[float]
+    take_profit_2: Optional[float]
+    tp2_rule: str                  # mô tả quy tắc trailing bằng text
+    reasoning: list[str]           # checklist lý do (để hiển thị UI)
+    conflict_detected: bool
+    mtf_agreement: Optional[bool]  # None nếu không có dữ liệu khung kia
+    disclaimer: str = (
+        "Đây là khuyến nghị dựa trên thuật toán kỹ thuật, "
+        "KHÔNG PHẢI lời khuyên đầu tư. Người dùng tự chịu "
+        "trách nhiệm với quyết định giao dịch của mình."
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "action": self.action,
+            "confidence": self.confidence,
+            "confidence_score": self.confidence_score,
+            "entry_type": self.entry_type,
+            "entry_price": self.entry_price,
+            "entry_zone": self.entry_zone,
+            "stop_loss": self.stop_loss,
+            "take_profit_1": self.take_profit_1,
+            "take_profit_2": self.take_profit_2,
+            "tp2_rule": self.tp2_rule,
+            "reasoning": self.reasoning,
+            "conflict_detected": self.conflict_detected,
+            "mtf_agreement": self.mtf_agreement,
+            "disclaimer": self.disclaimer,
+        }
+
+
+class ConfluenceDecisionEngine:
+    """
+    Đọc snapshot hiện tại từ IndicatorEngine + lịch sử tín hiệu từ 
+    RuleEngine để sinh ra khuyến nghị BUY/SELL/WAIT kèm Entry/SL/TP.
+    
+    Phạm vi: CHỈ phục vụ hiển thị UI qua /api/snapshot. 
+    KHÔNG dispatch qua bất kỳ kênh thông báo nào (Telegram, email...).
+    
+    Nguyên tắc: Pure function, KHÔNG giữ state nội bộ ngoài việc 
+    đọc input truyền vào. Được gọi lại mỗi khi có nến mới đóng, 
+    KHÔNG gọi lại mỗi request HTTP.
+    """
+
+    def __init__(self, config: dict) -> None:
+        self.cfg = config
+
+    def classify_ema_trend(self, ema_fast: float, ema_slow: float, atr: float) -> TrendState:
+        if atr <= 0:
+            return TrendState.NEUTRAL
+        diff_in_atr = (ema_fast - ema_slow) / atr
+        s = self.cfg["EMA_TREND_STRONG_ATR_MULT"]
+        w = self.cfg["EMA_TREND_WEAK_ATR_MULT"]
+        if diff_in_atr > s:
+            return TrendState.STRONG_UP
+        if diff_in_atr > w:
+            return TrendState.LEAN_UP
+        if diff_in_atr < -s:
+            return TrendState.STRONG_DOWN
+        if diff_in_atr < -w:
+            return TrendState.LEAN_DOWN
+        return TrendState.NEUTRAL
+
+    def classify_rsi(self, rsi: float) -> RsiZone:
+        c = self.cfg
+        if rsi <= c["RSI_EXTREME_OVERSOLD"]:
+            return RsiZone.EXTREME_OVERSOLD
+        if rsi <= c["RSI_LEAN_OVERSOLD"]:
+            return RsiZone.LEAN_OVERSOLD
+        if rsi >= c["RSI_EXTREME_OVERBOUGHT"]:
+            return RsiZone.EXTREME_OVERBOUGHT
+        if rsi >= c["RSI_LEAN_OVERBOUGHT"]:
+            return RsiZone.LEAN_OVERBOUGHT
+        return RsiZone.NEUTRAL
+
+    def classify_bb_position(self, close: float, bb_upper: float, bb_lower: float) -> BbPosition:
+        width = bb_upper - bb_lower
+        if width <= 0:
+            return BbPosition.MIDDLE
+        edge = width * self.cfg["BB_EDGE_ZONE_PCT"]
+        if close > bb_upper:
+            return BbPosition.BREAK_UPPER
+        if close < bb_lower:
+            return BbPosition.BREAK_LOWER
+        if close > bb_upper - edge:
+            return BbPosition.NEAR_UPPER
+        if close < bb_lower + edge:
+            return BbPosition.NEAR_LOWER
+        return BbPosition.MIDDLE
+
+    def detect_conflict(self, recent_signals: list, asset: str, timeframe: str, trend: TrendState) -> bool:
+        """Kiểm tra N tín hiệu gần nhất của asset/timeframe này có loại NGƯỢC CHIỀU với xu hướng EMA hiện tại không."""
+        lookback = self.cfg["CONFLICT_LOOKBACK_CANDLES"]
+        bullish_types = {"EMA_CROSS_UP", "BB_BREAKOUT_UP", "RSI_OVERSOLD"}
+        bearish_types = {"EMA_CROSS_DOWN", "BB_BREAKOUT_DOWN", "RSI_OVERBOUGHT"}
+
+        relevant = [
+            s for s in recent_signals
+            if (s.get("asset") if isinstance(s, dict) else getattr(s, "asset", None)) == asset
+            and (s.get("timeframe") if isinstance(s, dict) else getattr(s, "timeframe", None)) == timeframe
+        ]
+        relevant.sort(key=lambda x: x.get("ts", 0) if isinstance(x, dict) else getattr(x, "ts", 0))
+        recent_window = relevant[-lookback:]
+
+        trend_is_up = trend in (TrendState.STRONG_UP, TrendState.LEAN_UP)
+        trend_is_down = trend in (TrendState.STRONG_DOWN, TrendState.LEAN_DOWN)
+
+        for s in recent_window:
+            sig_type = s.get("signal_type") if isinstance(s, dict) else getattr(s, "signal_type", None)
+            if trend_is_up and sig_type in bearish_types:
+                return True
+            if trend_is_down and sig_type in bullish_types:
+                return True
+        return False
+
+    def check_mtf_agreement(self, trend_current_tf: TrendState, trend_other_tf: Optional[TrendState]) -> Optional[bool]:
+        if trend_other_tf is None:
+            return None
+        up_states = (TrendState.STRONG_UP, TrendState.LEAN_UP)
+        down_states = (TrendState.STRONG_DOWN, TrendState.LEAN_DOWN)
+        if trend_current_tf in up_states and trend_other_tf in up_states:
+            return True
+        if trend_current_tf in down_states and trend_other_tf in down_states:
+            return True
+        return False
+
+    def decide(
+        self,
+        asset: str,
+        timeframe: str,
+        snapshot: dict,
+        recent_signals: list,
+        other_tf_snapshot: Optional[dict] = None,
+    ) -> TradeAdvice:
+        """
+        snapshot: dict với các key close, ema_fast, ema_slow, rsi, bb_upper, bb_mid, bb_lower, atr.
+        other_tf_snapshot: snapshot của timeframe còn lại CÙNG asset.
+        """
+        if (
+            not snapshot
+            or snapshot.get("close") is None
+            or snapshot.get("atr") is None
+            or snapshot.get("ema_fast") is None
+            or snapshot.get("ema_slow") is None
+            or snapshot.get("rsi") is None
+            or snapshot.get("bb_upper") is None
+            or snapshot.get("bb_lower") is None
+        ):
+            return TradeAdvice(
+                action=Action.WAIT.value,
+                confidence=Confidence.LOW.value,
+                confidence_score=0,
+                entry_type="none",
+                entry_price=None,
+                entry_zone=None,
+                stop_loss=None,
+                take_profit_1=None,
+                take_profit_2=None,
+                tp2_rule="",
+                reasoning=["Đang thu thập đủ dữ liệu nến để tính toán chỉ báo..."],
+                conflict_detected=False,
+                mtf_agreement=None,
+            )
+
+        close = snapshot["close"]
+        atr = snapshot["atr"]
+        trend = self.classify_ema_trend(snapshot["ema_fast"], snapshot["ema_slow"], atr)
+        rsi_zone = self.classify_rsi(snapshot["rsi"])
+        bb_pos = self.classify_bb_position(close, snapshot["bb_upper"], snapshot["bb_lower"])
+        conflict = self.detect_conflict(recent_signals, asset, timeframe, trend)
+
+        trend_other = None
+        if other_tf_snapshot and all(
+            other_tf_snapshot.get(k) is not None for k in ("ema_fast", "ema_slow", "atr")
+        ):
+            trend_other = self.classify_ema_trend(
+                other_tf_snapshot["ema_fast"],
+                other_tf_snapshot["ema_slow"],
+                other_tf_snapshot["atr"],
+            )
+        mtf_agree = self.check_mtf_agreement(trend, trend_other)
+
+        reasoning: list[str] = []
+        score = 0
+
+        # 1. EMA Trend factor
+        if trend in (TrendState.STRONG_UP, TrendState.LEAN_UP):
+            score += 2 if trend == TrendState.STRONG_UP else 1
+            reasoning.append(f"Xu hướng EMA: {trend.value} (ủng hộ MUA)")
+        elif trend in (TrendState.STRONG_DOWN, TrendState.LEAN_DOWN):
+            score -= 2 if trend == TrendState.STRONG_DOWN else 1
+            reasoning.append(f"Xu hướng EMA: {trend.value} (ủng hộ BÁN)")
+        else:
+            reasoning.append(f"Xu hướng EMA: {trend.value} (trung lập)")
+
+        # 2. RSI Zone factor
+        if rsi_zone == RsiZone.EXTREME_OVERBOUGHT:
+            score -= 1
+            reasoning.append("RSI quá mua sâu (cảnh báo rủi ro đảo chiều)")
+        elif rsi_zone == RsiZone.EXTREME_OVERSOLD:
+            score += 1
+            reasoning.append("RSI quá bán sâu (cảnh báo rủi ro đảo chiều)")
+        elif rsi_zone == RsiZone.LEAN_OVERBOUGHT:
+            score += 1
+            reasoning.append("RSI nghiêng mua, còn dư địa tăng")
+        elif rsi_zone == RsiZone.LEAN_OVERSOLD:
+            score -= 1
+            reasoning.append("RSI nghiêng bán, còn dư địa giảm")
+        else:
+            reasoning.append("RSI cân bằng")
+
+        # 3. Bollinger Band factor
+        if bb_pos == BbPosition.BREAK_UPPER:
+            reasoning.append("Giá vượt đỉnh dải Bollinger (biến động mạnh, cẩn trọng mua đuổi)")
+        elif bb_pos == BbPosition.BREAK_LOWER:
+            reasoning.append("Giá thủng đáy dải Bollinger (biến động mạnh, cẩn trọng bán đuổi)")
+        elif bb_pos == BbPosition.NEAR_UPPER:
+            score += 1
+            reasoning.append("Giá áp sát biên trên (ủng hộ xu hướng tăng)")
+        elif bb_pos == BbPosition.NEAR_LOWER:
+            score -= 1
+            reasoning.append("Giá áp sát biên dưới (ủng hộ xu hướng giảm)")
+        else:
+            reasoning.append("Giá trong vùng dao động bình thường")
+
+        # 4. Conflict detection factor
+        if conflict:
+            reasoning.append("⚠️ Phát hiện tín hiệu MÂU THUẪN gần đây trên chart — cần thận trọng")
+        else:
+            reasoning.append("Không có tín hiệu mâu thuẫn gần đây")
+
+        # 5. Multi-timeframe agreement factor
+        if mtf_agree is not None:
+            if mtf_agree:
+                score += 1 if score > 0 else (-1 if score < 0 else 0)
+                reasoning.append("Khung thời gian lớn ĐỒNG THUẬN xu hướng")
+            else:
+                reasoning.append("⚠️ Khung thời gian lớn KHÔNG đồng thuận")
+
+        # Decision Matrix evaluation
+        is_sideway = (trend == TrendState.NEUTRAL and bb_pos == BbPosition.MIDDLE)
+        is_extreme_overextended = (
+            (bb_pos == BbPosition.BREAK_LOWER and rsi_zone != RsiZone.EXTREME_OVERSOLD and score <= -3)
+            or (bb_pos == BbPosition.BREAK_UPPER and rsi_zone != RsiZone.EXTREME_OVERBOUGHT and score >= 3)
+        )
+
+        if conflict or is_sideway:
+            action = Action.WAIT
+        elif is_extreme_overextended:
+            action = Action.WAIT
+        elif score >= 2:
+            action = Action.BUY
+        elif score <= -2:
+            action = Action.SELL
+        else:
+            action = Action.WAIT
+
+        if mtf_agree is False:
+            confidence_score = max(0, abs(score) - 1)
+        else:
+            confidence_score = abs(score)
+
+        if confidence_score >= 4:
+            confidence = Confidence.HIGH
+        elif confidence_score >= 2:
+            confidence = Confidence.MEDIUM
+        else:
+            confidence = Confidence.LOW
+
+        entry_type, entry_price, entry_zone = "none", None, None
+        sl = tp1 = tp2 = None
+        tp2_rule = ""
+
+        if action in (Action.BUY, Action.SELL):
+            ema20 = snapshot["ema_fast"]
+            distance_atr = abs(close - ema20) / atr if atr > 0 else 0
+            pullback_threshold = self.cfg["ENTRY_PULLBACK_ATR_THRESHOLD"]
+
+            if distance_atr <= pullback_threshold:
+                entry_type = "now"
+                entry_price = close
+            else:
+                entry_type = "wait_pullback"
+                entry_zone = ema20
+                entry_price = None
+
+            ref_price = entry_price if entry_price is not None else ema20
+            sl_mult = self.cfg["SL_ATR_MULTIPLIER"]
+            rr = self.cfg["TP1_RR_RATIO"]
+            tp2_mult = self.cfg["TP2_ATR_MULTIPLIER"]
+
+            if action == Action.BUY:
+                sl = ref_price - sl_mult * atr
+                tp1 = ref_price + sl_mult * atr * rr
+                tp2 = ref_price + tp2_mult * atr
+                tp2_rule = "Giữ lệnh đến khi Xu hướng EMA chuyển từ Tăng sang Cân bằng/Giảm"
+            else:
+                sl = ref_price + sl_mult * atr
+                tp1 = ref_price - sl_mult * atr * rr
+                tp2 = ref_price - tp2_mult * atr
+                tp2_rule = "Giữ lệnh đến khi Xu hướng EMA chuyển từ Giảm sang Cân bằng/Tăng"
+
+        return TradeAdvice(
+            action=action.value,
+            confidence=confidence.value,
+            confidence_score=confidence_score,
+            entry_type=entry_type,
+            entry_price=round(entry_price, 4) if entry_price is not None else None,
+            entry_zone=round(entry_zone, 4) if entry_zone is not None else None,
+            stop_loss=round(sl, 4) if sl is not None else None,
+            take_profit_1=round(tp1, 4) if tp1 is not None else None,
+            take_profit_2=round(tp2, 4) if tp2 is not None else None,
+            tp2_rule=tp2_rule,
+            reasoning=reasoning,
+            conflict_detected=conflict,
+            mtf_agreement=mtf_agree,
+        )
+
+
+# =============================================================================
 # SECTION 5: TELEGRAM DISPATCHER (with graceful offline / web fallback)
 # =============================================================================
 
@@ -878,7 +1274,7 @@ def seconds_until_next_close(tf_seconds: int, offset: int = 5) -> float:
 # SECTION 10: WEB DASHBOARD & EMBEDDED SERVER (aiohttp.web)
 # =============================================================================
 
-HTML_DASHBOARD = """<!DOCTYPE html>
+HTML_DASHBOARD = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
   <meta charset="UTF-8">
@@ -1140,6 +1536,200 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .component-item small { font-size: 0.7rem; color: var(--text-muted); display: block; }
     .component-item span { font-size: 0.82rem; font-weight: 700; }
 
+    /* Trade Advice Card Styles */
+    .advice-card-body {
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .advice-header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .advice-action-badge {
+      font-size: 1.35rem;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      padding: 6px 20px;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .action-buy {
+      background: #10b981;
+      color: #ffffff;
+      box-shadow: 0 0 16px rgba(16, 185, 129, 0.4);
+    }
+    .action-sell {
+      background: #ef4444;
+      color: #ffffff;
+      box-shadow: 0 0 16px rgba(239, 68, 68, 0.4);
+    }
+    .action-wait {
+      background: #f59e0b;
+      color: #0f172a;
+      box-shadow: 0 0 16px rgba(245, 158, 11, 0.4);
+    }
+    .advice-conf-box {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
+    }
+    .advice-conf-label {
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--text-muted);
+    }
+    .advice-conf-bar-track {
+      width: 100px;
+      height: 6px;
+      background: #1e293b;
+      border-radius: 9999px;
+      overflow: hidden;
+    }
+    .advice-conf-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #3b82f6, #10b981);
+      border-radius: 9999px;
+      transition: width 0.3s ease;
+    }
+    .trade-levels-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+    @media (max-width: 640px) {
+      .trade-levels-grid { grid-template-columns: 1fr; }
+    }
+    .level-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .level-title {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      font-weight: 700;
+    }
+    .level-value-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .level-value {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: #fff;
+    }
+    .btn-copy-mini {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: var(--text-muted);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 0.7rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-copy-mini:hover {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .level-sub {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      line-height: 1.3;
+    }
+    .wait-box {
+      background: rgba(245, 158, 11, 0.08);
+      border: 1px dashed rgba(245, 158, 11, 0.3);
+      border-radius: 8px;
+      padding: 14px 16px;
+      color: #f59e0b;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .reasoning-box {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .reasoning-title {
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .reasoning-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .reasoning-item {
+      font-size: 0.82rem;
+      line-height: 1.4;
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+    }
+    .reasoning-item.warn {
+      color: #f59e0b;
+    }
+    .reasoning-item.ok {
+      color: #10b981;
+    }
+    .reasoning-item.info {
+      color: var(--text);
+    }
+    .advice-disclaimer {
+      font-size: 0.72rem;
+      color: #94a3b8;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      padding-top: 8px;
+      line-height: 1.4;
+    }
+    .copy-toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #10b981;
+      color: #fff;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      z-index: 999;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all 0.2s ease;
+      pointer-events: none;
+    }
+    .copy-toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
     /* Tables & Plain Language Badges */
     .table-responsive { width: 100%; overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
@@ -1344,43 +1934,123 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Composite Signal Gauge -->
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">
-            <span>🧭 Thước Đo Tâm Lý Thị Trường</span>
+      <!-- Right Column: Gauge & Trade Advice -->
+      <div style="display:flex; flex-direction:column; gap:18px;">
+        <!-- Composite Signal Gauge -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span>🧭 Thước Đo Tâm Lý Thị Trường</span>
+            </div>
+            <div class="has-tip">
+              <span class="tip-icon">ℹ</span>
+              <div class="tip-box">
+                Chỉ số tổng hợp từ 3 tín hiệu kỹ thuật (Xu hướng 40%, Sức mua 35%, Biên độ 25%). Điểm càng cao phe mua càng áp đảo, điểm càng thấp phe bán càng chiếm ưu thế.
+              </div>
+            </div>
           </div>
-          <div class="has-tip">
-            <span class="tip-icon">ℹ</span>
-            <div class="tip-box">
-              Chỉ số tổng hợp từ 3 tín hiệu kỹ thuật (Xu hướng 40%, Sức mua 35%, Biên độ 25%). Điểm càng cao phe mua càng áp đảo, điểm càng thấp phe bán càng chiếm ưu thế.
+          <div class="gauge-card-body">
+            <div class="gauge-score-display" id="gaugeScore">50</div>
+            <div class="gauge-badge" id="gaugeBadge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
+              ⚖️ TRUNG LẬP
+            </div>
+            <div class="gauge-bar-track">
+              <div class="gauge-bar-gradient"></div>
+              <div class="gauge-needle" id="gaugeNeedle" style="left:50%;"></div>
+            </div>
+            <div class="gauge-explanation" id="gaugeExplanation">
+              Thị trường đang ở trạng thái cân bằng. Lực mua và lực bán giằng co, chưa rõ xu hướng bứt phá.
+            </div>
+            <div class="gauge-components">
+              <div class="component-item">
+                <small>Xu Hướng (EMA)</small>
+                <span id="compEma">--</span>
+              </div>
+              <div class="component-item">
+                <small>Sức Mua (RSI)</small>
+                <span id="compRsi">--</span>
+              </div>
+              <div class="component-item">
+                <small>Vị Trí Dải (BB)</small>
+                <span id="compBb">--</span>
+              </div>
             </div>
           </div>
         </div>
-        <div class="gauge-card-body">
-          <div class="gauge-score-display" id="gaugeScore">50</div>
-          <div class="gauge-badge" id="gaugeBadge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
-            ⚖️ TRUNG LẬP
-          </div>
-          <div class="gauge-bar-track">
-            <div class="gauge-bar-gradient"></div>
-            <div class="gauge-needle" id="gaugeNeedle" style="left:50%;"></div>
-          </div>
-          <div class="gauge-explanation" id="gaugeExplanation">
-            Thị trường đang ở trạng thái cân bằng. Lực mua và lực bán giằng co, chưa rõ xu hướng bứt phá.
-          </div>
-          <div class="gauge-components">
-            <div class="component-item">
-              <small>Xu Hướng (EMA)</small>
-              <span id="compEma">--</span>
+
+        <!-- 🎯 Khuyến Nghị Giao Dịch (Card Mới) -->
+        <div class="card" id="cardTradeAdvice">
+          <div class="card-header">
+            <div class="card-title">
+              <span>🎯 Khuyến Nghị Giao Dịch</span>
+              <span id="adviceAssetBadge" style="color:var(--accent);font-size:0.8rem;">[BTC · 15m]</span>
             </div>
-            <div class="component-item">
-              <small>Sức Mua (RSI)</small>
-              <span id="compRsi">--</span>
+            <div class="has-tip">
+              <span class="tip-icon">ℹ</span>
+              <div class="tip-box">
+                Hệ thống tự động đối chiếu đa khung thời gian (Confluence Engine) giữa EMA Trend, RSI, Bollinger Bands và tín hiệu cảnh báo để gợi ý hành động cụ thể.
+              </div>
             </div>
-            <div class="component-item">
-              <small>Vị Trí Dải (BB)</small>
-              <span id="compBb">--</span>
+          </div>
+          <div class="advice-card-body">
+            <!-- Action & Confidence -->
+            <div class="advice-header-row">
+              <div id="adviceActionBadge" class="advice-action-badge action-wait">
+                <span id="adviceActionText">WAIT</span>
+              </div>
+              <div class="advice-conf-box">
+                <div class="advice-conf-label" id="adviceConfLabel">Độ tin cậy: Thấp (0/5)</div>
+                <div class="advice-conf-bar-track">
+                  <div class="advice-conf-bar-fill" id="adviceConfBar" style="width: 20%;"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Entry / Stop Loss / Take Profit (Ẩn nếu WAIT) -->
+            <div id="adviceLevelsGrid" class="trade-levels-grid" style="display:none;">
+              <div class="level-card">
+                <span class="level-title">📍 Điểm Vào (Entry)</span>
+                <div class="level-value-row">
+                  <span class="level-value" id="adviceEntryVal">--</span>
+                  <button class="btn-copy-mini" onclick="copyValue('adviceEntryVal')">📋 Copy</button>
+                </div>
+                <span class="level-sub" id="adviceEntrySub">Vào ngay</span>
+              </div>
+              <div class="level-card">
+                <span class="level-title" style="color:#f87171;">🛑 Cắt Lỗ (SL)</span>
+                <div class="level-value-row">
+                  <span class="level-value" id="adviceSlVal">--</span>
+                  <button class="btn-copy-mini" onclick="copyValue('adviceSlVal')">📋 Copy</button>
+                </div>
+                <span class="level-sub">R:R 1:1 bảo toàn vốn</span>
+              </div>
+              <div class="level-card">
+                <span class="level-title" style="color:#34d399;">🎯 Chốt Lời (TP)</span>
+                <div class="level-value-row">
+                  <span class="level-value" id="adviceTp1Val">--</span>
+                  <button class="btn-copy-mini" onclick="copyValue('adviceTp1Val')">📋 Copy</button>
+                </div>
+                <span class="level-sub" id="adviceTp2Sub">TP2: --</span>
+              </div>
+            </div>
+
+            <!-- Thông điệp khi WAIT -->
+            <div id="adviceWaitMessage" class="wait-box">
+              <span>⏸</span>
+              <span>Chưa có điểm vào lệnh phù hợp lúc này — hệ thống đang chờ tín hiệu rõ ràng hơn.</span>
+            </div>
+
+            <!-- Reasoning Checklist -->
+            <div class="reasoning-box">
+              <div class="reasoning-title">📋 Vì sao có khuyến nghị này?</div>
+              <ul class="reasoning-list" id="adviceReasoningList">
+                <li class="reasoning-item info"><span>ℹ️</span><span>Đang tải phân tích định lượng...</span></li>
+              </ul>
+            </div>
+
+            <!-- Disclaimer -->
+            <div class="advice-disclaimer">
+              ⚠️ Đây là khuyến nghị dựa trên thuật toán kỹ thuật, không phải lời khuyên đầu tư. Bạn tự chịu trách nhiệm với quyết định của mình.
             </div>
           </div>
         </div>
@@ -1850,6 +2520,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           updateCompositeGauge(activeAssetData);
         }
 
+        // Cập nhật Khuyến nghị Giao dịch (Trade Advice)
+        renderAdviceCard(data, currentAsset, currentTimeframe);
+
         // 3. Dịch Signals Feed sang câu chuyện có ngữ cảnh
         const signals = data.signals || [];
         document.getElementById('signalsCountBadge').textContent = `${signals.length} tín hiệu ghi nhận`;
@@ -1919,6 +2592,150 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
+    // --- COPY TO CLIPBOARD HELPER ---
+    function copyValue(elementId) {
+      const el = document.getElementById(elementId);
+      if (!el) return;
+      const raw = el.getAttribute('data-raw');
+      const val = raw || el.textContent.replace(/[^0-9.]/g, '');
+      if (!val) return;
+      copyToClipboard(val);
+    }
+
+    function copyToClipboard(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+      } else {
+        fallbackCopy(text);
+      }
+      showToast('📋 Đã copy: ' + text);
+    }
+
+    function fallbackCopy(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+
+    function showToast(msg) {
+      let toast = document.getElementById('copyToast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'copyToast';
+        toast.className = 'copy-toast';
+        document.body.appendChild(toast);
+      }
+      toast.textContent = msg;
+      toast.classList.add('show');
+      setTimeout(() => {
+        toast.classList.remove('show');
+      }, 1500);
+    }
+
+    // --- RENDER TRADE ADVICE CARD ---
+    function renderAdviceCard(snapshot, asset, tf) {
+      if (!snapshot || !snapshot.advice) return;
+      const targetTf = (asset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
+      const advice = snapshot.advice?.[asset]?.[targetTf];
+
+      const badgeAsset = document.getElementById('adviceAssetBadge');
+      if (badgeAsset) badgeAsset.textContent = `[${asset} · ${tf}]`;
+
+      if (!advice) {
+        const waitBox = document.getElementById('adviceWaitMessage');
+        if (waitBox) {
+          waitBox.style.display = 'flex';
+          waitBox.innerHTML = '<span>⏳</span><span>Đang thu thập dữ liệu nến cho tài sản này...</span>';
+        }
+        const levelsGrid = document.getElementById('adviceLevelsGrid');
+        if (levelsGrid) levelsGrid.style.display = 'none';
+        return;
+      }
+
+      // Action Badge
+      const actionBadge = document.getElementById('adviceActionBadge');
+      const actionText = document.getElementById('adviceActionText');
+      if (actionBadge && actionText) {
+        actionText.textContent = advice.action;
+        actionBadge.className = 'advice-action-badge ' + (
+          advice.action === 'BUY' ? 'action-buy' :
+          advice.action === 'SELL' ? 'action-sell' : 'action-wait'
+        );
+      }
+
+      // Confidence
+      const confLabel = document.getElementById('adviceConfLabel');
+      const confBar = document.getElementById('adviceConfBar');
+      if (confLabel) {
+        confLabel.textContent = `Độ tin cậy: ${advice.confidence} (${advice.confidence_score}/5)`;
+      }
+      if (confBar) {
+        const pct = Math.min(Math.max((advice.confidence_score / 5) * 100, 15), 100);
+        confBar.style.width = pct + '%';
+        confBar.style.background = advice.confidence === 'Cao'
+          ? '#10b981'
+          : (advice.confidence === 'Trung bình' ? '#3b82f6' : '#f59e0b');
+      }
+
+      // Entry / SL / TP
+      const levelsGrid = document.getElementById('adviceLevelsGrid');
+      const waitMessage = document.getElementById('adviceWaitMessage');
+      if (advice.action === 'WAIT') {
+        if (levelsGrid) levelsGrid.style.display = 'none';
+        if (waitMessage) {
+          waitMessage.style.display = 'flex';
+          waitMessage.innerHTML = '<span>⏸</span><span>Chưa có điểm vào lệnh phù hợp lúc này — hệ thống đang chờ tín hiệu rõ ràng hơn.</span>';
+        }
+      } else {
+        if (levelsGrid) levelsGrid.style.display = 'grid';
+        if (waitMessage) waitMessage.style.display = 'none';
+
+        const entryValEl = document.getElementById('adviceEntryVal');
+        const entrySubEl = document.getElementById('adviceEntrySub');
+        if (advice.entry_type === 'now') {
+          entryValEl.textContent = '$' + Number(advice.entry_price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+          entryValEl.setAttribute('data-raw', advice.entry_price);
+          entrySubEl.textContent = '⚡ Khớp lệnh ngay giá hiện tại';
+        } else {
+          entryValEl.textContent = '$' + Number(advice.entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+          entryValEl.setAttribute('data-raw', advice.entry_zone);
+          entrySubEl.textContent = '⏳ Chờ giá hồi về vùng EMA20';
+        }
+
+        const slValEl = document.getElementById('adviceSlVal');
+        if (slValEl) {
+          slValEl.textContent = '$' + Number(advice.stop_loss).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+          slValEl.setAttribute('data-raw', advice.stop_loss);
+        }
+
+        const tp1ValEl = document.getElementById('adviceTp1Val');
+        const tp2SubEl = document.getElementById('adviceTp2Sub');
+        if (tp1ValEl) {
+          tp1ValEl.textContent = '$' + Number(advice.take_profit_1).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+          tp1ValEl.setAttribute('data-raw', advice.take_profit_1);
+        }
+        if (tp2SubEl) {
+          tp2SubEl.textContent = `TP2: $${Number(advice.take_profit_2).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})} (${advice.tp2_rule || 'Trailing EMA'})`;
+        }
+      }
+
+      // Reasoning Checklist
+      const reasoningList = document.getElementById('adviceReasoningList');
+      if (reasoningList && Array.isArray(advice.reasoning)) {
+        reasoningList.innerHTML = advice.reasoning.map(r => {
+          const isWarn = r.includes('⚠️');
+          const isOk = r.includes('ủng hộ') || r.includes('ĐỒNG THUẬN') || r.includes('dư địa') || r.includes('Không có');
+          const itemClass = isWarn ? 'warn' : (isOk ? 'ok' : 'info');
+          const icon = isWarn ? '⚠️' : (isOk ? '✅' : 'ℹ️');
+          const cleanText = r.replace(/^[⚠️✅ℹ️\s]+/, '');
+          return `<li class="reasoning-item ${itemClass}"><span>${icon}</span><span>${cleanText}</span></li>`;
+        }).join('');
+      }
+    }
+
     // --- CHUYỂN ĐỔI TÀI SẢN & KHUNG GIỜ ---
     function selectAsset(asset) {
       currentAsset = asset;
@@ -1928,9 +2745,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       });
       document.getElementById('activeChartTitle').textContent = `[${asset} · ${currentTimeframe}]`;
       fetchCandleData();
-      if (cachedSnapshot && cachedSnapshot.indicators) {
+      if (cachedSnapshot) {
         const tf = (asset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
-        updateCompositeGauge(cachedSnapshot.indicators[asset]?.[tf]);
+        if (cachedSnapshot.indicators) {
+          updateCompositeGauge(cachedSnapshot.indicators[asset]?.[tf]);
+        }
+        renderAdviceCard(cachedSnapshot, asset, currentTimeframe);
       }
     }
 
@@ -1940,9 +2760,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.getElementById('btnTf1h').classList.toggle('active', tf === '1h');
       document.getElementById('activeChartTitle').textContent = `[${currentAsset} · ${tf}]`;
       fetchCandleData();
-      if (cachedSnapshot && cachedSnapshot.indicators) {
+      if (cachedSnapshot) {
         const targetTf = (currentAsset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
-        updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[targetTf]);
+        if (cachedSnapshot.indicators) {
+          updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[targetTf]);
+        }
+        renderAdviceCard(cachedSnapshot, currentAsset, tf);
       }
     }
 
@@ -2071,6 +2894,13 @@ class DashboardServer:
     async def handle_snapshot(self, request: web.Request) -> web.Response:
         now = time.time()
         uptime_sec = int(now - self._orchestrator._start_time)
+
+        advice_payload: dict = {}
+        for a, tfs in self._orchestrator._latest_advice.items():
+            advice_payload[a] = {}
+            for tf, adv in tfs.items():
+                advice_payload[a][tf] = adv.to_dict() if hasattr(adv, "to_dict") else adv
+
         data = {
             "status": "online",
             "uptime_seconds": uptime_sec,
@@ -2080,6 +2910,7 @@ class DashboardServer:
             "twelvedata_configured": bool(self._orchestrator._twelve and self._orchestrator._twelve.is_configured),
             "indicators": self._orchestrator._latest_indicators,
             "signals": list(self._orchestrator._recent_signals),
+            "advice": advice_payload,
         }
         return web.json_response(data)
 
@@ -2164,6 +2995,7 @@ class IndicatorOrchestrator:
     def __init__(self) -> None:
         self._bufs:              dict[str, dict[str, CircularBuffer]] = {}
         self._rules              = RuleEngine()
+        self._confluence_engine  = ConfluenceDecisionEngine(CONFIG)
         self._persist:           Optional[StatePersistence]   = None
         self._tg:                Optional[TelegramDispatcher] = None
         self._session:           Optional[aiohttp.ClientSession] = None
@@ -2173,6 +3005,23 @@ class IndicatorOrchestrator:
         self._start_time:        float                        = time.time()
         self._latest_indicators: dict[str, dict[str, dict]]   = {}
         self._recent_signals:    deque[dict]                  = deque(maxlen=50)
+        self._latest_advice:     dict[str, dict[str, TradeAdvice]] = {}
+
+    def _compute_advice_for_asset(self, asset: str, tf: str, ind: dict) -> None:
+        """Compute trade advice using multi-timeframe indicators without triggering notifications."""
+        cfg = CONFIG["assets"].get(asset, {})
+        cfg_tfs = cfg.get("timeframes", [])
+        other_tf = next((t for t in cfg_tfs if t != tf), None)
+        other_tf_snapshot = self._latest_indicators.get(asset, {}).get(other_tf) if other_tf else None
+
+        advice = self._confluence_engine.decide(
+            asset=asset,
+            timeframe=tf,
+            snapshot=ind,
+            recent_signals=list(self._recent_signals),
+            other_tf_snapshot=other_tf_snapshot,
+        )
+        self._latest_advice.setdefault(asset, {})[tf] = advice
 
     # ------------------------------------------------------------------ setup
     async def _init_session(self) -> None:
@@ -2200,6 +3049,13 @@ class IndicatorOrchestrator:
                     self._latest_indicators.setdefault(asset, {})[tf] = ind
                 await asyncio.sleep(1)   # respect rate limits during init
 
+        # Compute initial advice for all buffers
+        for a, cfg_a in CONFIG["assets"].items():
+            for t in cfg_a.get("timeframes", []):
+                ind_snap = self._latest_indicators.get(a, {}).get(t)
+                if ind_snap:
+                    self._compute_advice_for_asset(a, t, ind_snap)
+
     async def reload_asset_buffers(self, asset_names: list[str]) -> None:
         """Fetch historical candles and compute indicators for specific assets in background."""
         logger.info(f"Reloading historical buffers for assets: {asset_names}...")
@@ -2220,6 +3076,12 @@ class IndicatorOrchestrator:
                     ind = IndicatorEngine.compute_all(buf)
                     self._latest_indicators.setdefault(asset, {})[tf] = ind
                 await asyncio.sleep(1)
+
+            # Recompute advice for reloaded assets
+            for tf in cfg["timeframes"]:
+                ind_snap = self._latest_indicators.get(asset, {}).get(tf)
+                if ind_snap:
+                    self._compute_advice_for_asset(asset, tf, ind_snap)
 
     # --------------------------------------------------------------- fetching
     async def _fetch(
@@ -2261,6 +3123,9 @@ class IndicatorOrchestrator:
             logger.info(f"  >> {sig.signal_type}")
             self._recent_signals.appendleft(sig.to_dict())
             asyncio.create_task(self._tg.dispatch_signal(sig))
+
+        # Compute trade advice (Web UI only -- NO Telegram dispatch)
+        self._compute_advice_for_asset(asset, tf, ind)
 
     # ------------------------------------------------------------------ loops
     async def _asset_loop(self, asset: str, tf: str) -> None:

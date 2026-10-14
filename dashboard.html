@@ -260,6 +260,200 @@
     .component-item small { font-size: 0.7rem; color: var(--text-muted); display: block; }
     .component-item span { font-size: 0.82rem; font-weight: 700; }
 
+    /* Trade Advice Card Styles */
+    .advice-card-body {
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .advice-header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .advice-action-badge {
+      font-size: 1.35rem;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      padding: 6px 20px;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .action-buy {
+      background: #10b981;
+      color: #ffffff;
+      box-shadow: 0 0 16px rgba(16, 185, 129, 0.4);
+    }
+    .action-sell {
+      background: #ef4444;
+      color: #ffffff;
+      box-shadow: 0 0 16px rgba(239, 68, 68, 0.4);
+    }
+    .action-wait {
+      background: #f59e0b;
+      color: #0f172a;
+      box-shadow: 0 0 16px rgba(245, 158, 11, 0.4);
+    }
+    .advice-conf-box {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
+    }
+    .advice-conf-label {
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--text-muted);
+    }
+    .advice-conf-bar-track {
+      width: 100px;
+      height: 6px;
+      background: #1e293b;
+      border-radius: 9999px;
+      overflow: hidden;
+    }
+    .advice-conf-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #3b82f6, #10b981);
+      border-radius: 9999px;
+      transition: width 0.3s ease;
+    }
+    .trade-levels-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+    @media (max-width: 640px) {
+      .trade-levels-grid { grid-template-columns: 1fr; }
+    }
+    .level-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .level-title {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      font-weight: 700;
+    }
+    .level-value-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .level-value {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: #fff;
+    }
+    .btn-copy-mini {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: var(--text-muted);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 0.7rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-copy-mini:hover {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .level-sub {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      line-height: 1.3;
+    }
+    .wait-box {
+      background: rgba(245, 158, 11, 0.08);
+      border: 1px dashed rgba(245, 158, 11, 0.3);
+      border-radius: 8px;
+      padding: 14px 16px;
+      color: #f59e0b;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .reasoning-box {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .reasoning-title {
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .reasoning-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .reasoning-item {
+      font-size: 0.82rem;
+      line-height: 1.4;
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+    }
+    .reasoning-item.warn {
+      color: #f59e0b;
+    }
+    .reasoning-item.ok {
+      color: #10b981;
+    }
+    .reasoning-item.info {
+      color: var(--text);
+    }
+    .advice-disclaimer {
+      font-size: 0.72rem;
+      color: #94a3b8;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      padding-top: 8px;
+      line-height: 1.4;
+    }
+    .copy-toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #10b981;
+      color: #fff;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      z-index: 999;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all 0.2s ease;
+      pointer-events: none;
+    }
+    .copy-toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
     /* Tables & Plain Language Badges */
     .table-responsive { width: 100%; overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
@@ -464,43 +658,123 @@
         </div>
       </div>
 
-      <!-- Composite Signal Gauge -->
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">
-            <span>🧭 Thước Đo Tâm Lý Thị Trường</span>
+      <!-- Right Column: Gauge & Trade Advice -->
+      <div style="display:flex; flex-direction:column; gap:18px;">
+        <!-- Composite Signal Gauge -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span>🧭 Thước Đo Tâm Lý Thị Trường</span>
+            </div>
+            <div class="has-tip">
+              <span class="tip-icon">ℹ</span>
+              <div class="tip-box">
+                Chỉ số tổng hợp từ 3 tín hiệu kỹ thuật (Xu hướng 40%, Sức mua 35%, Biên độ 25%). Điểm càng cao phe mua càng áp đảo, điểm càng thấp phe bán càng chiếm ưu thế.
+              </div>
+            </div>
           </div>
-          <div class="has-tip">
-            <span class="tip-icon">ℹ</span>
-            <div class="tip-box">
-              Chỉ số tổng hợp từ 3 tín hiệu kỹ thuật (Xu hướng 40%, Sức mua 35%, Biên độ 25%). Điểm càng cao phe mua càng áp đảo, điểm càng thấp phe bán càng chiếm ưu thế.
+          <div class="gauge-card-body">
+            <div class="gauge-score-display" id="gaugeScore">50</div>
+            <div class="gauge-badge" id="gaugeBadge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
+              ⚖️ TRUNG LẬP
+            </div>
+            <div class="gauge-bar-track">
+              <div class="gauge-bar-gradient"></div>
+              <div class="gauge-needle" id="gaugeNeedle" style="left:50%;"></div>
+            </div>
+            <div class="gauge-explanation" id="gaugeExplanation">
+              Thị trường đang ở trạng thái cân bằng. Lực mua và lực bán giằng co, chưa rõ xu hướng bứt phá.
+            </div>
+            <div class="gauge-components">
+              <div class="component-item">
+                <small>Xu Hướng (EMA)</small>
+                <span id="compEma">--</span>
+              </div>
+              <div class="component-item">
+                <small>Sức Mua (RSI)</small>
+                <span id="compRsi">--</span>
+              </div>
+              <div class="component-item">
+                <small>Vị Trí Dải (BB)</small>
+                <span id="compBb">--</span>
+              </div>
             </div>
           </div>
         </div>
-        <div class="gauge-card-body">
-          <div class="gauge-score-display" id="gaugeScore">50</div>
-          <div class="gauge-badge" id="gaugeBadge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);">
-            ⚖️ TRUNG LẬP
-          </div>
-          <div class="gauge-bar-track">
-            <div class="gauge-bar-gradient"></div>
-            <div class="gauge-needle" id="gaugeNeedle" style="left:50%;"></div>
-          </div>
-          <div class="gauge-explanation" id="gaugeExplanation">
-            Thị trường đang ở trạng thái cân bằng. Lực mua và lực bán giằng co, chưa rõ xu hướng bứt phá.
-          </div>
-          <div class="gauge-components">
-            <div class="component-item">
-              <small>Xu Hướng (EMA)</small>
-              <span id="compEma">--</span>
+
+        <!-- 🎯 Khuyến Nghị Giao Dịch (Card Mới) -->
+        <div class="card" id="cardTradeAdvice">
+          <div class="card-header">
+            <div class="card-title">
+              <span>🎯 Khuyến Nghị Giao Dịch</span>
+              <span id="adviceAssetBadge" style="color:var(--accent);font-size:0.8rem;">[BTC · 15m]</span>
             </div>
-            <div class="component-item">
-              <small>Sức Mua (RSI)</small>
-              <span id="compRsi">--</span>
+            <div class="has-tip">
+              <span class="tip-icon">ℹ</span>
+              <div class="tip-box">
+                Hệ thống tự động đối chiếu đa khung thời gian (Confluence Engine) giữa EMA Trend, RSI, Bollinger Bands và tín hiệu cảnh báo để gợi ý hành động cụ thể.
+              </div>
             </div>
-            <div class="component-item">
-              <small>Vị Trí Dải (BB)</small>
-              <span id="compBb">--</span>
+          </div>
+          <div class="advice-card-body">
+            <!-- Action & Confidence -->
+            <div class="advice-header-row">
+              <div id="adviceActionBadge" class="advice-action-badge action-wait">
+                <span id="adviceActionText">WAIT</span>
+              </div>
+              <div class="advice-conf-box">
+                <div class="advice-conf-label" id="adviceConfLabel">Độ tin cậy: Thấp (0/5)</div>
+                <div class="advice-conf-bar-track">
+                  <div class="advice-conf-bar-fill" id="adviceConfBar" style="width: 20%;"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Entry / Stop Loss / Take Profit (Ẩn nếu WAIT) -->
+            <div id="adviceLevelsGrid" class="trade-levels-grid" style="display:none;">
+              <div class="level-card">
+                <span class="level-title">📍 Điểm Vào (Entry)</span>
+                <div class="level-value-row">
+                  <span class="level-value" id="adviceEntryVal">--</span>
+                  <button class="btn-copy-mini" onclick="copyValue('adviceEntryVal')">📋 Copy</button>
+                </div>
+                <span class="level-sub" id="adviceEntrySub">Vào ngay</span>
+              </div>
+              <div class="level-card">
+                <span class="level-title" style="color:#f87171;">🛑 Cắt Lỗ (SL)</span>
+                <div class="level-value-row">
+                  <span class="level-value" id="adviceSlVal">--</span>
+                  <button class="btn-copy-mini" onclick="copyValue('adviceSlVal')">📋 Copy</button>
+                </div>
+                <span class="level-sub">R:R 1:1 bảo toàn vốn</span>
+              </div>
+              <div class="level-card">
+                <span class="level-title" style="color:#34d399;">🎯 Chốt Lời (TP)</span>
+                <div class="level-value-row">
+                  <span class="level-value" id="adviceTp1Val">--</span>
+                  <button class="btn-copy-mini" onclick="copyValue('adviceTp1Val')">📋 Copy</button>
+                </div>
+                <span class="level-sub" id="adviceTp2Sub">TP2: --</span>
+              </div>
+            </div>
+
+            <!-- Thông điệp khi WAIT -->
+            <div id="adviceWaitMessage" class="wait-box">
+              <span>⏸</span>
+              <span>Chưa có điểm vào lệnh phù hợp lúc này — hệ thống đang chờ tín hiệu rõ ràng hơn.</span>
+            </div>
+
+            <!-- Reasoning Checklist -->
+            <div class="reasoning-box">
+              <div class="reasoning-title">📋 Vì sao có khuyến nghị này?</div>
+              <ul class="reasoning-list" id="adviceReasoningList">
+                <li class="reasoning-item info"><span>ℹ️</span><span>Đang tải phân tích định lượng...</span></li>
+              </ul>
+            </div>
+
+            <!-- Disclaimer -->
+            <div class="advice-disclaimer">
+              ⚠️ Đây là khuyến nghị dựa trên thuật toán kỹ thuật, không phải lời khuyên đầu tư. Bạn tự chịu trách nhiệm với quyết định của mình.
             </div>
           </div>
         </div>
@@ -970,6 +1244,9 @@
           updateCompositeGauge(activeAssetData);
         }
 
+        // Cập nhật Khuyến nghị Giao dịch (Trade Advice)
+        renderAdviceCard(data, currentAsset, currentTimeframe);
+
         // 3. Dịch Signals Feed sang câu chuyện có ngữ cảnh
         const signals = data.signals || [];
         document.getElementById('signalsCountBadge').textContent = `${signals.length} tín hiệu ghi nhận`;
@@ -1039,6 +1316,150 @@
       }
     }
 
+    // --- COPY TO CLIPBOARD HELPER ---
+    function copyValue(elementId) {
+      const el = document.getElementById(elementId);
+      if (!el) return;
+      const raw = el.getAttribute('data-raw');
+      const val = raw || el.textContent.replace(/[^0-9.]/g, '');
+      if (!val) return;
+      copyToClipboard(val);
+    }
+
+    function copyToClipboard(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+      } else {
+        fallbackCopy(text);
+      }
+      showToast('📋 Đã copy: ' + text);
+    }
+
+    function fallbackCopy(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+
+    function showToast(msg) {
+      let toast = document.getElementById('copyToast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'copyToast';
+        toast.className = 'copy-toast';
+        document.body.appendChild(toast);
+      }
+      toast.textContent = msg;
+      toast.classList.add('show');
+      setTimeout(() => {
+        toast.classList.remove('show');
+      }, 1500);
+    }
+
+    // --- RENDER TRADE ADVICE CARD ---
+    function renderAdviceCard(snapshot, asset, tf) {
+      if (!snapshot || !snapshot.advice) return;
+      const targetTf = (asset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
+      const advice = snapshot.advice?.[asset]?.[targetTf];
+
+      const badgeAsset = document.getElementById('adviceAssetBadge');
+      if (badgeAsset) badgeAsset.textContent = `[${asset} · ${tf}]`;
+
+      if (!advice) {
+        const waitBox = document.getElementById('adviceWaitMessage');
+        if (waitBox) {
+          waitBox.style.display = 'flex';
+          waitBox.innerHTML = '<span>⏳</span><span>Đang thu thập dữ liệu nến cho tài sản này...</span>';
+        }
+        const levelsGrid = document.getElementById('adviceLevelsGrid');
+        if (levelsGrid) levelsGrid.style.display = 'none';
+        return;
+      }
+
+      // Action Badge
+      const actionBadge = document.getElementById('adviceActionBadge');
+      const actionText = document.getElementById('adviceActionText');
+      if (actionBadge && actionText) {
+        actionText.textContent = advice.action;
+        actionBadge.className = 'advice-action-badge ' + (
+          advice.action === 'BUY' ? 'action-buy' :
+          advice.action === 'SELL' ? 'action-sell' : 'action-wait'
+        );
+      }
+
+      // Confidence
+      const confLabel = document.getElementById('adviceConfLabel');
+      const confBar = document.getElementById('adviceConfBar');
+      if (confLabel) {
+        confLabel.textContent = `Độ tin cậy: ${advice.confidence} (${advice.confidence_score}/5)`;
+      }
+      if (confBar) {
+        const pct = Math.min(Math.max((advice.confidence_score / 5) * 100, 15), 100);
+        confBar.style.width = pct + '%';
+        confBar.style.background = advice.confidence === 'Cao'
+          ? '#10b981'
+          : (advice.confidence === 'Trung bình' ? '#3b82f6' : '#f59e0b');
+      }
+
+      // Entry / SL / TP
+      const levelsGrid = document.getElementById('adviceLevelsGrid');
+      const waitMessage = document.getElementById('adviceWaitMessage');
+      if (advice.action === 'WAIT') {
+        if (levelsGrid) levelsGrid.style.display = 'none';
+        if (waitMessage) {
+          waitMessage.style.display = 'flex';
+          waitMessage.innerHTML = '<span>⏸</span><span>Chưa có điểm vào lệnh phù hợp lúc này — hệ thống đang chờ tín hiệu rõ ràng hơn.</span>';
+        }
+      } else {
+        if (levelsGrid) levelsGrid.style.display = 'grid';
+        if (waitMessage) waitMessage.style.display = 'none';
+
+        const entryValEl = document.getElementById('adviceEntryVal');
+        const entrySubEl = document.getElementById('adviceEntrySub');
+        if (advice.entry_type === 'now') {
+          entryValEl.textContent = '$' + Number(advice.entry_price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+          entryValEl.setAttribute('data-raw', advice.entry_price);
+          entrySubEl.textContent = '⚡ Khớp lệnh ngay giá hiện tại';
+        } else {
+          entryValEl.textContent = '$' + Number(advice.entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+          entryValEl.setAttribute('data-raw', advice.entry_zone);
+          entrySubEl.textContent = '⏳ Chờ giá hồi về vùng EMA20';
+        }
+
+        const slValEl = document.getElementById('adviceSlVal');
+        if (slValEl) {
+          slValEl.textContent = '$' + Number(advice.stop_loss).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+          slValEl.setAttribute('data-raw', advice.stop_loss);
+        }
+
+        const tp1ValEl = document.getElementById('adviceTp1Val');
+        const tp2SubEl = document.getElementById('adviceTp2Sub');
+        if (tp1ValEl) {
+          tp1ValEl.textContent = '$' + Number(advice.take_profit_1).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+          tp1ValEl.setAttribute('data-raw', advice.take_profit_1);
+        }
+        if (tp2SubEl) {
+          tp2SubEl.textContent = `TP2: $${Number(advice.take_profit_2).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})} (${advice.tp2_rule || 'Trailing EMA'})`;
+        }
+      }
+
+      // Reasoning Checklist
+      const reasoningList = document.getElementById('adviceReasoningList');
+      if (reasoningList && Array.isArray(advice.reasoning)) {
+        reasoningList.innerHTML = advice.reasoning.map(r => {
+          const isWarn = r.includes('⚠️');
+          const isOk = r.includes('ủng hộ') || r.includes('ĐỒNG THUẬN') || r.includes('dư địa') || r.includes('Không có');
+          const itemClass = isWarn ? 'warn' : (isOk ? 'ok' : 'info');
+          const icon = isWarn ? '⚠️' : (isOk ? '✅' : 'ℹ️');
+          const cleanText = r.replace(/^[⚠️✅ℹ️\s]+/, '');
+          return `<li class="reasoning-item ${itemClass}"><span>${icon}</span><span>${cleanText}</span></li>`;
+        }).join('');
+      }
+    }
+
     // --- CHUYỂN ĐỔI TÀI SẢN & KHUNG GIỜ ---
     function selectAsset(asset) {
       currentAsset = asset;
@@ -1048,9 +1469,12 @@
       });
       document.getElementById('activeChartTitle').textContent = `[${asset} · ${currentTimeframe}]`;
       fetchCandleData();
-      if (cachedSnapshot && cachedSnapshot.indicators) {
+      if (cachedSnapshot) {
         const tf = (asset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
-        updateCompositeGauge(cachedSnapshot.indicators[asset]?.[tf]);
+        if (cachedSnapshot.indicators) {
+          updateCompositeGauge(cachedSnapshot.indicators[asset]?.[tf]);
+        }
+        renderAdviceCard(cachedSnapshot, asset, currentTimeframe);
       }
     }
 
@@ -1060,9 +1484,12 @@
       document.getElementById('btnTf1h').classList.toggle('active', tf === '1h');
       document.getElementById('activeChartTitle').textContent = `[${currentAsset} · ${tf}]`;
       fetchCandleData();
-      if (cachedSnapshot && cachedSnapshot.indicators) {
+      if (cachedSnapshot) {
         const targetTf = (currentAsset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
-        updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[targetTf]);
+        if (cachedSnapshot.indicators) {
+          updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[targetTf]);
+        }
+        renderAdviceCard(cachedSnapshot, currentAsset, tf);
       }
     }
 

@@ -5,7 +5,8 @@ import unittest
 from engine import (
     Candle, CircularBuffer, IndicatorEngine, RuleEngine,
     Signal, TelegramDispatcher, DashboardServer, IndicatorOrchestrator,
-    TwelveDataFetcher, CONFIG, _parse_port, _load_dotenv, _update_dotenv
+    TwelveDataFetcher, CONFIG, _parse_port, _load_dotenv, _update_dotenv,
+    ConfluenceDecisionEngine, TradeAdvice, TrendState, RsiZone, BbPosition, Action, Confidence
 )
 
 class TestEngine(unittest.TestCase):
@@ -127,6 +128,131 @@ class TestEngine(unittest.TestCase):
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+
+    def test_confluence_decision_matrix_table_driven(self):
+        engine = ConfluenceDecisionEngine(CONFIG)
+
+        # 1. Trend mạnh xuống + RSI cân bằng + BB giữa/chạm biên dưới -> SELL
+        snap_sell = {
+            "close": 59800.0,
+            "ema_fast": 60000.0,
+            "ema_slow": 60500.0,  # diff = -500, with ATR=500 -> diff_in_atr = -1.0 (< -0.5) => STRONG_DOWN
+            "rsi": 50.0,          # NEUTRAL
+            "bb_upper": 61000.0,
+            "bb_mid": 60250.0,
+            "bb_lower": 59500.0,  # width=1500, edge=225, lower+edge=59725 => 59800 is MIDDLE
+            "atr": 500.0,
+        }
+        adv1 = engine.decide("BTC", "15m", snap_sell, [])
+        self.assertEqual(adv1.action, "SELL")
+        self.assertIsNotNone(adv1.stop_loss)
+        self.assertIsNotNone(adv1.take_profit_1)
+        self.assertIsNotNone(adv1.take_profit_2)
+
+        # 2. Trend mạnh xuống + BB vừa thủng đáy + RSI chưa quá bán sâu -> WAIT (quá đà)
+        snap_break_lower = {
+            "close": 59400.0,     # < bb_lower 59500 => BREAK_LOWER
+            "ema_fast": 60000.0,
+            "ema_slow": 60500.0,  # STRONG_DOWN
+            "rsi": 35.0,          # LEAN_OVERSOLD (not EXTREME_OVERSOLD < 25)
+            "bb_upper": 61000.0,
+            "bb_mid": 60250.0,
+            "bb_lower": 59500.0,
+            "atr": 500.0,
+        }
+        adv2 = engine.decide("BTC", "15m", snap_break_lower, [])
+        self.assertEqual(adv2.action, "WAIT")
+
+        # 3. Sideway (trend neutral + BB giữa dải) -> WAIT
+        snap_sideway = {
+            "close": 60000.0,
+            "ema_fast": 60010.0,
+            "ema_slow": 60000.0,  # diff = +10, ATR=500 -> diff_in_atr = 0.02 => NEUTRAL
+            "rsi": 50.0,          # NEUTRAL
+            "bb_upper": 61000.0,
+            "bb_mid": 60000.0,
+            "bb_lower": 59000.0,  # width=2000 => MIDDLE
+            "atr": 500.0,
+        }
+        adv3 = engine.decide("BTC", "15m", snap_sideway, [])
+        self.assertEqual(adv3.action, "WAIT")
+
+        # 4. Trend mạnh lên + RSI vừa phải + BB giữa/cận biên trên -> BUY
+        snap_buy = {
+            "close": 60600.0,
+            "ema_fast": 60500.0,
+            "ema_slow": 60000.0,  # diff = +500, ATR=500 -> diff_in_atr = +1.0 (> 0.5) => STRONG_UP
+            "rsi": 55.0,          # NEUTRAL
+            "bb_upper": 61000.0,
+            "bb_mid": 60250.0,
+            "bb_lower": 59500.0,  # width=1500, edge=225, upper-edge=60775 => MIDDLE
+            "atr": 500.0,
+        }
+        adv4 = engine.decide("BTC", "15m", snap_buy, [])
+        self.assertEqual(adv4.action, "BUY")
+        self.assertIsNotNone(adv4.stop_loss)
+        self.assertIsNotNone(adv4.take_profit_1)
+        self.assertIsNotNone(adv4.take_profit_2)
+
+        # 5. Có tín hiệu mâu thuẫn trong recent_signals -> luôn WAIT bất kể score
+        conflicting_signals = [
+            {"asset": "BTC", "timeframe": "15m", "signal_type": "EMA_CROSS_DOWN", "ts": 1700000000}
+        ]
+        adv5 = engine.decide("BTC", "15m", snap_buy, conflicting_signals)
+        self.assertEqual(adv5.action, "WAIT")
+        self.assertTrue(adv5.conflict_detected)
+
+        # 6. MTF không đồng thuận -> giữ action nhưng hạ confidence
+        other_tf_bearish = {
+            "ema_fast": 59000.0,
+            "ema_slow": 60000.0,
+            "atr": 500.0,
+        }
+        adv6 = engine.decide("BTC", "15m", snap_buy, [], other_tf_snapshot=other_tf_bearish)
+        self.assertEqual(adv6.action, "BUY")
+        self.assertFalse(adv6.mtf_agreement)
+        self.assertIn(adv6.confidence, ("Thấp", "Trung bình"))
+
+    def test_confluence_no_telegram_reference_or_side_effects(self):
+        engine = ConfluenceDecisionEngine(CONFIG)
+        # Verify decide() is a pure synchronous function without network or dispatcher call
+        snap = {
+            "close": 60000.0, "ema_fast": 60500.0, "ema_slow": 60000.0,
+            "rsi": 50.0, "bb_upper": 61000.0, "bb_mid": 60250.0, "bb_lower": 59500.0, "atr": 500.0
+        }
+        # Run decide() and verify it returns a TradeAdvice instance without throwing
+        advice = engine.decide("BTC", "15m", snap, [])
+        self.assertIsInstance(advice, TradeAdvice)
+        self.assertFalse(hasattr(engine, "_tg"))
+        self.assertFalse(hasattr(engine, "telegram"))
+
+    def test_snapshot_api_returns_advice(self):
+        orch = IndicatorOrchestrator()
+        # Mock buffer and indicators for BTC 15m
+        snap = {
+            "close": 60000.0, "ema_fast": 60500.0, "ema_slow": 60000.0,
+            "rsi": 50.0, "bb_upper": 61000.0, "bb_mid": 60250.0, "bb_lower": 59500.0, "atr": 500.0
+        }
+        orch._latest_indicators["BTC"] = {"15m": snap}
+        orch._compute_advice_for_asset("BTC", "15m", snap)
+
+        server = DashboardServer(orch, "127.0.0.1", 8080)
+        
+        class MockRequest:
+            pass
+
+        resp = asyncio.run(server.handle_snapshot(MockRequest()))
+        self.assertEqual(resp.status, 200)
+        import json
+        payload = json.loads(resp.text)
+        self.assertIn("advice", payload)
+        self.assertIn("BTC", payload["advice"])
+        self.assertIn("15m", payload["advice"]["BTC"])
+        btc_advice = payload["advice"]["BTC"]["15m"]
+        self.assertIn("action", btc_advice)
+        self.assertIn("confidence", btc_advice)
+        self.assertIn("disclaimer", btc_advice)
+
 
 if __name__ == "__main__":
     unittest.main()
