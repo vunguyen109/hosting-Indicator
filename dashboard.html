@@ -708,6 +708,7 @@
         <span class="group-label">Khung giờ:</span>
         <button class="tab-btn active" id="btnTf15m" onclick="selectTimeframe('15m')">15 Phút (Ngắn hạn)</button>
         <button class="tab-btn" id="btnTf1h" onclick="selectTimeframe('1h')">1 Giờ (Trung hạn)</button>
+        <button class="tab-btn" id="btnTf4h" onclick="selectTimeframe('4h')">4 Giờ (Swing)</button>
       </div>
     </div>
 
@@ -1128,7 +1129,7 @@
     // --- TẢI DỮ LIỆU NẾN CHO CHART ---
     async function fetchCandleData() {
       try {
-        const tfParam = (currentAsset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        const tfParam = (currentAsset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
         const res = await fetch(`/api/candles?asset=${currentAsset}&tf=${tfParam}&limit=100`);
         if (!res.ok) return;
         const candles = await res.json();
@@ -1325,7 +1326,7 @@
             if (asset === 'XAU') assetName = '🟡 Vàng (XAU)';
             if (asset === 'OIL') assetName = '🛢️ Dầu thô (USO)';
 
-            let tfName = tf.includes('15') ? '15 Phút' : '1 Giờ';
+            let tfName = tf.includes('15') ? '15 Phút' : (tf.includes('4') ? '4 Giờ' : '1 Giờ');
 
             rowsHtml += `
               <tr>
@@ -1344,7 +1345,7 @@
         if (rowsHtml) tbody.innerHTML = rowsHtml;
 
         // 2. Cập nhật Gauge cho tài sản đang được chọn
-        const targetTf = (currentAsset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        const targetTf = (currentAsset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
         const activeAssetData = indMap[currentAsset]?.[targetTf];
         if (activeAssetData) {
           updateCompositeGauge(activeAssetData);
@@ -1367,7 +1368,7 @@
             let confHtml = '<span class="conf-tag conf-mid">🟡 ĐỘ TIN CẬY: VỪA</span>';
 
             const assetLabel = s.asset === 'BTC' ? 'Bitcoin' : (s.asset === 'XAU' ? 'Vàng' : 'Dầu thô');
-            const tfLabel = s.timeframe.includes('15') ? '15 phút' : '1 giờ';
+            const tfLabel = s.timeframe.includes('15') ? '15 phút' : (s.timeframe.includes('4') ? '4 giờ' : '1 giờ');
             const priceStr = '$' + Number(s.price).toFixed(2);
 
             if (s.signal_type.includes('BB_BREAKOUT_DOWN')) {
@@ -1483,7 +1484,7 @@
     // --- RENDER TRADE ADVICE CARD ---
     function renderAdviceCard(snapshot, asset, tf) {
       if (!snapshot || !snapshot.advice) return;
-      const targetTf = (asset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
+      const targetTf = (asset !== 'BTC' && tf === '15m') ? '15min' : tf;
       const advice = snapshot.advice?.[asset]?.[targetTf];
 
       const badgeAsset = document.getElementById('adviceAssetBadge');
@@ -1639,9 +1640,9 @@
       document.getElementById('activeChartTitle').textContent = `[${asset} · ${currentTimeframe}]`;
       fetchCandleData();
       if (cachedSnapshot) {
-        const tf = (asset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        const targetTf = (asset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
         if (cachedSnapshot.indicators) {
-          updateCompositeGauge(cachedSnapshot.indicators[asset]?.[tf]);
+          updateCompositeGauge(cachedSnapshot.indicators[asset]?.[targetTf]);
         }
         renderAdviceCard(cachedSnapshot, asset, currentTimeframe);
       }
@@ -1649,12 +1650,14 @@
 
     function selectTimeframe(tf) {
       currentTimeframe = tf;
-      document.getElementById('btnTf15m').classList.toggle('active', tf === '15m');
-      document.getElementById('btnTf1h').classList.toggle('active', tf === '1h');
+      ['15m', '1h', '4h'].forEach(t => {
+        const btn = document.getElementById('btnTf' + t);
+        if (btn) btn.classList.toggle('active', t === tf);
+      });
       document.getElementById('activeChartTitle').textContent = `[${currentAsset} · ${tf}]`;
       fetchCandleData();
       if (cachedSnapshot) {
-        const targetTf = (currentAsset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
+        const targetTf = (currentAsset !== 'BTC' && tf === '15m') ? '15min' : tf;
         if (cachedSnapshot.indicators) {
           updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[targetTf]);
         }

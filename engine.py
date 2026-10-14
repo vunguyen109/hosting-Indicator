@@ -140,19 +140,19 @@ CONFIG = {
             "name":       "Bitcoin",
             "source":     "binance",
             "symbol":     "BTCUSDT",
-            "timeframes": ["15m", "1h"],
+            "timeframes": ["15m", "1h", "4h"],
         },
         "XAU": {
             "name":       "Gold",
             "source":     "twelvedata",
             "symbol":     "XAU/USD",
-            "timeframes": ["15min", "1h"],
+            "timeframes": ["15min", "1h", "4h"],
         },
         "OIL": {
             "name":       "Crude Oil (USO)",
             "source":     "twelvedata",
             "symbol":     "USO",
-            "timeframes": ["15min", "1h"],
+            "timeframes": ["15min", "1h", "4h"],
         },
     },
 
@@ -672,7 +672,7 @@ class TradeAdvice:
         }
 
 
-TIMEFRAME_ORDER = {"15m": 1, "15min": 1, "1h": 2}
+TIMEFRAME_ORDER = {"15m": 1, "15min": 1, "1h": 2, "4h": 3}
 
 
 class ConfluenceDecisionEngine:
@@ -697,7 +697,7 @@ class ConfluenceDecisionEngine:
             return "khung thời gian khác"
         current_rank = TIMEFRAME_ORDER.get(current_tf, 0)
         other_rank = TIMEFRAME_ORDER.get(other_tf, 0)
-        other_tf_display = {"15m": "15 phút", "15min": "15 phút", "1h": "1 giờ"}.get(other_tf, other_tf)
+        other_tf_display = {"15m": "15 phút", "15min": "15 phút", "1h": "1 giờ", "4h": "4 giờ"}.get(other_tf, other_tf)
         if other_rank > current_rank:
             return f"khung {other_tf_display} (dài hạn hơn)"
         elif other_rank < current_rank:
@@ -2190,6 +2190,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <span class="group-label">Khung giờ:</span>
         <button class="tab-btn active" id="btnTf15m" onclick="selectTimeframe('15m')">15 Phút (Ngắn hạn)</button>
         <button class="tab-btn" id="btnTf1h" onclick="selectTimeframe('1h')">1 Giờ (Trung hạn)</button>
+        <button class="tab-btn" id="btnTf4h" onclick="selectTimeframe('4h')">4 Giờ (Swing)</button>
       </div>
     </div>
 
@@ -2610,7 +2611,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     // --- TẢI DỮ LIỆU NẾN CHO CHART ---
     async function fetchCandleData() {
       try {
-        const tfParam = (currentAsset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        const tfParam = (currentAsset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
         const res = await fetch(`/api/candles?asset=${currentAsset}&tf=${tfParam}&limit=100`);
         if (!res.ok) return;
         const candles = await res.json();
@@ -2807,7 +2808,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             if (asset === 'XAU') assetName = '🟡 Vàng (XAU)';
             if (asset === 'OIL') assetName = '🛢️ Dầu thô (USO)';
 
-            let tfName = tf.includes('15') ? '15 Phút' : '1 Giờ';
+            let tfName = tf.includes('15') ? '15 Phút' : (tf.includes('4') ? '4 Giờ' : '1 Giờ');
 
             rowsHtml += `
               <tr>
@@ -2826,7 +2827,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (rowsHtml) tbody.innerHTML = rowsHtml;
 
         // 2. Cập nhật Gauge cho tài sản đang được chọn
-        const targetTf = (currentAsset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        const targetTf = (currentAsset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
         const activeAssetData = indMap[currentAsset]?.[targetTf];
         if (activeAssetData) {
           updateCompositeGauge(activeAssetData);
@@ -2849,7 +2850,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             let confHtml = '<span class="conf-tag conf-mid">🟡 ĐỘ TIN CẬY: VỪA</span>';
 
             const assetLabel = s.asset === 'BTC' ? 'Bitcoin' : (s.asset === 'XAU' ? 'Vàng' : 'Dầu thô');
-            const tfLabel = s.timeframe.includes('15') ? '15 phút' : '1 giờ';
+            const tfLabel = s.timeframe.includes('15') ? '15 phút' : (s.timeframe.includes('4') ? '4 giờ' : '1 giờ');
             const priceStr = '$' + Number(s.price).toFixed(2);
 
             if (s.signal_type.includes('BB_BREAKOUT_DOWN')) {
@@ -2965,7 +2966,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     // --- RENDER TRADE ADVICE CARD ---
     function renderAdviceCard(snapshot, asset, tf) {
       if (!snapshot || !snapshot.advice) return;
-      const targetTf = (asset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
+      const targetTf = (asset !== 'BTC' && tf === '15m') ? '15min' : tf;
       const advice = snapshot.advice?.[asset]?.[targetTf];
 
       const badgeAsset = document.getElementById('adviceAssetBadge');
@@ -3121,9 +3122,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('activeChartTitle').textContent = `[${asset} · ${currentTimeframe}]`;
       fetchCandleData();
       if (cachedSnapshot) {
-        const tf = (asset === 'BTC') ? currentTimeframe : (currentTimeframe === '15m' ? '15min' : '1h');
+        const targetTf = (asset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
         if (cachedSnapshot.indicators) {
-          updateCompositeGauge(cachedSnapshot.indicators[asset]?.[tf]);
+          updateCompositeGauge(cachedSnapshot.indicators[asset]?.[targetTf]);
         }
         renderAdviceCard(cachedSnapshot, asset, currentTimeframe);
       }
@@ -3131,12 +3132,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
     function selectTimeframe(tf) {
       currentTimeframe = tf;
-      document.getElementById('btnTf15m').classList.toggle('active', tf === '15m');
-      document.getElementById('btnTf1h').classList.toggle('active', tf === '1h');
+      ['15m', '1h', '4h'].forEach(t => {
+        const btn = document.getElementById('btnTf' + t);
+        if (btn) btn.classList.toggle('active', t === tf);
+      });
       document.getElementById('activeChartTitle').textContent = `[${currentAsset} · ${tf}]`;
       fetchCandleData();
       if (cachedSnapshot) {
-        const targetTf = (currentAsset === 'BTC') ? tf : (tf === '15m' ? '15min' : '1h');
+        const targetTf = (currentAsset !== 'BTC' && tf === '15m') ? '15min' : tf;
         if (cachedSnapshot.indicators) {
           updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[targetTf]);
         }
@@ -3386,7 +3389,18 @@ class IndicatorOrchestrator:
         """Compute trade advice using multi-timeframe indicators without triggering notifications."""
         cfg = CONFIG["assets"].get(asset, {})
         cfg_tfs = cfg.get("timeframes", [])
-        other_tf = next((t for t in cfg_tfs if t != tf), None)
+        
+        # Chọn khung tham chiếu MTF phù hợp nhất (ưu tiên khung lớn hơn liền kề hoặc khung dưới liền kề)
+        other_tf = None
+        if tf in ("15m", "15min"):
+            other_tf = "1h" if "1h" in cfg_tfs else ("4h" if "4h" in cfg_tfs else None)
+        elif tf == "1h":
+            other_tf = "4h" if "4h" in cfg_tfs else ("15m" if "15m" in cfg_tfs else ("15min" if "15min" in cfg_tfs else None))
+        elif tf == "4h":
+            other_tf = "1h" if "1h" in cfg_tfs else ("15m" if "15m" in cfg_tfs else ("15min" if "15min" in cfg_tfs else None))
+        else:
+            other_tf = next((t for t in cfg_tfs if t != tf), None)
+
         other_tf_snapshot = self._latest_indicators.get(asset, {}).get(other_tf) if other_tf else None
 
         buf = self._bufs.get(asset, {}).get(tf)

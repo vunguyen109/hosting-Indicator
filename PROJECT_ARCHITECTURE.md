@@ -111,6 +111,14 @@ Phân tích hợp lưu đa khung thời gian để sinh khuyến nghị BUY/SELL
   - Tự động đánh giá tính khả thi mục tiêu (`target_feasibility`): so sánh mục tiêu giá với ATR phiên.
   - UI Web Dashboard: Hiển thị song song cả 2 đơn vị ("% giá" và "% vốn ký quỹ"), có badge đòn bẩy và nút copy tiện dụng. Đồng bộ 100% giữa file tĩnh `dashboard.html` và chuỗi nhúng `HTML_DASHBOARD` trong `engine.py`.
 
+### Changelog v1.3 (Tích Hợp Toàn Diện Luồng Nến 4 Giờ - 4h)
+- [New Feature] **Bổ sung luồng fetcher 4h cho cả 3 tài sản (BTC, XAU, OIL):**
+  - Cập nhật `CONFIG["assets"]` hỗ trợ khung `"4h"` cho BTC (Binance), XAU và OIL (TwelveData).
+  - Tần suất đóng nến 4h (6 nến/ngày) tiêu thụ tài nguyên cực kỳ thấp: Chỉ thêm ~12 requests/ngày cho TwelveData, hoàn toàn nằm trong hạn mức 800 req/ngày của gói Free.
+  - Khởi tạo đầy đủ buffer 300 nến 4h và vòng lặp `_asset_loop` theo chu kỳ 14,400 giây.
+  - Nâng cấp `TIMEFRAME_ORDER` và logic hợp lưu MTF: Khung 4h được dùng làm khung tham chiếu xu hướng dài hạn cho khung 1h.
+  - Giao diện Web Dashboard: Thêm nút chuyển khung `4 Giờ (Swing)` trên Controls Bar, hỗ trợ vẽ biểu đồ nến Lightweight Charts 4h, cập nhật Gauge tâm lý và sinh khuyến nghị Trade Advice swing cho khung 4h.
+
 ---
 
 ## 5. Đặc Tả Giao Diện API (API Specifications)
@@ -237,7 +245,7 @@ Server lắng nghe mặc định tại `0.0.0.0:${SERVER_PORT:-8080}`:
 - **Chức năng:** Trả về mảng nến OHLC trực tiếp từ `CircularBuffer` trong RAM (O(1) slice, không tốn tài nguyên mạng/disk). Frontend polling mỗi **15 giây** để vẽ biểu đồ nến.
 - **Query Params:**
   - `asset`: Tên tài sản (`BTC`, `XAU`, `OIL`). Mặc định: `BTC`.
-  - `tf`: Khung giờ (`15m`, `1h`). Tự động xử lý alias `15m` <-> `15min`. Mặc định: `15m`.
+  - `tf`: Khung giờ (`15m`, `1h`, `4h`). Tự động xử lý alias `15m` <-> `15min`. Mặc định: `15m`.
   - `limit`: Số nến cần lấy (10 đến 300). Mặc định: `100`.
 - **Response:**
   ```json

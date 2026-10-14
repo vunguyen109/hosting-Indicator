@@ -374,6 +374,32 @@ class TestEngine(unittest.TestCase):
             self.assertIn("price", level)
             self.assertIn("label", level)
 
+    def test_4h_timeframe_integration(self):
+        """Kiểm tra tích hợp khung nến 4h cho cả 3 tài sản và logic tính swing holding period."""
+        # 1. Kiểm tra cấu hình assets có chứa 4h
+        for asset in ("BTC", "XAU", "OIL"):
+            self.assertIn("4h", CONFIG["assets"][asset]["timeframes"])
+
+        # 2. Kiểm tra Confluence Engine nhận diện 4h là swing_mode
+        engine = ConfluenceDecisionEngine(CONFIG)
+        entry = 65000.0
+        atr = 500.0
+        adv_4h = engine.decide(
+            asset="BTC", timeframe="4h",
+            snapshot={"close": entry, "ema_fast": 65500.0, "ema_slow": 64000.0,
+                      "rsi": 62.0, "bb_upper": 66000.0, "bb_mid": 65000.0, "bb_lower": 64000.0, "atr": atr},
+            recent_signals=[], recent_candles=[]
+        )
+        self.assertTrue(adv_4h.swing_mode)
+        self.assertGreater(len(adv_4h.tp_levels), 0)
+
+        # 3. Kiểm tra ước lượng holding period cho 4h
+        # Với khoảng cách 2 * (0.46 * atr) = 460 -> 2 nến 4h = 8h
+        hold = engine.estimate_holding_period(price_distance=460.0, atr=atr, timeframe="4h")
+        self.assertEqual(hold["candles"], 2)
+        self.assertEqual(hold["hours"], 8.0)
+        self.assertEqual(hold["time_label"], "8h")
+
 
 if __name__ == "__main__":
     unittest.main()
