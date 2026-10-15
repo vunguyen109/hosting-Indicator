@@ -6,7 +6,8 @@ from engine import (
     Candle, CircularBuffer, IndicatorEngine, RuleEngine,
     Signal, TelegramDispatcher, DashboardServer, IndicatorOrchestrator,
     TwelveDataFetcher, CONFIG, _parse_port, _load_dotenv, _update_dotenv,
-    ConfluenceDecisionEngine, TradeAdvice, TrendState, RsiZone, BbPosition, Action, Confidence
+    ConfluenceDecisionEngine, TradeAdvice, TrendState, RsiZone, BbPosition, Action, Confidence,
+    AdviceValidityStatus, check_advice_validity
 )
 
 class TestEngine(unittest.TestCase):
@@ -399,6 +400,109 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(hold["candles"], 2)
         self.assertEqual(hold["hours"], 8.0)
         self.assertEqual(hold["time_label"], "8h")
+
+    def test_advice_invalidated_when_price_crosses_sl(self):
+        """Regression test: tái hiện ĐÚNG case XAU 1h đã quan sát — 
+        SELL advice với SL=4132.74, giá hiện tại=4139.86 (đã vượt SL) 
+        PHẢI trả về status=invalidated."""
+        advice = TradeAdvice(
+            action="SELL", entry_price=4112.6056, 
+            stop_loss=4132.7379, confidence="Trung bình", 
+            confidence_score=3, entry_type="now", entry_zone=None,
+            take_profit_1=4071.4795, take_profit_2=4050.9165,
+            tp2_rule="", reasoning=[], conflict_detected=False,
+            mtf_agreement=None,
+        )
+        validity = check_advice_validity(
+            advice, current_price=4139.86, atr=11.17, cfg=CONFIG
+        )
+        self.assertEqual(validity["status"], "invalidated")
+        self.assertIn("vượt qua mức Cắt Lỗ", validity["reason"])
+        self.assertGreater(validity["price_drift_atr"], 2.0)
+
+    def test_advice_stale_but_not_invalidated(self):
+        """Giá trôi > 1x ATR nhưng chưa chạm SL => status=stale, 
+        không phải invalidated."""
+        advice = TradeAdvice(
+            action="BUY", entry_price=100.0, 
+            stop_loss=95.0, confidence="Trung bình",
+            confidence_score=3, entry_type="now", entry_zone=None,
+            take_profit_1=105.0, take_profit_2=110.0,
+            tp2_rule="", reasoning=[], conflict_detected=False,
+            mtf_agreement=None,
+        )
+        validity = check_advice_validity(
+            advice, current_price=105.5, atr=4.0, cfg=CONFIG
+        )
+        self.assertEqual(validity["status"], "stale")
+        self.assertIn("đáng kể", validity["reason"])
+        self.assertEqual(validity["price_drift_atr"], 1.38)
+
+    def test_advice_fresh_when_price_barely_moved(self):
+        """Giá gần như không đổi => status=fresh, không cảnh báo thừa."""
+        advice = TradeAdvice(
+            action="SELL", entry_price=100.0, 
+            stop_loss=105.0, confidence="Trung bình",
+            confidence_score=3, entry_type="now", entry_zone=None,
+            take_profit_1=95.0, take_profit_2=90.0,
+            tp2_rule="", reasoning=[], conflict_detected=False,
+            mtf_agreement=None,
+        )
+        validity = check_advice_validity(
+            advice, current_price=100.3, atr=4.0, cfg=CONFIG
+        )
+        self.assertEqual(validity["status"], "fresh")
+        self.assertIsNone(validity["reason"])
+
+    def test_wait_action_never_flagged_invalid(self):
+        """Advice với action=WAIT không có Entry/SL thực nên luôn 
+        PHẢI trả về fresh, không bao giờ invalidated/stale."""
+        advice = TradeAdvice(
+            action="WAIT", entry_price=None, 
+            stop_loss=None, confidence="Thấp",
+            confidence_score=0, entry_type="none", entry_zone=None,
+            take_profit_1=None, take_profit_2=None,
+            tp2_rule="", reasoning=[], conflict_detected=False,
+            mtf_agreement=None,
+        )
+        validity = check_advice_validity(
+            advice, current_price=100.0, atr=4.0, cfg=CONFIG
+        )
+        self.assertEqual(validity["status"], "fresh")
+        self.assertIsNone(validity["reason"])
+
+    def test_handle_snapshot_validity_field(self):
+        """Kiểm tra endpoint /api/snapshot gắn field validity vào advice."""
+        orch = IndicatorOrchestrator()
+        server = DashboardServer(orch, "127.0.0.1", 8080)
+
+        buf = CircularBuffer(50, "XAU", "1h")
+        buf.push(Candle(ts=1700000000, open=4110.0, high=4145.0, low=4100.0, close=4139.86))
+        orch._bufs["XAU"] = {"1h": buf}
+        orch._latest_indicators["XAU"] = {"1h": {"close": 4139.86, "atr": 11.17}}
+
+        adv = TradeAdvice(
+            action="SELL", entry_price=4112.6056, stop_loss=4132.7379,
+            confidence="Trung bình", confidence_score=3, entry_type="now", entry_zone=None,
+            take_profit_1=4071.4795, take_profit_2=4050.9165, tp2_rule="",
+            reasoning=[], conflict_detected=False, mtf_agreement=None
+        )
+        orch._latest_advice["XAU"] = {"1h": adv}
+
+        class MockRequest:
+            pass
+
+        resp = asyncio.run(server.handle_snapshot(MockRequest()))
+        self.assertEqual(resp.status, 200)
+        import json
+        payload = json.loads(resp.text)
+        self.assertIn("advice", payload)
+        self.assertIn("XAU", payload["advice"])
+        self.assertIn("1h", payload["advice"]["XAU"])
+        adv_json = payload["advice"]["XAU"]["1h"]
+        self.assertIn("validity", adv_json)
+        self.assertEqual(adv_json["validity"]["status"], "invalidated")
+        self.assertIn("vượt qua mức Cắt Lỗ", adv_json["validity"]["reason"])
 
 
 if __name__ == "__main__":

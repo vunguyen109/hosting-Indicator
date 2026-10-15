@@ -261,5 +261,15 @@ Trên Botkeep dashboard:
 
 ---
 
+## 13. Lịch sử phiên bản (Changelog)
+
+### Changelog v1.2 (Hotfix an toàn — ưu tiên khẩn cấp)
+- **[Fixed - Critical]** Thêm cơ chế `check_advice_validity()` phát hiện khi giá hiện tại đã vượt qua mức SL/Entry đã tính, đánh dấu advice là `"invalidated"` và cảnh báo rõ ràng trên UI thay vì im lặng hiển thị số liệu đã lỗi thời.
+- **[UX]** Sửa nhãn gây hiểu lầm `"Khớp lệnh ngay giá hiện tại"` → hiển thị rõ ràng giá tham chiếu là giá đóng cửa nến gần nhất, kèm giá hiện tại thời gian thực để người dùng tự đối chiếu.
+- **[Investigation]** Bổ sung log debug xác minh hành vi của `detect_counter_move()` (patch v1.1) trong tình huống giá bật mạnh sau khi giảm sâu — xác nhận đây là giới hạn tất yếu của kiến trúc "tính theo nến đóng" (non-repainting), không phải lỗi logic.
+- **Nguồn gốc patch**: live testing case XAU/USD 1h, Entry $4,112.61 (SELL) nhưng giá live đã đạt $4,139.86 — vượt qua SL $4,132.74 tại đúng thời điểm khuyến nghị được hiển thị trên UI.
+
+---
+
 *Hỗ trợ & Tài liệu Botkeep:* [botkeep.cloud/docs](https://botkeep.cloud/docs)  
 *Repository GitHub:* [github.com/vunguyen109/hosting-Indicator](https://github.com/vunguyen109/hosting-Indicator)

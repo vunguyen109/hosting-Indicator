@@ -1494,6 +1494,13 @@
       const swingTpBox = document.getElementById('adviceSwingTpBox');
       const waitMessage = document.getElementById('adviceWaitMessage');
       const metaBadge = document.getElementById('adviceMetaBadge');
+      const cardEl = document.getElementById('cardTradeAdvice') || document.getElementById('advice-card');
+      const bodyEl = cardEl ? cardEl.querySelector('.advice-card-body') : null;
+      const targetContainer = bodyEl || cardEl;
+
+      // Xóa banner cảnh báo cũ nếu có
+      const oldBanner = document.getElementById('advice-stale-banner');
+      if (oldBanner) oldBanner.remove();
 
       if (!advice) {
         if (waitMessage) {
@@ -1504,6 +1511,47 @@
         if (swingTpBox) swingTpBox.style.display = 'none';
         if (metaBadge) metaBadge.style.display = 'none';
         return;
+      }
+
+      // Xử lý Validity Banner (Fresh / Stale / Invalidated)
+      const validity = advice.validity || { status: 'fresh', reason: null, price_drift_atr: 0.0 };
+      const setLevelsOpacity = (op) => {
+        if (levelsGrid) levelsGrid.style.opacity = op;
+        if (swingTpBox) swingTpBox.style.opacity = op;
+      };
+
+      if (validity.status === 'invalidated') {
+        const banner = document.createElement('div');
+        banner.id = 'advice-stale-banner';
+        banner.style.cssText = 'background: rgba(153, 27, 27, 0.45); border: 2px solid #ef4444; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;';
+        banner.innerHTML = `
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+            <span style="font-size:1.15rem;">🚫</span>
+            <strong style="color:#fca5a5; font-size:0.95rem; text-transform:uppercase; letter-spacing:0.5px;">KHUYẾN NGHỊ ĐÃ VÔ HIỆU</strong>
+          </div>
+          <p style="color:#fee2e2; font-size:0.85rem; margin:0 0 6px 0; line-height:1.4;">${validity.reason || 'Giá hiện tại đã vượt qua mức Cắt Lỗ dự kiến. Khuyến nghị này không còn hợp lệ.'}</p>
+          <p style="color:#fca5a5; font-size:0.75rem; margin:0; opacity:0.9;">⏳ Vui lòng chờ nến tiếp theo đóng cửa để hệ thống cập nhật khuyến nghị mới.</p>
+        `;
+        if (targetContainer) {
+          targetContainer.prepend(banner);
+        }
+        setLevelsOpacity('0.35');
+      } else if (validity.status === 'stale') {
+        const banner = document.createElement('div');
+        banner.id = 'advice-stale-banner';
+        banner.style.cssText = 'background: rgba(146, 64, 14, 0.4); border: 1px solid #f59e0b; border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;';
+        banner.innerHTML = `
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:1rem;">⚠️</span>
+            <span style="color:#fef08a; font-size:0.85rem; line-height:1.4;">${validity.reason || 'Giá đã trôi khá xa kể từ lúc tính khuyến nghị. Cân nhắc chờ cập nhật mới.'}</span>
+          </div>
+        `;
+        if (targetContainer) {
+          targetContainer.prepend(banner);
+        }
+        setLevelsOpacity('0.7');
+      } else {
+        setLevelsOpacity('1');
       }
 
       // Action Badge & Meta Profile
@@ -1536,6 +1584,7 @@
 
       // Entry / SL / TP
       if (advice.action === 'WAIT') {
+        setLevelsOpacity('1');
         if (levelsGrid) levelsGrid.style.display = 'none';
         if (swingTpBox) swingTpBox.style.display = 'none';
         if (waitMessage) {
@@ -1546,16 +1595,19 @@
         if (waitMessage) waitMessage.style.display = 'none';
         if (levelsGrid) levelsGrid.style.display = 'grid';
 
+        const liveClose = snapshot.indicators?.[asset]?.[targetTf]?.close;
+        const livePriceStr = liveClose != null ? ('$' + Number(liveClose).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})) : '--';
+
         const entryValEl = document.getElementById('adviceEntryVal');
         const entrySubEl = document.getElementById('adviceEntrySub');
         if (advice.entry_type === 'now') {
           entryValEl.textContent = '$' + Number(advice.entry_price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           entryValEl.setAttribute('data-raw', advice.entry_price);
-          entrySubEl.textContent = '⚡ Khớp lệnh ngay giá hiện tại';
+          entrySubEl.innerHTML = `📌 Entry tính tại nến đóng. Giá live: <span id="live-price-compare" style="color:var(--text-main); font-weight:600;">${livePriceStr}</span>`;
         } else {
           entryValEl.textContent = '$' + Number(advice.entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           entryValEl.setAttribute('data-raw', advice.entry_zone);
-          entrySubEl.textContent = '⏳ Chờ giá hồi về vùng EMA20';
+          entrySubEl.innerHTML = `⏳ Chờ giá hồi về vùng EMA20. Giá live: <span id="live-price-compare" style="color:var(--text-main); font-weight:600;">${livePriceStr}</span>`;
         }
 
         const slValEl = document.getElementById('adviceSlVal');

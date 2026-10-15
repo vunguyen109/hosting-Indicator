@@ -197,6 +197,9 @@ CONFIG = {
     # Ngưỡng coi là "giá đã gần EMA20, có thể entry ngay" thay vì "chờ pullback"
     "ENTRY_PULLBACK_ATR_THRESHOLD": 0.3,
 
+    # Ngưỡng cảnh báo advice có khả năng lỗi thời khi giá trôi quá X lần ATR kể từ lúc tính
+    "STALE_ADVICE_ATR_THRESHOLD":    1.0,
+
     # Số nến gần nhất dùng để phát hiện biến động ngược dòng mạnh
     "COUNTER_MOVE_LOOKBACK_CANDLES": 3,
     # Ngưỡng: biến động giá (đơn vị lần ATR) trong N nến gần nhất được coi là "counter-move" đủ mạnh để nghi ngờ xu hướng EMA
@@ -618,6 +621,12 @@ class Confidence(str, Enum):
     LOW = "Thấp"
 
 
+class AdviceValidityStatus(str, Enum):
+    FRESH = "fresh"              # advice còn mới, giá chưa đi xa
+    STALE = "stale"              # giá đã đi khá xa, cần thận trọng
+    INVALIDATED = "invalidated"  # giá đã vượt qua SL/Entry, advice vô nghĩa
+
+
 @dataclass
 class TradeAdvice:
     action: str                    # BUY / SELL / WAIT
@@ -675,6 +684,78 @@ class TradeAdvice:
 TIMEFRAME_ORDER = {"15m": 1, "15min": 1, "1h": 2, "4h": 3}
 
 
+def check_advice_validity(
+    advice: TradeAdvice, current_price: float, atr: float, cfg: dict
+) -> dict:
+    """
+    Phép so sánh NHẸ (O(1)), gọi mỗi request API — KHÔNG tính lại 
+    indicator hay re-run toàn bộ decide(). Chỉ kiểm tra xem Entry/SL 
+    đã tính trước đó còn ý nghĩa với giá HIỆN TẠI hay không.
+    """
+    if advice.action not in ("BUY", "SELL") or atr <= 0:
+        return {
+            "status": AdviceValidityStatus.FRESH.value,
+            "reason": None,
+            "price_drift_atr": 0.0,
+        }
+
+    reference_price = advice.entry_price or advice.entry_zone
+    if reference_price is None:
+        return {
+            "status": AdviceValidityStatus.FRESH.value,
+            "reason": None,
+            "price_drift_atr": 0.0,
+        }
+
+    drift = current_price - reference_price
+    drift_in_atr = abs(drift) / atr
+
+    is_sell = advice.action == "SELL"
+
+    # Kiểm tra INVALIDATED trước — điều kiện nghiêm trọng nhất:
+    # giá đã di chuyển theo hướng NGƯỢC LẠI và vượt qua chính mức SL
+    if is_sell and advice.stop_loss is not None and current_price >= advice.stop_loss:
+        return {
+            "status": AdviceValidityStatus.INVALIDATED.value,
+            "reason": (
+                f"Giá hiện tại (${current_price:.2f}) đã vượt "
+                f"qua mức Cắt Lỗ dự kiến (${advice.stop_loss:.2f}). "
+                f"Khuyến nghị này không còn hợp lệ."
+            ),
+            "price_drift_atr": round(drift_in_atr, 2),
+        }
+    if not is_sell and advice.stop_loss is not None and current_price <= advice.stop_loss:
+        return {
+            "status": AdviceValidityStatus.INVALIDATED.value,
+            "reason": (
+                f"Giá hiện tại (${current_price:.2f}) đã vượt "
+                f"qua mức Cắt Lỗ dự kiến (${advice.stop_loss:.2f}). "
+                f"Khuyến nghị này không còn hợp lệ."
+            ),
+            "price_drift_atr": round(drift_in_atr, 2),
+        }
+
+    # Kiểm tra STALE — giá đã trôi khá xa nhưng chưa tới mức vô hiệu hóa
+    threshold = cfg.get("STALE_ADVICE_ATR_THRESHOLD", 1.0)
+    if drift_in_atr >= threshold:
+        direction = "tăng" if drift > 0 else "giảm"
+        return {
+            "status": AdviceValidityStatus.STALE.value,
+            "reason": (
+                f"Giá đã {direction} đáng kể "
+                f"(~{drift_in_atr:.1f}x ATR) kể từ lúc tính "
+                f"khuyến nghị. Cân nhắc chờ cập nhật mới."
+            ),
+            "price_drift_atr": round(drift_in_atr, 2),
+        }
+
+    return {
+        "status": AdviceValidityStatus.FRESH.value,
+        "reason": None,
+        "price_drift_atr": round(drift_in_atr, 2),
+    }
+
+
 class ConfluenceDecisionEngine:
     """
     Đọc snapshot hiện tại từ IndicatorEngine + lịch sử tín hiệu từ 
@@ -706,7 +787,12 @@ class ConfluenceDecisionEngine:
             return f"khung {other_tf_display}"
 
     def detect_counter_move(
-        self, recent_candles: Optional[list], atr: float, trend: TrendState
+        self,
+        recent_candles: Optional[list],
+        atr: float,
+        trend: TrendState,
+        asset: str = "",
+        timeframe: str = "",
     ) -> tuple[bool, float]:
         """
         Phát hiện biến động giá ngược chiều với xu hướng EMA hiện tại trong N nến gần nhất,
@@ -731,11 +817,25 @@ class ConfluenceDecisionEngine:
         trend_is_up = trend in (TrendState.STRONG_UP, TrendState.LEAN_UP)
 
         # Counter-move = giá tăng mạnh NGƯỢC xu hướng giảm, hoặc ngược lại
+        detected = False
         if trend_is_down and change_in_atr > threshold:
-            return True, change_in_atr
-        if trend_is_up and change_in_atr < -threshold:
-            return True, change_in_atr
-        return False, change_in_atr
+            detected = True
+        elif trend_is_up and change_in_atr < -threshold:
+            detected = True
+
+        window_closes = [
+            getattr(c, "close", None) if not isinstance(c, dict) else c.get("close")
+            for c in window
+        ]
+        trend_val = trend.value if hasattr(trend, "value") else str(trend)
+        logger.debug(
+            f"[{asset}/{timeframe}] counter_move check: "
+            f"window_closes={window_closes}, "
+            f"change_in_atr={change_in_atr:.2f}, "
+            f"threshold={threshold}, trend={trend_val}, "
+            f"detected={detected}"
+        )
+        return detected, change_in_atr
 
     def estimate_holding_period(self, price_distance: float, atr: float, timeframe: str) -> dict:
         """
@@ -903,7 +1003,9 @@ class ConfluenceDecisionEngine:
         bb_pos = self.classify_bb_position(close, snapshot["bb_upper"], snapshot["bb_lower"])
         
         conflict_from_signals = self.detect_conflict(recent_signals, asset, timeframe, trend)
-        counter_move_detected, counter_move_magnitude = self.detect_counter_move(recent_candles, atr, trend)
+        counter_move_detected, counter_move_magnitude = self.detect_counter_move(
+            recent_candles, atr, trend, asset, timeframe
+        )
         conflict = conflict_from_signals or counter_move_detected
 
         trend_other = None
@@ -2976,6 +3078,13 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       const swingTpBox = document.getElementById('adviceSwingTpBox');
       const waitMessage = document.getElementById('adviceWaitMessage');
       const metaBadge = document.getElementById('adviceMetaBadge');
+      const cardEl = document.getElementById('cardTradeAdvice') || document.getElementById('advice-card');
+      const bodyEl = cardEl ? cardEl.querySelector('.advice-card-body') : null;
+      const targetContainer = bodyEl || cardEl;
+
+      // Xóa banner cảnh báo cũ nếu có
+      const oldBanner = document.getElementById('advice-stale-banner');
+      if (oldBanner) oldBanner.remove();
 
       if (!advice) {
         if (waitMessage) {
@@ -2986,6 +3095,47 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (swingTpBox) swingTpBox.style.display = 'none';
         if (metaBadge) metaBadge.style.display = 'none';
         return;
+      }
+
+      // Xử lý Validity Banner (Fresh / Stale / Invalidated)
+      const validity = advice.validity || { status: 'fresh', reason: null, price_drift_atr: 0.0 };
+      const setLevelsOpacity = (op) => {
+        if (levelsGrid) levelsGrid.style.opacity = op;
+        if (swingTpBox) swingTpBox.style.opacity = op;
+      };
+
+      if (validity.status === 'invalidated') {
+        const banner = document.createElement('div');
+        banner.id = 'advice-stale-banner';
+        banner.style.cssText = 'background: rgba(153, 27, 27, 0.45); border: 2px solid #ef4444; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;';
+        banner.innerHTML = `
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+            <span style="font-size:1.15rem;">🚫</span>
+            <strong style="color:#fca5a5; font-size:0.95rem; text-transform:uppercase; letter-spacing:0.5px;">KHUYẾN NGHỊ ĐÃ VÔ HIỆU</strong>
+          </div>
+          <p style="color:#fee2e2; font-size:0.85rem; margin:0 0 6px 0; line-height:1.4;">${validity.reason || 'Giá hiện tại đã vượt qua mức Cắt Lỗ dự kiến. Khuyến nghị này không còn hợp lệ.'}</p>
+          <p style="color:#fca5a5; font-size:0.75rem; margin:0; opacity:0.9;">⏳ Vui lòng chờ nến tiếp theo đóng cửa để hệ thống cập nhật khuyến nghị mới.</p>
+        `;
+        if (targetContainer) {
+          targetContainer.prepend(banner);
+        }
+        setLevelsOpacity('0.35');
+      } else if (validity.status === 'stale') {
+        const banner = document.createElement('div');
+        banner.id = 'advice-stale-banner';
+        banner.style.cssText = 'background: rgba(146, 64, 14, 0.4); border: 1px solid #f59e0b; border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;';
+        banner.innerHTML = `
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:1rem;">⚠️</span>
+            <span style="color:#fef08a; font-size:0.85rem; line-height:1.4;">${validity.reason || 'Giá đã trôi khá xa kể từ lúc tính khuyến nghị. Cân nhắc chờ cập nhật mới.'}</span>
+          </div>
+        `;
+        if (targetContainer) {
+          targetContainer.prepend(banner);
+        }
+        setLevelsOpacity('0.7');
+      } else {
+        setLevelsOpacity('1');
       }
 
       // Action Badge & Meta Profile
@@ -3018,6 +3168,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // Entry / SL / TP
       if (advice.action === 'WAIT') {
+        setLevelsOpacity('1');
         if (levelsGrid) levelsGrid.style.display = 'none';
         if (swingTpBox) swingTpBox.style.display = 'none';
         if (waitMessage) {
@@ -3028,16 +3179,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (waitMessage) waitMessage.style.display = 'none';
         if (levelsGrid) levelsGrid.style.display = 'grid';
 
+        const liveClose = snapshot.indicators?.[asset]?.[targetTf]?.close;
+        const livePriceStr = liveClose != null ? ('$' + Number(liveClose).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})) : '--';
+
         const entryValEl = document.getElementById('adviceEntryVal');
         const entrySubEl = document.getElementById('adviceEntrySub');
         if (advice.entry_type === 'now') {
           entryValEl.textContent = '$' + Number(advice.entry_price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           entryValEl.setAttribute('data-raw', advice.entry_price);
-          entrySubEl.textContent = '⚡ Khớp lệnh ngay giá hiện tại';
+          entrySubEl.innerHTML = `📌 Entry tính tại nến đóng. Giá live: <span id="live-price-compare" style="color:var(--text-main); font-weight:600;">${livePriceStr}</span>`;
         } else {
           entryValEl.textContent = '$' + Number(advice.entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           entryValEl.setAttribute('data-raw', advice.entry_zone);
-          entrySubEl.textContent = '⏳ Chờ giá hồi về vùng EMA20';
+          entrySubEl.innerHTML = `⏳ Chờ giá hồi về vùng EMA20. Giá live: <span id="live-price-compare" style="color:var(--text-main); font-weight:600;">${livePriceStr}</span>`;
         }
 
         const slValEl = document.getElementById('adviceSlVal');
@@ -3192,6 +3346,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
   </script>
 </body>
 </html>
+
 """
 
 
@@ -3274,10 +3429,57 @@ class DashboardServer:
         uptime_sec = int(now - self._orchestrator._start_time)
 
         advice_payload: dict = {}
+        cfg = getattr(self._orchestrator, "cfg", CONFIG)
         for a, tfs in self._orchestrator._latest_advice.items():
             advice_payload[a] = {}
             for tf, adv in tfs.items():
-                advice_payload[a][tf] = adv.to_dict() if hasattr(adv, "to_dict") else adv
+                adv_dict = adv.to_dict() if hasattr(adv, "to_dict") else dict(adv)
+
+                # Kiểm tra tính hợp lệ của Advice (O(1) nhẹ)
+                ind_snap = self._orchestrator._latest_indicators.get(a, {}).get(tf, {})
+                buf = self._orchestrator._bufs.get(a, {}).get(tf)
+                current_price = None
+                if buf and len(buf) > 0 and buf.latest:
+                    current_price = buf.latest.close
+                elif ind_snap and "close" in ind_snap:
+                    current_price = ind_snap["close"]
+
+                atr = ind_snap.get("atr", 0.0) if ind_snap else 0.0
+                if current_price is not None and atr is not None:
+                    target_adv = adv
+                    if not isinstance(adv, TradeAdvice) and isinstance(adv, dict):
+                        target_adv = TradeAdvice(
+                            action=adv.get("action", "WAIT"),
+                            confidence=adv.get("confidence", "Thấp"),
+                            confidence_score=adv.get("confidence_score", 0),
+                            entry_type=adv.get("entry_type", "none"),
+                            entry_price=adv.get("entry_price"),
+                            entry_zone=adv.get("entry_zone"),
+                            stop_loss=adv.get("stop_loss"),
+                            take_profit_1=adv.get("take_profit_1"),
+                            take_profit_2=adv.get("take_profit_2"),
+                            tp2_rule=adv.get("tp2_rule", ""),
+                            reasoning=adv.get("reasoning", []),
+                            conflict_detected=adv.get("conflict_detected", False),
+                            mtf_agreement=adv.get("mtf_agreement"),
+                        )
+                    if isinstance(target_adv, TradeAdvice):
+                        validity = check_advice_validity(target_adv, float(current_price), float(atr), cfg)
+                    else:
+                        validity = {
+                            "status": AdviceValidityStatus.FRESH.value,
+                            "reason": None,
+                            "price_drift_atr": 0.0,
+                        }
+                else:
+                    validity = {
+                        "status": AdviceValidityStatus.FRESH.value,
+                        "reason": None,
+                        "price_drift_atr": 0.0,
+                    }
+
+                adv_dict["validity"] = validity
+                advice_payload[a][tf] = adv_dict
 
         data = {
             "status": "online",
