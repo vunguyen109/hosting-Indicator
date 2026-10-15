@@ -200,6 +200,9 @@ CONFIG = {
     # Ngưỡng cảnh báo advice có khả năng lỗi thời khi giá trôi quá X lần ATR kể từ lúc tính
     "STALE_ADVICE_ATR_THRESHOLD":    1.0,
 
+    # Ngưỡng cập nhật/làm tươi lại vùng entry_zone (bội số ATR lệch khỏi EMA20)
+    "ENTRY_ZONE_REFRESH_ATR_THRESHOLD": 0.3,
+
     # Số nến gần nhất dùng để phát hiện biến động ngược dòng mạnh
     "COUNTER_MOVE_LOOKBACK_CANDLES": 3,
     # Ngưỡng: biến động giá (đơn vị lần ATR) trong N nến gần nhất được coi là "counter-move" đủ mạnh để nghi ngờ xu hướng EMA
@@ -625,6 +628,8 @@ class AdviceValidityStatus(str, Enum):
     FRESH = "fresh"              # advice còn mới, giá chưa đi xa
     STALE = "stale"              # giá đã đi khá xa, cần thận trọng
     INVALIDATED = "invalidated"  # giá đã vượt qua SL/Entry, advice vô nghĩa
+    ZONE_UPDATED = "zone_updated"  # vùng chờ EMA20 đã dịch chuyển và giá hiện tại đã chạm vùng mới
+    ZONE_DRIFTED = "zone_drifted"  # vùng chờ EMA20 đã dịch chuyển đáng kể so với lúc tính toán
 
 
 @dataclass
@@ -685,13 +690,41 @@ TIMEFRAME_ORDER = {"15m": 1, "15min": 1, "1h": 2, "4h": 3}
 
 
 def check_advice_validity(
-    advice: TradeAdvice, current_price: float, atr: float, cfg: dict
+    advice: TradeAdvice,
+    current_price: float,
+    *args,
+    atr: float | None = None,
+    cfg: dict | None = None,
+    current_ema_fast: float | None = None,
+    **kwargs,
 ) -> dict:
     """
     Phép so sánh NHẸ (O(1)), gọi mỗi request API — KHÔNG tính lại 
     indicator hay re-run toàn bộ decide(). Chỉ kiểm tra xem Entry/SL 
     đã tính trước đó còn ý nghĩa với giá HIỆN TẠI hay không.
+    Hỗ trợ kiểm tra trôi vùng EMA20 cho entry_type="wait_pullback" (v1.3).
     """
+    if len(args) == 1:
+        if atr is None:
+            atr = args[0]
+    elif len(args) == 2:
+        if atr is None:
+            atr = args[0]
+        if cfg is None:
+            cfg = args[1]
+    elif len(args) >= 3:
+        if current_ema_fast is None:
+            current_ema_fast = args[0]
+        if atr is None:
+            atr = args[1]
+        if cfg is None:
+            cfg = args[2]
+
+    if cfg is None:
+        cfg = CONFIG
+    if atr is None:
+        atr = 0.0
+
     if advice.action not in ("BUY", "SELL") or atr <= 0:
         return {
             "status": AdviceValidityStatus.FRESH.value,
@@ -712,7 +745,7 @@ def check_advice_validity(
 
     is_sell = advice.action == "SELL"
 
-    # Kiểm tra INVALIDATED trước — điều kiện nghiêm trọng nhất:
+    # 1. Kiểm tra INVALIDATED trước — điều kiện nghiêm trọng nhất:
     # giá đã di chuyển theo hướng NGƯỢC LẠI và vượt qua chính mức SL
     if is_sell and advice.stop_loss is not None and current_price >= advice.stop_loss:
         return {
@@ -735,7 +768,44 @@ def check_advice_validity(
             "price_drift_atr": round(drift_in_atr, 2),
         }
 
-    # Kiểm tra STALE — giá đã trôi khá xa nhưng chưa tới mức vô hiệu hóa
+    # 2. Xử lý riêng cho entry_type == "wait_pullback" (v1.3)
+    if advice.entry_type == "wait_pullback" and advice.entry_zone is not None and current_ema_fast is not None:
+        zone_drift = abs(current_ema_fast - advice.entry_zone)
+        zone_drift_atr = zone_drift / atr if atr > 0 else 0.0
+        refresh_threshold = cfg.get("ENTRY_ZONE_REFRESH_ATR_THRESHOLD", 0.3)
+
+        if zone_drift_atr >= refresh_threshold:
+            # Kiểm tra xem giá hiện tại đã "chạm" vùng EMA20 MỚI hay chưa
+            distance_to_new_zone = abs(current_price - current_ema_fast) / atr if atr > 0 else 0.0
+            pullback_threshold = cfg.get("ENTRY_PULLBACK_ATR_THRESHOLD", 0.3)
+
+            if distance_to_new_zone <= pullback_threshold:
+                return {
+                    "status": AdviceValidityStatus.ZONE_UPDATED.value,
+                    "reason": (
+                        f"Vùng chờ Entry đã thay đổi theo chỉ báo "
+                        f"mới nhất (EMA20 hiện tại: ${current_ema_fast:.2f}). "
+                        f"Giá hiện tại đã nằm trong vùng này — "
+                        f"có thể cân nhắc vào lệnh ngay thay vì chờ "
+                        f"mức ${advice.entry_zone:.2f} cũ."
+                    ),
+                    "updated_entry_zone": round(current_ema_fast, 4),
+                    "price_drift_atr": round(zone_drift_atr, 2),
+                }
+            else:
+                return {
+                    "status": AdviceValidityStatus.ZONE_DRIFTED.value,
+                    "reason": (
+                        f"Vùng chờ Entry đã dịch chuyển: "
+                        f"EMA20 hiện tại là ${current_ema_fast:.2f}, "
+                        f"không còn là ${advice.entry_zone:.2f} như "
+                        f"lúc tính toán ban đầu."
+                    ),
+                    "updated_entry_zone": round(current_ema_fast, 4),
+                    "price_drift_atr": round(zone_drift_atr, 2),
+                }
+
+    # 3. Kiểm tra STALE — áp dụng khi entry_type == "now" (hoặc không phải wait_pullback)
     threshold = cfg.get("STALE_ADVICE_ATR_THRESHOLD", 1.0)
     if drift_in_atr >= threshold:
         direction = "tăng" if drift > 0 else "giảm"
@@ -3120,6 +3190,36 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
           targetContainer.prepend(banner);
         }
         setLevelsOpacity('0.35');
+      } else if (validity.status === 'zone_updated') {
+        const banner = document.createElement('div');
+        banner.id = 'advice-stale-banner';
+        banner.style.cssText = 'background: rgba(6, 78, 59, 0.55); border: 2px solid #10b981; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;';
+        const newZoneStr = validity.updated_entry_zone != null ? ('$' + Number(validity.updated_entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})) : '';
+        banner.innerHTML = `
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+            <span style="font-size:1.15rem;">🎯</span>
+            <strong style="color:#6ee7b7; font-size:0.95rem; text-transform:uppercase; letter-spacing:0.5px;">VÙNG ENTRY ĐÃ ĐẠT ${newZoneStr ? `(${newZoneStr})` : ''}</strong>
+          </div>
+          <p style="color:#d1fae5; font-size:0.85rem; margin:0 0 4px 0; line-height:1.4;">${validity.reason || 'Vùng chờ Entry đã thay đổi theo chỉ báo mới nhất. Giá hiện tại đã nằm trong vùng này — có thể cân nhắc vào lệnh ngay.'}</p>
+        `;
+        if (targetContainer) {
+          targetContainer.prepend(banner);
+        }
+        setLevelsOpacity('1');
+      } else if (validity.status === 'zone_drifted') {
+        const banner = document.createElement('div');
+        banner.id = 'advice-stale-banner';
+        banner.style.cssText = 'background: rgba(146, 64, 14, 0.4); border: 1px solid #f59e0b; border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;';
+        banner.innerHTML = `
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:1rem;">⚠️</span>
+            <span style="color:#fef08a; font-size:0.85rem; line-height:1.4;">${validity.reason || 'Vùng chờ Entry đã dịch chuyển theo EMA20 mới.'}</span>
+          </div>
+        `;
+        if (targetContainer) {
+          targetContainer.prepend(banner);
+        }
+        setLevelsOpacity('0.9');
       } else if (validity.status === 'stale') {
         const banner = document.createElement('div');
         banner.id = 'advice-stale-banner';
@@ -3191,7 +3291,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         } else {
           entryValEl.textContent = '$' + Number(advice.entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           entryValEl.setAttribute('data-raw', advice.entry_zone);
-          entrySubEl.innerHTML = `⏳ Chờ giá hồi về vùng EMA20. Giá live: <span id="live-price-compare" style="color:var(--text-main); font-weight:600;">${livePriceStr}</span>`;
+          const liveEma = snapshot.indicators?.[asset]?.[targetTf]?.ema_fast;
+          const liveEmaStr = (validity && validity.updated_entry_zone != null)
+            ? ('$' + Number(validity.updated_entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4}))
+            : (liveEma != null ? ('$' + Number(liveEma).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})) : '--');
+          entrySubEl.innerHTML = `⏳ Chờ giá hồi về EMA20. Vùng EMA20 live: <span style="color:#6ee7b7; font-weight:600;">${liveEmaStr}</span> | Giá live: <span id="live-price-compare" style="color:var(--text-main); font-weight:600;">${livePriceStr}</span>`;
         }
 
         const slValEl = document.getElementById('adviceSlVal');
@@ -3445,6 +3549,7 @@ class DashboardServer:
                     current_price = ind_snap["close"]
 
                 atr = ind_snap.get("atr", 0.0) if ind_snap else 0.0
+                current_ema_fast = ind_snap.get("ema_fast") if ind_snap else None
                 if current_price is not None and atr is not None:
                     target_adv = adv
                     if not isinstance(adv, TradeAdvice) and isinstance(adv, dict):
@@ -3464,7 +3569,13 @@ class DashboardServer:
                             mtf_agreement=adv.get("mtf_agreement"),
                         )
                     if isinstance(target_adv, TradeAdvice):
-                        validity = check_advice_validity(target_adv, float(current_price), float(atr), cfg)
+                        validity = check_advice_validity(
+                            target_adv,
+                            current_price=float(current_price),
+                            atr=float(atr),
+                            cfg=cfg,
+                            current_ema_fast=float(current_ema_fast) if current_ema_fast is not None else None,
+                        )
                     else:
                         validity = {
                             "status": AdviceValidityStatus.FRESH.value,

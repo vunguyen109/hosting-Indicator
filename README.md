@@ -263,6 +263,12 @@ Trên Botkeep dashboard:
 
 ## 13. Lịch sử phiên bản (Changelog)
 
+### Changelog v1.3 (Hotfix — Entry Zone Staleness & Dynamic Pullback Refresh)
+- **[Fixed - Critical]** Mở rộng `check_advice_validity()` tiếp nhận `current_ema_fast` thời gian thực để khắc phục hiện tượng trôi vùng chờ Entry (`entry_zone`) cho loại lệnh `wait_pullback`.
+- **[UX - Smart Trigger]** Tự động phát hiện khi giá live đã chạm vào vùng EMA20 mới (`zone_updated`), hiển thị Banner xanh `🎯 VÙNG ENTRY ĐÃ ĐẠT` gợi ý trader vào lệnh ngay thay vì thụ động chờ mốc cũ đã lỗi thời.
+- **[UX - Multi-level Display]** Hiển thị song song cả mốc Entry cũ lúc đóng nến và mốc EMA20 live kèm chênh lệch thời gian thực trên Dashboard UI.
+- **[Regression Tests]** Bổ sung 3 unit tests chuyên biệt mô phỏng chính xác case XAU 1h pullback thực tế (27/27 tests passed).
+
 ### Changelog v1.2 (Hotfix an toàn — ưu tiên khẩn cấp)
 - **[Fixed - Critical]** Thêm cơ chế `check_advice_validity()` phát hiện khi giá hiện tại đã vượt qua mức SL/Entry đã tính, đánh dấu advice là `"invalidated"` và cảnh báo rõ ràng trên UI thay vì im lặng hiển thị số liệu đã lỗi thời.
 - **[UX]** Sửa nhãn gây hiểu lầm `"Khớp lệnh ngay giá hiện tại"` → hiển thị rõ ràng giá tham chiếu là giá đóng cửa nến gần nhất, kèm giá hiện tại thời gian thực để người dùng tự đối chiếu.

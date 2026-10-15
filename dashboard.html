@@ -1536,6 +1536,36 @@
           targetContainer.prepend(banner);
         }
         setLevelsOpacity('0.35');
+      } else if (validity.status === 'zone_updated') {
+        const banner = document.createElement('div');
+        banner.id = 'advice-stale-banner';
+        banner.style.cssText = 'background: rgba(6, 78, 59, 0.55); border: 2px solid #10b981; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;';
+        const newZoneStr = validity.updated_entry_zone != null ? ('$' + Number(validity.updated_entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})) : '';
+        banner.innerHTML = `
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+            <span style="font-size:1.15rem;">🎯</span>
+            <strong style="color:#6ee7b7; font-size:0.95rem; text-transform:uppercase; letter-spacing:0.5px;">VÙNG ENTRY ĐÃ ĐẠT ${newZoneStr ? `(${newZoneStr})` : ''}</strong>
+          </div>
+          <p style="color:#d1fae5; font-size:0.85rem; margin:0 0 4px 0; line-height:1.4;">${validity.reason || 'Vùng chờ Entry đã thay đổi theo chỉ báo mới nhất. Giá hiện tại đã nằm trong vùng này — có thể cân nhắc vào lệnh ngay.'}</p>
+        `;
+        if (targetContainer) {
+          targetContainer.prepend(banner);
+        }
+        setLevelsOpacity('1');
+      } else if (validity.status === 'zone_drifted') {
+        const banner = document.createElement('div');
+        banner.id = 'advice-stale-banner';
+        banner.style.cssText = 'background: rgba(146, 64, 14, 0.4); border: 1px solid #f59e0b; border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;';
+        banner.innerHTML = `
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:1rem;">⚠️</span>
+            <span style="color:#fef08a; font-size:0.85rem; line-height:1.4;">${validity.reason || 'Vùng chờ Entry đã dịch chuyển theo EMA20 mới.'}</span>
+          </div>
+        `;
+        if (targetContainer) {
+          targetContainer.prepend(banner);
+        }
+        setLevelsOpacity('0.9');
       } else if (validity.status === 'stale') {
         const banner = document.createElement('div');
         banner.id = 'advice-stale-banner';
@@ -1607,7 +1637,11 @@
         } else {
           entryValEl.textContent = '$' + Number(advice.entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           entryValEl.setAttribute('data-raw', advice.entry_zone);
-          entrySubEl.innerHTML = `⏳ Chờ giá hồi về vùng EMA20. Giá live: <span id="live-price-compare" style="color:var(--text-main); font-weight:600;">${livePriceStr}</span>`;
+          const liveEma = snapshot.indicators?.[asset]?.[targetTf]?.ema_fast;
+          const liveEmaStr = (validity && validity.updated_entry_zone != null)
+            ? ('$' + Number(validity.updated_entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4}))
+            : (liveEma != null ? ('$' + Number(liveEma).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})) : '--');
+          entrySubEl.innerHTML = `⏳ Chờ giá hồi về EMA20. Vùng EMA20 live: <span style="color:#6ee7b7; font-weight:600;">${liveEmaStr}</span> | Giá live: <span id="live-price-compare" style="color:var(--text-main); font-weight:600;">${livePriceStr}</span>`;
         }
 
         const slValEl = document.getElementById('adviceSlVal');

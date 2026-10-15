@@ -504,6 +504,57 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(adv_json["validity"]["status"], "invalidated")
         self.assertIn("vượt qua mức Cắt Lỗ", adv_json["validity"]["reason"])
 
+    def test_entry_zone_updated_when_price_reaches_new_ema(self):
+        """Tái hiện đúng case XAU: entry_zone cũ=4129.55, EMA20 mới=4135.19, 
+        giá hiện tại=4135.19 (đã chạm EMA20 mới) => status=zone_updated."""
+        advice = TradeAdvice(
+            action="SELL", entry_type="wait_pullback", 
+            entry_zone=4129.5504, entry_price=None,
+            stop_loss=4151.1098, confidence="Trung bình",
+            confidence_score=3, take_profit_1=4090.0,
+            take_profit_2=4070.0, tp2_rule="", reasoning=[],
+            conflict_detected=False, mtf_agreement=None,
+        )
+        validity = check_advice_validity(
+            advice, current_price=4135.19, current_ema_fast=4135.19, 
+            atr=14.37, cfg=CONFIG
+        )
+        
+        self.assertEqual(validity["status"], "zone_updated")
+        self.assertAlmostEqual(validity["updated_entry_zone"], 4135.19, places=2)
+        self.assertIn("thay đổi theo chỉ báo mới nhất", validity["reason"])
+
+    def test_entry_zone_drifted_but_price_not_there_yet(self):
+        """EMA20 đã đổi nhiều nhưng giá hiện tại vẫn chưa chạm vùng mới 
+        => status=zone_drifted (chỉ cảnh báo, chưa nâng cấp thành 'vào ngay')."""
+        advice = TradeAdvice(
+            action="SELL", entry_type="wait_pullback", entry_zone=4129.55,
+            entry_price=None, stop_loss=4200.0, confidence="Trung bình",
+            confidence_score=3, take_profit_1=4090.0, take_profit_2=4070.0,
+            tp2_rule="", reasoning=[], conflict_detected=False, mtf_agreement=None,
+        )
+        validity = check_advice_validity(
+            advice, current_price=4150.0, current_ema_fast=4140.0, 
+            atr=14.37, cfg=CONFIG
+        )
+        self.assertEqual(validity["status"], "zone_drifted")
+        self.assertIn("dịch chuyển", validity["reason"])
+
+    def test_entry_now_type_unaffected_by_zone_check(self):
+        """entry_type='now' (không phải wait_pullback) không được áp dụng 
+        logic zone-drift mới này."""
+        advice = TradeAdvice(
+            action="SELL", entry_type="now", entry_price=100.0, 
+            entry_zone=None, stop_loss=105.0, confidence="Trung bình",
+            confidence_score=3, take_profit_1=95.0, take_profit_2=90.0,
+            tp2_rule="", reasoning=[], conflict_detected=False, mtf_agreement=None,
+        )
+        validity = check_advice_validity(
+            advice, current_price=100.5, current_ema_fast=102.0, 
+            atr=4.0, cfg=CONFIG
+        )
+        self.assertEqual(validity["status"], "fresh")
+
 
 if __name__ == "__main__":
     unittest.main()
