@@ -263,6 +263,21 @@ Trên Botkeep dashboard:
 
 ## 13. Lịch sử phiên bản (Changelog)
 
+### Changelog v1.4 (Paper-Tracking Forward-Test & Performance Analytics)
+- **[New Module - SignalOutcomeTracker]** Hệ thống paper-tracking/forward-testing tự động theo dõi vòng đời các khuyến nghị giao dịch từ ConfluenceDecisionEngine:
+  - Vòng đời lệnh 9 trạng thái: `pending_entry`, `open`, `partial_tp1`, `partial_tp2`, `closed_tp3`, `closed_sl`, `expired`, `invalidated`, `ambiguous`.
+  - Cơ chế chống Look-Ahead Bias: Nến fill entry không được dùng để xét TP/SL; track cũ được update trước khi xét tạo track mới.
+  - Xử lý Ambiguous Candle: Nến cùng lúc quét TP và SL được đánh dấu `AMBIGUOUS` và loại khỏi mẫu win/loss chính.
+  - Partial TP đa tầng (40% / 35% / 25%) và tính toán R-Multiple có trọng số (`weighted_r`).
+  - Quản trị cơ sở dữ liệu SQLite bounded: file `./data/signal_tracker.db` $\le 20$MB, WAL mode, tự động trim bản ghi terminal cũ khi vượt quá 500 records.
+- **[New UI - Section Hiệu Suất Đề Xuất]** Tab/Section mới trên Web Dashboard:
+  - Disclaimer pháp lý & kỹ thuật cố định.
+  - Grid 6 KPI cards: Profit Factor, Expectancy, Max Drawdown, Win Rate, Entry Fill Rate, Mẫu hợp lệ (kèm cảnh báo nếu $<30$ lệnh).
+  - Biểu đồ Equity Curve (SVG thuần, zero-dependency, polling 30s/lần không gây tải).
+  - Bảng Recent Tracks kèm bộ lọc đa chiều (Tài sản, Khung giờ, Độ tin cậy, Hướng lệnh).
+- **[New API]** Endpoint `GET /api/performance` và mở rộng `GET /api/snapshot` với trường `tracker_summary`.
+- **[Unit Tests]** 10 test case mới bao phủ 100% edge cases (37/37 tests passed).
+
 ### Changelog v1.3 (Hotfix — Entry Zone Staleness & Dynamic Pullback Refresh)
 - **[Fixed - Critical]** Mở rộng `check_advice_validity()` tiếp nhận `current_ema_fast` thời gian thực để khắc phục hiện tượng trôi vùng chờ Entry (`entry_zone`) cho loại lệnh `wait_pullback`.
 - **[UX - Smart Trigger]** Tự động phát hiện khi giá live đã chạm vào vùng EMA20 mới (`zone_updated`), hiển thị Banner xanh `🎯 VÙNG ENTRY ĐÃ ĐẠT` gợi ý trader vào lệnh ngay thay vì thụ động chờ mốc cũ đã lỗi thời.

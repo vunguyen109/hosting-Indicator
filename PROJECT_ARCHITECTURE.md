@@ -81,6 +81,7 @@ hosting-Indicator/
 | **Section 3: Indicators** | `IndicatorEngine` | Pure-math không dùng numpy: <br>• **EMA**: Hệ số $k = 2 / (period + 1)$<br>• **RSI**: Chu kỳ 14 theo thuật toán làm mượt Wilder<br>• **Bollinger Bands**: Chu kỳ 20, độ lệch chuẩn 2.0<br>• **ATR**: Chu kỳ 14 theo thuật toán Wilder. |
 | **Section 4: Rules** | `RuleEngine`, `Signal` | So sánh snapshot hiện tại với snapshot trước đó:<br>• **Golden/Death Cross**: EMA20 cắt lên/cắt xuống EMA50<br>• **RSI Overbought/Oversold**: Vượt ngưỡng 70 / Thủng ngưỡng 30<br>• **Bollinger Breakout**: Giá đóng cửa vượt Upper Band hoặc thủng Lower Band<br>• **ATR Volatility Spike**: ATR hiện tại > 1.5x ATR trước đó. |
 | **Section 4.5: Confluence Engine** | `ConfluenceDecisionEngine`, `TradeAdvice` | Phân tích hợp lưu đa khung thời gian (EMA Trend, RSI Zone, Vị trí BB, Tín hiệu mâu thuẫn gần đây, MTF Agreement) để sinh khuyến nghị BUY/SELL/WAIT kèm điểm Entry, Stop Loss, Take Profit 1 & 2.<br>**Phạm vi:** Chỉ phục vụ hiển thị UI qua `/api/snapshot`, **KHÔNG tích hợp với TelegramDispatcher**. |
+| **Section 4.6: Signal Outcome Tracker** | `SignalOutcomeTracker`, `SignalTrack`, `TrackStatus` | Hệ thống paper-tracking/forward-testing các khuyến nghị giao dịch: theo dõi vòng đời lệnh (Pending Entry, Open, Partial TP, Stop Loss, Expiry), chống look-ahead bias, tính toán Profit Factor, Expectancy R, Max Drawdown, lưu trữ SQLite bounded (≤20MB, WAL mode). |
 | **Section 5: Telegram** | `TelegramDispatcher` | Gửi tin nhắn bất đồng bộ qua Telegram Bot API, tự retry tối đa 3 lần với exponential backoff (1s, 2s, 4s). Tự động chuyển chế độ Console Mode nếu không có token. |
 | **Section 6: Fetchers** | `BinanceFetcher`, `TwelveDataFetcher` | • Binance: Lấy klines công khai, tự động loại bỏ cây nến chưa đóng cuối cùng.<br>• TwelveData: Lấy nến Vàng & Dầu, tích hợp cơ chế throttle tối thiểu **8.0 giây giữa 2 request** để tránh vượt giới hạn 8 req/min của gói Free. |
 | **Section 7: Persistence** | `StatePersistence` | Ghi trạng thái định kỳ 15 phút một lần xuống `./data/state.json`. Dùng kỹ thuật ghi ra temp file rồi `os.replace` để đảm bảo tính nguyên tử (atomic) trên POSIX. Tự động trim dữ liệu nếu vượt ngưỡng trần 1.5MB. |
@@ -118,6 +119,20 @@ Phân tích hợp lưu đa khung thời gian để sinh khuyến nghị BUY/SELL
   - Khởi tạo đầy đủ buffer 300 nến 4h và vòng lặp `_asset_loop` theo chu kỳ 14,400 giây.
   - Nâng cấp `TIMEFRAME_ORDER` và logic hợp lưu MTF: Khung 4h được dùng làm khung tham chiếu xu hướng dài hạn cho khung 1h.
   - Giao diện Web Dashboard: Thêm nút chuyển khung `4 Giờ (Swing)` trên Controls Bar, hỗ trợ vẽ biểu đồ nến Lightweight Charts 4h, cập nhật Gauge tâm lý và sinh khuyến nghị Trade Advice swing cho khung 4h.
+
+### Section 4.6: SignalOutcomeTracker (Paper-tracking & Forward-testing)
+Theo dõi kết quả thực tế của các khuyến nghị giao dịch theo phương pháp forward-test giả lập:
+- **Nguyên tắc cốt lõi:** CHỈ sử dụng nến OHLC đã đóng. Tuyệt đối không mở lệnh thật, không kết nối sàn/broker, không khẳng định lợi nhuận chắc chắn.
+- **Chống Look-Ahead Bias:** Cây nến khớp Entry KHÔNG được dùng để xét TP/SL. Cập nhật nến đóng cho track cũ TRƯỚC khi xét tạo track mới từ advice.
+- **Ambiguous Candle:** Nếu trong cùng 1 nến OHLC vừa chạm SL vừa chạm TP tiếp theo, trạng thái được đánh dấu `AMBIGUOUS` và loại khỏi thống kê chính.
+- **Lưu trữ Bounded SQLite:** File `./data/signal_tracker.db` tối đa 20MB, WAL mode, tự động trim bản ghi terminal cũ nhất khi vượt 500 records.
+
+### Changelog v1.4 (Tích Hợp SignalOutcomeTracker & Hiệu Suất Đề Xuất)
+- [New Feature] Bổ sung module `SignalOutcomeTracker`: Quản lý vòng đời `TrackStatus` (`pending_entry`, `open`, `partial_tp1`, `partial_tp2`, `closed_tp3`, `closed_sl`, `expired`, `invalidated`, `ambiguous`).
+- [New Feature] Engine tính toán chỉ số hiệu suất định lượng: Win Rate, Profit Factor, Expectancy R, Max Drawdown, Equity Curve, cảnh báo mẫu thống kê $<30$ lệnh.
+- [New API] Endpoint `GET /api/performance` và bổ sung `tracker_summary` vào `GET /api/snapshot`.
+- [New UI] Section "Hiệu Suất Đề Xuất": Disclaimer pháp lý, 6 KPI cards, SVG Equity Curve thuần (zero lib ngoài) và Bảng Recent Tracks kèm bộ lọc đa năng.
+- [Database] Cấp phát dung lượng đĩa: `data/signal_tracker.db: tối đa 20MB`.
 
 ---
 
@@ -270,7 +285,46 @@ Server lắng nghe mặc định tại `0.0.0.0:${SERVER_PORT:-8080}`:
     "telegram_chat_id": "YOUR_CHAT_ID"
   }
   ```
-- **Hành vi:** Cập nhật biến trong `CONFIG`, ghi cập nhật vào `.env`, kích hoạt `TwelveDataFetcher` / `TelegramDispatcher` và kích hoạt tác vụ nền tải nến lịch sử cho Vàng & Dầu ngay lập tức.
+### 6. `GET /api/performance`
+- **Chức năng:** Trả về toàn bộ chỉ số hiệu suất định lượng (Paper-tracking Forward-test) và lịch sử khuyến nghị gần nhất.
+- **Query Params:**
+  - `asset`: `BTC` | `XAU` | `OIL` | `ALL` (mặc định: `ALL`).
+  - `tf`: `1h` | `4h` | `ALL` (mặc định: `ALL`).
+  - `confidence`: `Cao` | `Trung bình` | `ALL` (mặc định: `ALL`).
+  - `limit`: `10`..`100` (mặc định: `20`).
+- **Response mẫu:**
+  ```json
+  {
+    "status": "ok",
+    "tracking_mode": "paper_forward_test",
+    "last_updated": "2026-10-15 13:00:00 UTC",
+    "filters": { "asset": "ALL", "timeframe": "ALL", "confidence": "ALL" },
+    "metrics": {
+      "total_tracks": 45,
+      "active_tracks": 3,
+      "closed_count": 34,
+      "win_count": 19,
+      "loss_count": 15,
+      "expired_count": 5,
+      "invalidated_count": 2,
+      "ambiguous_count": 1,
+      "entry_fill_rate_pct": 82.2,
+      "tp1_hit_rate_pct": 61.8,
+      "tp2_hit_rate_pct": 44.1,
+      "tp3_hit_rate_pct": 26.5,
+      "win_rate_pct": 55.9,
+      "profit_factor": 1.42,
+      "expectancy_r": 0.18,
+      "average_r": 0.18,
+      "total_r": 6.12,
+      "max_drawdown_r": -3.40,
+      "equity_curve_r": [ ... ],
+      "sample_size_warning": null
+    },
+    "recent_tracks": [ ... ],
+    "disclaimer": "Đây là kết quả paper-tracking dựa trên nến OHLC đã đóng..."
+  }
+  ```
 
 ---
 
@@ -291,6 +345,8 @@ Khi tiếp nhận dự án để thực hiện nâng cấp, cần đặc biệt 
    - Các ngưỡng phân loại trong `ConfluenceDecisionEngine` (`EMA_TREND_*`, `RSI_*`, `BB_EDGE_ZONE_PCT`) là giá trị heuristic ban đầu, **CẦN backtest định lượng** trên dữ liệu lịch sử thực tế của từng asset trước khi coi là đáng tin cậy cho giao dịch thật.
 6. **Mở rộng kênh thông báo Advice (Telegram/Discord):**
    - Hiện tại `TradeAdvice` **CHỈ phục vụ hiển thị trên Web Dashboard** qua `/api/snapshot`. Nếu trong tương lai cần mở rộng phát tín hiệu Advice sang Telegram, đây sẽ là một tính năng riêng cần đặc tả cơ chế chống spam/dedup bổ sung.
+7. **Hạn chế của OHLC đối với Nến Mơ Hồ (Ambiguous Candle):**
+   - SignalOutcomeTracker dựa trên OHLC nên không thể xác định thứ tự giá chạm Entry/TP/SL trong cùng một nến. Các trường hợp này bị đánh dấu `AMBIGUOUS` và loại khỏi thống kê chính. Muốn đánh giá chính xác hơn cần dữ liệu timeframe thấp hơn hoặc tick data, nhưng không nằm trong phạm vi hosting low-resource hiện tại.
 
 ---
 

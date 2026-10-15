@@ -671,9 +671,107 @@
       color: #fff;
       font-size: 0.85rem;
     }
-    .modal-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-    .btn-primary { background: #2563eb; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; }
-    .btn-secondary { background: #334155; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
+    /* Performance Tracker Styles */
+    .perf-disclaimer {
+      background: rgba(245, 158, 11, 0.08);
+      border-left: 4px solid var(--gold);
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      color: #fef3c7;
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .kpi-card {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .kpi-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .kpi-val {
+      font-size: 1.45rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .kpi-sub {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+    }
+    .val-green { color: var(--green) !important; }
+    .val-yellow { color: var(--gold) !important; }
+    .val-red { color: var(--red) !important; }
+    .val-muted { color: var(--text-muted) !important; }
+
+    .perf-filter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 14px;
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 8px;
+    }
+    .perf-filter-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-right: 4px;
+    }
+    .perf-filter-btn {
+      background: #1e293b;
+      color: var(--text-muted);
+      border: 1px solid var(--card-border);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .perf-filter-btn.active, .perf-filter-btn:hover {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    .svg-equity-container {
+      width: 100%;
+      height: 220px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 8px;
+      border: 1px solid var(--card-border);
+      position: relative;
+      margin-bottom: 20px;
+      overflow: hidden;
+    }
+    .svg-equity-container svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .status-badge-track {
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
   </style>
 </head>
 <body>
@@ -950,6 +1048,118 @@
         <div style="text-align:center;color:var(--text-muted);padding:30px;">
           Chưa có tín hiệu bất thường. Hệ thống đang theo dõi 24/7...
         </div>
+      </div>
+    </div>
+
+    <!-- SECTION: HIỆU SUẤT ĐỀ XUẤT (PAPER-TRACKING) -->
+    <div class="card" id="cardPerformanceTracker">
+      <div class="card-header">
+        <div class="card-title">
+          <span>📊 Hiệu Suất Đề Xuất (Paper-Tracking Forward-Test)</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span id="sampleWarningBadge" class="status-badge" style="background:rgba(245,158,11,0.12);color:var(--gold);border-color:rgba(245,158,11,0.3);display:none;">⚠️ Chưa đủ dữ liệu</span>
+          <span style="font-size:0.8rem;color:var(--text-muted);" id="perfLastUpdated">--</span>
+        </div>
+      </div>
+
+      <!-- 11.1 Disclaimer -->
+      <div class="perf-disclaimer">
+        ⚠️ <strong>Lưu ý quan trọng:</strong> Đây là kết quả theo dõi giả lập dựa trên nến OHLC đã đóng. Chưa bao gồm spread, phí giao dịch, funding, swap và trượt giá thực tế. Không phải cam kết lợi nhuận hoặc lời khuyên đầu tư.
+      </div>
+
+      <!-- Filters -->
+      <div class="perf-filter-bar">
+        <span class="perf-filter-label">Tài sản:</span>
+        <button class="perf-filter-btn active" data-filter="asset" data-val="ALL" onclick="setPerfFilter('asset', 'ALL')">Tất cả</button>
+        <button class="perf-filter-btn" data-filter="asset" data-val="BTC" onclick="setPerfFilter('asset', 'BTC')">BTC</button>
+        <button class="perf-filter-btn" data-filter="asset" data-val="XAU" onclick="setPerfFilter('asset', 'XAU')">XAU</button>
+        <button class="perf-filter-btn" data-filter="asset" data-val="OIL" onclick="setPerfFilter('asset', 'OIL')">OIL</button>
+
+        <span class="perf-filter-label" style="margin-left:10px;">Khung:</span>
+        <button class="perf-filter-btn active" data-filter="tf" data-val="ALL" onclick="setPerfFilter('tf', 'ALL')">Tất cả</button>
+        <button class="perf-filter-btn" data-filter="tf" data-val="1h" onclick="setPerfFilter('tf', '1h')">1h</button>
+        <button class="perf-filter-btn" data-filter="tf" data-val="4h" onclick="setPerfFilter('tf', '4h')">4h</button>
+
+        <span class="perf-filter-label" style="margin-left:10px;">Độ tin cậy:</span>
+        <button class="perf-filter-btn active" data-filter="conf" data-val="ALL" onclick="setPerfFilter('conf', 'ALL')">Tất cả</button>
+        <button class="perf-filter-btn" data-filter="conf" data-val="Cao" onclick="setPerfFilter('conf', 'Cao')">Cao</button>
+        <button class="perf-filter-btn" data-filter="conf" data-val="Trung bình" onclick="setPerfFilter('conf', 'Trung bình')">Trung bình</button>
+
+        <span class="perf-filter-label" style="margin-left:10px;">Hướng:</span>
+        <button class="perf-filter-btn active" data-filter="dir" data-val="ALL" onclick="setPerfFilter('dir', 'ALL')">Tất cả</button>
+        <button class="perf-filter-btn" data-filter="dir" data-val="BUY" onclick="setPerfFilter('dir', 'BUY')">BUY</button>
+        <button class="perf-filter-btn" data-filter="dir" data-val="SELL" onclick="setPerfFilter('dir', 'SELL')">SELL</button>
+      </div>
+
+      <!-- 11.2 KPI Cards -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">Profit Factor</div>
+          <div class="kpi-val" id="kpiProfitFactor">--</div>
+          <div class="kpi-sub" id="kpiProfitFactorSub">Tổng lời R / Tổng lỗ R</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Expectancy (Kỳ vọng)</div>
+          <div class="kpi-val" id="kpiExpectancy">--</div>
+          <div class="kpi-sub">Kỳ vọng lợi nhuận / lệnh</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Max Drawdown</div>
+          <div class="kpi-val val-red" id="kpiMaxDrawdown">--</div>
+          <div class="kpi-sub">Sụt giảm lớn nhất từ đỉnh</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Win Rate</div>
+          <div class="kpi-val" id="kpiWinRate">--</div>
+          <div class="kpi-sub" id="kpiWinCountSub">0 thắng / 0 lệnh</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Entry Fill Rate</div>
+          <div class="kpi-val" id="kpiFillRate">--</div>
+          <div class="kpi-sub">Tỉ lệ tín hiệu khớp điểm vào</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Mẫu Đã Đóng Hợp Lệ</div>
+          <div class="kpi-val" id="kpiSampleSize">--</div>
+          <div class="kpi-sub" id="kpiSampleSizeSub">Yêu cầu tối thiểu 30 lệnh</div>
+        </div>
+      </div>
+
+      <!-- 11.3 Equity Curve Chart (Pure SVG) -->
+      <div style="margin-bottom:8px;font-size:0.85rem;font-weight:600;display:flex;justify-content:space-between;align-items:center;">
+        <span>📈 Biểu Đồ Tăng Trưởng Vốn (Equity Curve theo R-Multiple)</span>
+        <span style="font-size:0.75rem;color:var(--text-muted);">Trục X: Số lệnh | Trục Y: Tổng R tích lũy</span>
+      </div>
+      <div class="svg-equity-container" id="equityChartContainer">
+        <svg id="equitySvg" viewBox="0 0 800 220" preserveAspectRatio="none">
+          <text x="400" y="110" fill="#94a3b8" font-size="14" text-anchor="middle">Đang tải dữ liệu tăng trưởng...</text>
+        </svg>
+      </div>
+
+      <!-- 11.4 Recent Tracks Table -->
+      <div style="margin-bottom:8px;font-size:0.85rem;font-weight:600;">
+        <span>📋 Lịch Sử Khuyến Nghị Gần Đây</span>
+      </div>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Thời gian</th>
+              <th>Tài sản</th>
+              <th>Khung</th>
+              <th>Hướng</th>
+              <th>Độ tin cậy</th>
+              <th style="text-align:right;">Entry</th>
+              <th>Kết quả / Ghi chú</th>
+              <th style="text-align:right;">Realized R</th>
+              <th>Trạng thái</th>
+            </tr>
+          </thead>
+          <tbody id="recentTracksTbody">
+            <tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:24px;">Đang tải danh sách theo dõi...</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -1781,17 +1991,282 @@
       }
     }
 
+    // --- PERFORMANCE TRACKER (PAPER-TRACKING FORWARD-TEST) ---
+    const perfFilters = {
+      asset: 'ALL',
+      tf: 'ALL',
+      conf: 'ALL',
+      dir: 'ALL'
+    };
+    let cachedPerfJsonStr = '';
+
+    function setPerfFilter(category, val) {
+      perfFilters[category] = val;
+      document.querySelectorAll(`.perf-filter-btn[data-filter="${category}"]`).forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-val') === val);
+      });
+      fetchPerformanceData();
+    }
+
+    async function fetchPerformanceData() {
+      try {
+        const query = new URLSearchParams({
+          asset: perfFilters.asset,
+          tf: perfFilters.tf,
+          confidence: perfFilters.conf,
+          limit: '50'
+        });
+        const res = await fetch(`/api/performance?${query.toString()}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const jsonStr = JSON.stringify(data);
+        if (jsonStr === cachedPerfJsonStr) return; // Không redraw nếu dữ liệu không đổi
+        cachedPerfJsonStr = jsonStr;
+        renderPerformance(data);
+      } catch (err) {
+        console.error('Error fetching performance metrics:', err);
+      }
+    }
+
+    function renderPerformance(data) {
+      if (!data || !data.metrics) return;
+      const m = data.metrics;
+
+      // Update timestamp
+      const timeEl = document.getElementById('perfLastUpdated');
+      if (timeEl) timeEl.textContent = data.last_updated || '';
+
+      // Sample size warning badge
+      const warnBadge = document.getElementById('sampleWarningBadge');
+      if (warnBadge) {
+        if (m.sample_size_warning) {
+          warnBadge.style.display = 'inline-flex';
+          warnBadge.textContent = '⚠️ ' + m.sample_size_warning;
+        } else {
+          warnBadge.style.display = 'none';
+        }
+      }
+
+      // 1. Profit Factor
+      const pfEl = document.getElementById('kpiProfitFactor');
+      const pfSub = document.getElementById('kpiProfitFactorSub');
+      if (pfEl) {
+        if (m.closed_count < 30) {
+          pfEl.textContent = m.profit_factor !== null ? m.profit_factor.toFixed(2) : '--';
+          pfEl.className = 'kpi-val val-muted';
+          if (pfSub) pfSub.textContent = 'Chưa đủ 30 mẫu để khẳng định';
+        } else if (m.profit_factor === null) {
+          pfEl.textContent = 'N/A';
+          pfEl.className = 'kpi-val val-muted';
+          if (pfSub) pfSub.textContent = 'Không có lệnh lỗ';
+        } else {
+          pfEl.textContent = m.profit_factor.toFixed(2);
+          if (m.profit_factor > 1.2) pfEl.className = 'kpi-val val-green';
+          else if (m.profit_factor >= 1.0) pfEl.className = 'kpi-val val-yellow';
+          else pfEl.className = 'kpi-val val-red';
+          if (pfSub) pfSub.textContent = m.profit_factor >= 1.0 ? 'Hệ thống có lợi thế thống kê' : 'Hệ thống đang âm vốn';
+        }
+      }
+
+      // 2. Expectancy
+      const expEl = document.getElementById('kpiExpectancy');
+      if (expEl) {
+        const sign = m.expectancy_r > 0 ? '+' : '';
+        expEl.textContent = `${sign}${m.expectancy_r.toFixed(2)}R / lệnh`;
+        expEl.className = 'kpi-val ' + (m.expectancy_r > 0 ? 'val-green' : (m.expectancy_r < 0 ? 'val-red' : 'val-muted'));
+      }
+
+      // 3. Max Drawdown
+      const ddEl = document.getElementById('kpiMaxDrawdown');
+      if (ddEl) {
+        ddEl.textContent = `${m.max_drawdown_r.toFixed(2)}R`;
+      }
+
+      // 4. Win Rate
+      const wrEl = document.getElementById('kpiWinRate');
+      const wcSub = document.getElementById('kpiWinCountSub');
+      if (wrEl) {
+        wrEl.textContent = `${m.win_rate_pct.toFixed(1)}%`;
+        if (wcSub) wcSub.textContent = `${m.win_count} thắng / ${m.win_count + m.loss_count} lệnh đóng`;
+      }
+
+      // 5. Entry Fill Rate
+      const frEl = document.getElementById('kpiFillRate');
+      if (frEl) {
+        frEl.textContent = `${m.entry_fill_rate_pct.toFixed(1)}%`;
+      }
+
+      // 6. Sample Size
+      const ssEl = document.getElementById('kpiSampleSize');
+      const ssSub = document.getElementById('kpiSampleSizeSub');
+      if (ssEl) {
+        ssEl.textContent = `${m.closed_count} / 30`;
+        if (m.closed_count >= 30) {
+          ssEl.className = 'kpi-val val-green';
+          if (ssSub) ssSub.textContent = 'Đủ điều kiện thống kê tin cậy';
+        } else {
+          ssEl.className = 'kpi-val val-yellow';
+          if (ssSub) ssSub.textContent = `Cần thêm ${30 - m.closed_count} lệnh nữa`;
+        }
+      }
+
+      // Render Equity Curve (SVG)
+      renderEquitySvg(m.equity_curve_r || []);
+
+      // Render Recent Tracks Table
+      renderRecentTracks(data.recent_tracks || []);
+    }
+
+    function renderEquitySvg(curve) {
+      const svg = document.getElementById('equitySvg');
+      if (!svg) return;
+
+      if (!curve || curve.length === 0) {
+        svg.innerHTML = `
+          <line x1="0" y1="110" x2="800" y2="110" stroke="#334155" stroke-dasharray="4,4" />
+          <text x="400" y="115" fill="#94a3b8" font-size="13" text-anchor="middle">Chưa có lệnh đóng để vẽ biểu đồ tăng trưởng (cần ít nhất 1 lệnh kết thúc)</text>
+        `;
+        return;
+      }
+
+      const points = [{ cumulative_r: 0.0, track_id: 'Start' }, ...curve];
+      let minR = 0.0;
+      let maxR = 0.0;
+      points.forEach(p => {
+        if (p.cumulative_r < minR) minR = p.cumulative_r;
+        if (p.cumulative_r > maxR) maxR = p.cumulative_r;
+      });
+
+      const range = (maxR - minR) || 2.0;
+      const padY = range * 0.15;
+      const yMin = minR - padY;
+      const yMax = maxR + padY;
+
+      const W = 800;
+      const H = 220;
+      const pL = 50;
+      const pR = 20;
+      const pT = 20;
+      const pB = 30;
+
+      function toX(idx) {
+        if (points.length <= 1) return pL;
+        return pL + (idx / (points.length - 1)) * (W - pL - pR);
+      }
+      function toY(val) {
+        return pT + (1 - (val - yMin) / (yMax - yMin)) * (H - pT - pB);
+      }
+
+      const zeroY = toY(0.0);
+      const coords = points.map((p, i) => `${toX(i).toFixed(1)},${toY(p.cumulative_r).toFixed(1)}`).join(' ');
+      const areaCoords = `${toX(0)},${zeroY} ` + coords + ` ${toX(points.length - 1)},${zeroY}`;
+
+      const isProfit = points[points.length - 1].cumulative_r >= 0;
+      const strokeColor = isProfit ? '#10b981' : '#ef4444';
+      const gradId = isProfit ? 'gradGreen' : 'gradRed';
+
+      svg.innerHTML = `
+        <defs>
+          <linearGradient id="gradGreen" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#10b981" stop-opacity="0.35"/>
+            <stop offset="100%" stop-color="#10b981" stop-opacity="0.0"/>
+          </linearGradient>
+          <linearGradient id="gradRed" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#ef4444" stop-opacity="0.35"/>
+            <stop offset="100%" stop-color="#ef4444" stop-opacity="0.0"/>
+          </linearGradient>
+        </defs>
+
+        <line x1="${pL}" y1="${toY(yMax - padY)}" x2="${W - pR}" y2="${toY(yMax - padY)}" stroke="#1e293b" stroke-width="1" />
+        <line x1="${pL}" y1="${zeroY}" x2="${W - pR}" y2="${zeroY}" stroke="#475569" stroke-width="1.5" stroke-dasharray="3,3" />
+        <line x1="${pL}" y1="${toY(yMin + padY)}" x2="${W - pR}" y2="${toY(yMin + padY)}" stroke="#1e293b" stroke-width="1" />
+
+        <text x="${pL - 8}" y="${zeroY + 4}" fill="#94a3b8" font-size="11" text-anchor="end">0.0R</text>
+        <text x="${pL - 8}" y="${toY(maxR) + 4}" fill="#10b981" font-size="11" text-anchor="end">+${maxR.toFixed(1)}R</text>
+        ${minR < 0 ? `<text x="${pL - 8}" y="${toY(minR) + 4}" fill="#ef4444" font-size="11" text-anchor="end">${minR.toFixed(1)}R</text>` : ''}
+
+        <polygon points="${areaCoords}" fill="url(#${gradId})" />
+        <polyline fill="none" stroke="${strokeColor}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="${coords}" />
+
+        ${points.map((p, i) => `
+          <circle cx="${toX(i)}" cy="${toY(p.cumulative_r)}" r="3" fill="${p.cumulative_r >= 0 ? '#10b981' : '#ef4444'}" stroke="#090d16" stroke-width="1.5">
+            <title>Lệnh ${i}: ${p.cumulative_r >= 0 ? '+' : ''}${p.cumulative_r}R</title>
+          </circle>
+        `).join('')}
+
+        <text x="${toX(points.length - 1)}" y="${H - 8}" fill="#94a3b8" font-size="11" text-anchor="middle">Lệnh #${points.length - 1}</text>
+      `;
+    }
+
+    function renderRecentTracks(tracks) {
+      const tbody = document.getElementById('recentTracksTbody');
+      if (!tbody) return;
+
+      let filtered = tracks;
+      if (perfFilters.dir !== 'ALL') {
+        filtered = filtered.filter(t => t.direction === perfFilters.dir);
+      }
+
+      if (!filtered || filtered.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:24px;">Không có khuyến nghị nào phù hợp với bộ lọc.</td></tr>`;
+        return;
+      }
+
+      const statusMap = {
+        'pending_entry': { icon: '⏳', label: 'Chờ khớp entry', bg: 'rgba(245,158,11,0.15)', col: '#f59e0b' },
+        'open':          { icon: '🔵', label: 'Đang mở',        bg: 'rgba(59,130,246,0.15)', col: '#3b82f6' },
+        'partial_tp1':   { icon: '🟢', label: 'Đạt TP1, còn vị thế', bg: 'rgba(16,185,129,0.15)', col: '#10b981' },
+        'partial_tp2':   { icon: '🟢', label: 'Đạt TP2, còn vị thế', bg: 'rgba(16,185,129,0.20)', col: '#10b981' },
+        'closed_tp3':    { icon: '✅', label: 'Hoàn tất TP3',   bg: 'rgba(16,185,129,0.25)', col: '#10b981' },
+        'closed_sl':     { icon: '🔴', label: 'Chạm Stop Loss', bg: 'rgba(239,68,68,0.15)', col: '#ef4444' },
+        'expired':       { icon: '⌛', label: 'Hết thời hạn',   bg: 'rgba(148,163,184,0.15)', col: '#94a3b8' },
+        'invalidated':   { icon: '🚫', label: 'Bị vô hiệu trước Entry', bg: 'rgba(239,68,68,0.1)', col: '#ef4444' },
+        'ambiguous':     { icon: '⚠️', label: 'Không xác định TP/SL nến', bg: 'rgba(245,158,11,0.2)', col: '#f59e0b' },
+      };
+
+      tbody.innerHTML = filtered.map(t => {
+        const st = statusMap[t.status] || { icon: '⚪', label: t.status, bg: 'rgba(255,255,255,0.05)', col: '#fff' };
+        const dirCol = t.direction === 'BUY' ? 'var(--green)' : 'var(--red)';
+        const rVal = t.realized_r || 0.0;
+        const rSign = rVal > 0 ? '+' : '';
+        const rCol = rVal > 0 ? 'var(--green)' : (rVal < 0 ? 'var(--red)' : 'var(--text-muted)');
+        const entryStr = t.actual_entry ? Number(t.actual_entry).toLocaleString() : (t.planned_entry ? Number(t.planned_entry).toLocaleString() : '--');
+
+        return `
+          <tr>
+            <td style="font-size:0.78rem;color:var(--text-muted);white-space:nowrap;">${t.created_at_str || ''}</td>
+            <td><strong>${t.asset}</strong></td>
+            <td><span class="conf-tag conf-mid">${t.timeframe}</span></td>
+            <td><strong style="color:${dirCol};">${t.direction}</strong></td>
+            <td><span style="font-size:0.8rem;">${t.confidence} (${t.confidence_score}/5)</span></td>
+            <td style="text-align:right;font-family:monospace;font-weight:600;">$${entryStr}</td>
+            <td style="font-size:0.8rem;color:#cbd5e1;max-width:260px;">${t.result_note || '--'}</td>
+            <td style="text-align:right;font-family:monospace;font-weight:700;color:${rCol};">${rSign}${rVal.toFixed(2)}R</td>
+            <td>
+              <span class="status-badge-track" style="background:${st.bg};color:${st.col};border:1px solid ${st.col}40;">
+                ${st.icon} ${st.label}
+              </span>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
     // --- VÒNG LẶP CẬP NHẬT (PERFORMANCE GUARDRAILS) ---
     window.addEventListener('DOMContentLoaded', () => {
       initChart();
       updateDashboard();
       fetchCandleData();
+      fetchPerformanceData();
 
       // Snapshot số liệu & tín hiệu: mỗi 3 giây
       setInterval(updateDashboard, 3000);
 
       // Biểu đồ nến: mỗi 15 giây (tiết kiệm băng thông & tải render canvas)
       setInterval(fetchCandleData, 15000);
+
+      // Hiệu suất đề xuất (Paper-tracking): mỗi 30 giây (tiết kiệm CPU & I/O)
+      setInterval(fetchPerformanceData, 30000);
     });
   </script>
 </body>

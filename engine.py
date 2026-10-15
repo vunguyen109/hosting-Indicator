@@ -18,14 +18,17 @@ Memory strategy:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import json
 import logging
 import math
 import os
+import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
@@ -244,6 +247,15 @@ CONFIG = {
     # ---- Disk watchdog --------------------------------------------------
     "disk_alert_threshold_pct": 70,      # alert when disk > 70 %
     "disk_check_interval":      21600,   # check every 6 hours
+
+    # ---- Signal Outcome Tracker (Paper-tracking / Forward-testing) ------
+    "TRACKER_ENABLED_TIMEFRAMES":   ["1h", "4h"],
+    "TRACK_PENDING_EXPIRY_CANDLES": {"1h": 12, "4h": 8},
+    "TRACK_OPEN_EXPIRY_CANDLES":    {"1h": 72, "4h": 30},
+    "TRACKER_DEFAULT_LEVERAGE":     5,
+    "TRACKER_MAX_HISTORY_RECORDS":  500,
+    "TRACKER_MAX_DB_SIZE_MB":       20,
+    "TRACKER_DB_PATH":              os.environ.get("TRACKER_DB_PATH", "./data/signal_tracker.db"),
 }
 
 # Timeframe identifier -> seconds
@@ -634,19 +646,19 @@ class AdviceValidityStatus(str, Enum):
 
 @dataclass
 class TradeAdvice:
-    action: str                    # BUY / SELL / WAIT
-    confidence: str                # Cao / Trung bình / Thấp
-    confidence_score: int          # 0-5, số yếu tố đồng thuận
-    entry_type: str                # "now" / "wait_pullback" / "none"
-    entry_price: Optional[float]
-    entry_zone: Optional[float]    # giá EMA20 (vùng chờ pullback)
-    stop_loss: Optional[float]
-    take_profit_1: Optional[float]
-    take_profit_2: Optional[float]
-    tp2_rule: str                  # mô tả quy tắc trailing bằng text
-    reasoning: list[str]           # checklist lý do (để hiển thị UI)
-    conflict_detected: bool
-    mtf_agreement: Optional[bool]  # None nếu không có dữ liệu khung kia
+    action: str = "WAIT"                    # BUY / SELL / WAIT
+    confidence: str = "Thấp"                # Cao / Trung bình / Thấp
+    confidence_score: int = 0               # 0-5, số yếu tố đồng thuận
+    entry_type: str = "none"                # "now" / "wait_pullback" / "none"
+    entry_price: Optional[float] = None
+    entry_zone: Optional[float] = None      # giá EMA20 (vùng chờ pullback)
+    stop_loss: Optional[float] = None
+    take_profit_1: Optional[float] = None
+    take_profit_2: Optional[float] = None
+    tp2_rule: str = ""                      # mô tả quy tắc trailing bằng text
+    reasoning: list[str] = field(default_factory=list) # checklist lý do (để hiển thị UI)
+    conflict_detected: bool = False
+    mtf_agreement: Optional[bool] = None    # None nếu không có dữ liệu khung kia
     counter_move_detected: bool = False
     counter_move_magnitude_atr: float = 0.0
     swing_mode: bool = False
@@ -654,6 +666,7 @@ class TradeAdvice:
     sl_margin_loss_pct: float = 0.0
     target_feasibility: str = ""
     estimated_holding_time: str = ""
+    validity: dict = field(default_factory=lambda: {"status": "fresh", "reason": None})
     disclaimer: str = (
         "Đây là khuyến nghị dựa trên thuật toán kỹ thuật, "
         "KHÔNG PHẢI lời khuyên đầu tư. Người dùng tự chịu "
@@ -1298,6 +1311,956 @@ class ConfluenceDecisionEngine:
             target_feasibility=target_feasibility,
             estimated_holding_time=estimated_holding_time,
         )
+
+
+# =============================================================================
+# SECTION 4.6: SIGNAL OUTCOME TRACKER (Paper-tracking / Forward-testing)
+# =============================================================================
+
+class TrackStatus(str, Enum):
+    PENDING_ENTRY = "pending_entry"
+    OPEN = "open"
+    PARTIAL_TP1 = "partial_tp1"
+    PARTIAL_TP2 = "partial_tp2"
+    CLOSED_TP3 = "closed_tp3"
+    CLOSED_SL = "closed_sl"
+    EXPIRED = "expired"
+    INVALIDATED = "invalidated"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass
+class SignalTrack:
+    track_id: str
+    created_at_ts: int
+    created_at_str: str
+
+    asset: str
+    timeframe: str
+    direction: str                 # BUY / SELL
+    confidence: str
+    confidence_score: int
+
+    status: str                    # TrackStatus
+    entry_type: str                # now / wait_pullback
+    planned_entry: float
+    actual_entry: float | None
+    entry_filled_at_ts: int | None
+
+    stop_loss: float
+    tp_levels: list                # copy immutable từ advice.tp_levels
+
+    initial_advice_validity: str
+    advice_reasoning: list[str]
+
+    tp1_hit_at_ts: int | None = None
+    tp2_hit_at_ts: int | None = None
+    tp3_hit_at_ts: int | None = None
+    sl_hit_at_ts: int | None = None
+    closed_at_ts: int | None = None
+
+    realized_r: float = 0.0
+    realized_margin_pnl_pct: float = 0.0
+
+    max_favorable_excursion_r: float = 0.0
+    max_adverse_excursion_r: float = 0.0
+
+    expiry_at_ts: int = 0
+    result_note: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "track_id": self.track_id,
+            "created_at_ts": self.created_at_ts,
+            "created_at_str": self.created_at_str,
+            "asset": self.asset,
+            "timeframe": self.timeframe,
+            "direction": self.direction,
+            "confidence": self.confidence,
+            "confidence_score": self.confidence_score,
+            "status": self.status,
+            "entry_type": self.entry_type,
+            "planned_entry": self.planned_entry,
+            "actual_entry": self.actual_entry,
+            "entry_filled_at_ts": self.entry_filled_at_ts,
+            "stop_loss": self.stop_loss,
+            "tp_levels": self.tp_levels,
+            "tp1": self.tp_levels[0]["price"] if len(self.tp_levels) > 0 else None,
+            "tp2": self.tp_levels[1]["price"] if len(self.tp_levels) > 1 else None,
+            "tp3": self.tp_levels[2]["price"] if len(self.tp_levels) > 2 else None,
+            "initial_advice_validity": self.initial_advice_validity,
+            "advice_reasoning": self.advice_reasoning,
+            "tp1_hit_at_ts": self.tp1_hit_at_ts,
+            "tp2_hit_at_ts": self.tp2_hit_at_ts,
+            "tp3_hit_at_ts": self.tp3_hit_at_ts,
+            "sl_hit_at_ts": self.sl_hit_at_ts,
+            "closed_at_ts": self.closed_at_ts,
+            "realized_r": round(self.realized_r, 4),
+            "realized_margin_pnl_pct": round(self.realized_margin_pnl_pct, 2),
+            "expiry_at_ts": self.expiry_at_ts,
+            "result_note": self.result_note,
+        }
+
+
+def _normalize_pct(val: float | int) -> float:
+    """Helper to convert close_pct (e.g. 40 or 0.40) to fraction 0..1."""
+    v = float(val)
+    return v / 100.0 if v > 1.0 else v
+
+
+class SignalOutcomeTracker:
+    """
+    Paper-tracking & Forward-testing engine for TradeAdvice.
+    Evaluates outcomes strictly based on closed OHLC bars (zero look-ahead bias).
+    Bounded SQLite persistence with WAL mode & automated cleanup.
+    """
+
+    def __init__(self, db_path: str = "./data/signal_tracker.db", config: dict = None) -> None:
+        self.config = config or CONFIG
+        self.db_path = db_path or self.config.get("TRACKER_DB_PATH", "./data/signal_tracker.db")
+        self._active_tracks: dict[str, SignalTrack] = {}  # key: f"{asset}_{timeframe}"
+        self._last_vacuum_ts: float = 0.0
+        self._cached_metrics: Optional[dict] = None
+        self._cached_metrics_ts: float = 0.0
+        self._init_db()
+        self._load_active_tracks()
+
+    @contextlib.contextmanager
+    def _get_connection(self):
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def _init_db(self) -> None:
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+            except Exception as e:
+                logger.error(f"[Tracker] Could not create directory for SQLite: {e}")
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                cursor.execute("PRAGMA synchronous=NORMAL;")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS signal_tracks (
+                        track_id TEXT PRIMARY KEY,
+                        created_at_ts INTEGER NOT NULL,
+                        asset TEXT NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        confidence TEXT NOT NULL,
+                        confidence_score INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+
+                        entry_type TEXT NOT NULL,
+                        planned_entry REAL NOT NULL,
+                        actual_entry REAL,
+
+                        stop_loss REAL NOT NULL,
+                        tp1 REAL,
+                        tp2 REAL,
+                        tp3 REAL,
+
+                        realized_r REAL DEFAULT 0,
+                        realized_margin_pnl_pct REAL DEFAULT 0,
+
+                        entry_filled_at_ts INTEGER,
+                        closed_at_ts INTEGER,
+                        expiry_at_ts INTEGER NOT NULL,
+
+                        result_note TEXT,
+                        payload_json TEXT NOT NULL
+                    );
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_signal_tracks_asset_tf
+                    ON signal_tracks(asset, timeframe);
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_signal_tracks_status
+                    ON signal_tracks(status);
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_signal_tracks_created
+                    ON signal_tracks(created_at_ts);
+                """)
+                conn.commit()
+            logger.info(f"[Tracker] SQLite initialized successfully at {self.db_path}")
+        except Exception as exc:
+            logger.error(f"[Tracker] Database initialization failed: {exc}")
+
+    def _load_active_tracks(self) -> None:
+        """Load pending and open tracks from database into memory upon startup."""
+        active_statuses = (
+            TrackStatus.PENDING_ENTRY.value,
+            TrackStatus.OPEN.value,
+            TrackStatus.PARTIAL_TP1.value,
+            TrackStatus.PARTIAL_TP2.value,
+        )
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                q = f"SELECT payload_json FROM signal_tracks WHERE status IN ({','.join(['?']*len(active_statuses))})"
+                cursor.execute(q, active_statuses)
+                rows = cursor.fetchall()
+                for r in rows:
+                    try:
+                        p = json.loads(r["payload_json"])
+                        track = SignalTrack(
+                            track_id=p["track_id"],
+                            created_at_ts=p["created_at_ts"],
+                            created_at_str=p["created_at_str"],
+                            asset=p["asset"],
+                            timeframe=p["timeframe"],
+                            direction=p["direction"],
+                            confidence=p["confidence"],
+                            confidence_score=p["confidence_score"],
+                            status=p["status"],
+                            entry_type=p["entry_type"],
+                            planned_entry=p["planned_entry"],
+                            actual_entry=p.get("actual_entry"),
+                            entry_filled_at_ts=p.get("entry_filled_at_ts"),
+                            stop_loss=p["stop_loss"],
+                            tp_levels=p.get("tp_levels", []),
+                            initial_advice_validity=p.get("initial_advice_validity", "fresh"),
+                            advice_reasoning=p.get("advice_reasoning", []),
+                            tp1_hit_at_ts=p.get("tp1_hit_at_ts"),
+                            tp2_hit_at_ts=p.get("tp2_hit_at_ts"),
+                            tp3_hit_at_ts=p.get("tp3_hit_at_ts"),
+                            sl_hit_at_ts=p.get("sl_hit_at_ts"),
+                            closed_at_ts=p.get("closed_at_ts"),
+                            realized_r=p.get("realized_r", 0.0),
+                            realized_margin_pnl_pct=p.get("realized_margin_pnl_pct", 0.0),
+                            expiry_at_ts=p.get("expiry_at_ts", 0),
+                            result_note=p.get("result_note", ""),
+                        )
+                        key = f"{track.asset}_{track.timeframe}"
+                        self._active_tracks[key] = track
+                    except Exception as parse_err:
+                        logger.error(f"[Tracker] Error parsing track JSON: {parse_err}")
+            logger.info(f"[Tracker] Loaded {len(self._active_tracks)} active tracks from DB.")
+        except Exception as exc:
+            logger.error(f"[Tracker] Failed to load active tracks: {exc}")
+
+    def _save_track(self, track: SignalTrack) -> None:
+        """Upsert a track record into SQLite."""
+        try:
+            tp1 = track.tp_levels[0]["price"] if len(track.tp_levels) > 0 else None
+            tp2 = track.tp_levels[1]["price"] if len(track.tp_levels) > 1 else None
+            tp3 = track.tp_levels[2]["price"] if len(track.tp_levels) > 2 else None
+            payload_json = json.dumps(track.to_dict(), ensure_ascii=False)
+
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO signal_tracks (
+                        track_id, created_at_ts, asset, timeframe, direction,
+                        confidence, confidence_score, status, entry_type,
+                        planned_entry, actual_entry, stop_loss, tp1, tp2, tp3,
+                        realized_r, realized_margin_pnl_pct, entry_filled_at_ts,
+                        closed_at_ts, expiry_at_ts, result_note, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(track_id) DO UPDATE SET
+                        status = excluded.status,
+                        actual_entry = excluded.actual_entry,
+                        realized_r = excluded.realized_r,
+                        realized_margin_pnl_pct = excluded.realized_margin_pnl_pct,
+                        entry_filled_at_ts = excluded.entry_filled_at_ts,
+                        closed_at_ts = excluded.closed_at_ts,
+                        expiry_at_ts = excluded.expiry_at_ts,
+                        result_note = excluded.result_note,
+                        payload_json = excluded.payload_json;
+                """, (
+                    track.track_id, track.created_at_ts, track.asset, track.timeframe, track.direction,
+                    track.confidence, track.confidence_score, track.status, track.entry_type,
+                    track.planned_entry, track.actual_entry, track.stop_loss, tp1, tp2, tp3,
+                    track.realized_r, track.realized_margin_pnl_pct, track.entry_filled_at_ts,
+                    track.closed_at_ts, track.expiry_at_ts, track.result_note, payload_json
+                ))
+                conn.commit()
+        except Exception as exc:
+            logger.error(f"[Tracker] Failed to save track {track.track_id}: {exc}")
+
+    def _trim_database_if_needed(self) -> None:
+        """Keep database bounded within TRACKER_MAX_HISTORY_RECORDS and TRACKER_MAX_DB_SIZE_MB."""
+        max_records = self.config.get("TRACKER_MAX_HISTORY_RECORDS", 500)
+        max_mb = self.config.get("TRACKER_MAX_DB_SIZE_MB", 20)
+
+        terminal_statuses = (
+            TrackStatus.CLOSED_TP3.value,
+            TrackStatus.CLOSED_SL.value,
+            TrackStatus.EXPIRED.value,
+            TrackStatus.INVALIDATED.value,
+            TrackStatus.AMBIGUOUS.value,
+        )
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) as cnt FROM signal_tracks")
+                total_cnt = cursor.fetchone()["cnt"]
+
+                if total_cnt > max_records:
+                    delete_count = total_cnt - max_records
+                    cursor.execute(f"""
+                        DELETE FROM signal_tracks
+                        WHERE track_id IN (
+                            SELECT track_id FROM signal_tracks
+                            WHERE status IN ({','.join(['?']*len(terminal_statuses))})
+                            ORDER BY created_at_ts ASC
+                            LIMIT ?
+                        )
+                    """, (*terminal_statuses, delete_count))
+                    conn.commit()
+                    logger.info(f"[Tracker] Trimmed {delete_count} old terminal tracks from database.")
+
+            # Check DB file size
+            if os.path.exists(self.db_path):
+                db_size_mb = os.path.getsize(self.db_path) / (1024 * 1024)
+                now = time.time()
+                if db_size_mb > max_mb and (now - self._last_vacuum_ts) > 86400:
+                    with self._get_connection() as conn:
+                        conn.execute("VACUUM;")
+                    self._last_vacuum_ts = now
+                    logger.info(f"[Tracker] DB size {db_size_mb:.2f}MB exceeded {max_mb}MB. VACUUM executed.")
+        except Exception as exc:
+            logger.warning(f"[Tracker] Database trim error: {exc}")
+
+    def should_create_track(self, advice: TradeAdvice, asset: str, timeframe: str) -> bool:
+        """Deduplication & eligibility rules for creating a new SignalTrack."""
+        enabled_tfs = self.config.get("TRACKER_ENABLED_TIMEFRAMES", ["1h", "4h"])
+        if timeframe not in enabled_tfs:
+            return False
+
+        if advice.action not in ("BUY", "SELL"):
+            return False
+
+        if advice.confidence not in ("Cao", "Trung bình"):
+            return False
+
+        validity = getattr(advice, "validity", {})
+        val_status = validity.get("status") if isinstance(validity, dict) else str(validity)
+        if val_status == AdviceValidityStatus.INVALIDATED.value:
+            return False
+
+        entry = advice.entry_price or advice.entry_zone
+        if not entry or not advice.stop_loss:
+            return False
+
+        tp1 = advice.take_profit_1 or (advice.tp_levels[0]["price"] if advice.tp_levels else None)
+        if not tp1:
+            return False
+
+        # Stream deduplication check
+        stream_key = f"{asset}_{timeframe}"
+        active = self._active_tracks.get(stream_key)
+        if active:
+            active_statuses = (
+                TrackStatus.PENDING_ENTRY.value,
+                TrackStatus.OPEN.value,
+                TrackStatus.PARTIAL_TP1.value,
+                TrackStatus.PARTIAL_TP2.value,
+            )
+            if active.status in active_statuses:
+                if active.direction != advice.action:
+                    logger.warning(
+                        f"[Tracker] [{asset} {timeframe}] Opposite advice {advice.action} received while "
+                        f"track {active.track_id} ({active.direction}) is active ({active.status}). "
+                        f"Preserving existing track until resolution."
+                    )
+                return False
+
+        return True
+
+    def maybe_create_track(
+        self,
+        asset: str,
+        timeframe: str,
+        advice: TradeAdvice,
+        candle_ts: int,
+    ) -> Optional[SignalTrack]:
+        """Conditionally create a new SignalTrack if advice passes criteria."""
+        if not self.should_create_track(advice, asset, timeframe):
+            return None
+
+        planned_entry = float(advice.entry_price or advice.entry_zone)
+        stop_loss = float(advice.stop_loss)
+
+        # Build clean immutable tp_levels (maximum 3 levels)
+        tp_levels: list[dict] = []
+        if advice.tp_levels:
+            for item in advice.tp_levels[:3]:
+                tp_levels.append({
+                    "label": item.get("label", "TP"),
+                    "price": float(item.get("price", 0.0)),
+                    "close_pct": _normalize_pct(item.get("close_pct", 0.4)),
+                    "margin_profit_pct": float(item.get("margin_profit_pct", 5.0)),
+                })
+        else:
+            tp_levels = [
+                {"label": "TP1", "price": float(advice.take_profit_1 or planned_entry), "close_pct": 0.40, "margin_profit_pct": 5.0},
+            ]
+            if advice.take_profit_2:
+                tp_levels.append(
+                    {"label": "TP2", "price": float(advice.take_profit_2), "close_pct": 0.35, "margin_profit_pct": 7.5}
+                )
+
+        tf_sec = TF_SECONDS.get(timeframe, 3600)
+        pending_candles = self.config.get("TRACK_PENDING_EXPIRY_CANDLES", {}).get(timeframe, 12)
+        expiry_at_ts = int(candle_ts + pending_candles * tf_sec)
+
+        val = getattr(advice, "validity", {})
+        val_status = val.get("status", "fresh") if isinstance(val, dict) else str(val)
+
+        created_str = datetime.datetime.fromtimestamp(candle_ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        track = SignalTrack(
+            track_id=uuid.uuid4().hex,
+            created_at_ts=int(candle_ts),
+            created_at_str=created_str,
+            asset=asset,
+            timeframe=timeframe,
+            direction=advice.action,
+            confidence=advice.confidence,
+            confidence_score=int(advice.confidence_score),
+            status=TrackStatus.PENDING_ENTRY.value,
+            entry_type=advice.entry_type or "now",
+            planned_entry=round(planned_entry, 4),
+            actual_entry=None,
+            entry_filled_at_ts=None,
+            stop_loss=round(stop_loss, 4),
+            tp_levels=tp_levels,
+            initial_advice_validity=val_status,
+            advice_reasoning=list(advice.reasoning) if advice.reasoning else [],
+            expiry_at_ts=expiry_at_ts,
+            result_note="Đang chờ khớp điểm vào lệnh (Pending Entry).",
+        )
+
+        stream_key = f"{asset}_{timeframe}"
+        self._active_tracks[stream_key] = track
+        self._save_track(track)
+        self._cached_metrics = None  # invalidate metrics cache
+        logger.info(f"[Tracker] Created track {track.track_id[:8]} [{asset} {timeframe} {track.direction}] @ {track.planned_entry}")
+        return track
+
+    def process_closed_candle(
+        self,
+        asset: str,
+        timeframe: str,
+        candle: Candle,
+        latest_advice: Optional[TradeAdvice] = None,
+    ) -> Optional[SignalTrack]:
+        """
+        Evaluate existing track on candle close.
+        Executes strict anti-look-ahead bias policies.
+        """
+        enabled_tfs = self.config.get("TRACKER_ENABLED_TIMEFRAMES", ["1h", "4h"])
+        if timeframe not in enabled_tfs:
+            return None
+
+        stream_key = f"{asset}_{timeframe}"
+        track = self._active_tracks.get(stream_key)
+        if not track:
+            return None
+
+        leverage = self.config.get("TRACKER_DEFAULT_LEVERAGE", 5)
+
+        # ---------------------------------------------------------------------
+        # 1. Track is in PENDING_ENTRY
+        # ---------------------------------------------------------------------
+        if track.status == TrackStatus.PENDING_ENTRY.value:
+            # Check if advice was invalidated before entry
+            if latest_advice:
+                val = getattr(latest_advice, "validity", {})
+                val_status = val.get("status") if isinstance(val, dict) else str(val)
+                if val_status == AdviceValidityStatus.INVALIDATED.value:
+                    track.status = TrackStatus.INVALIDATED.value
+                    track.closed_at_ts = int(candle.ts)
+                    track.result_note = "Khuyến nghị bị vô hiệu hóa trước khi giá khớp Entry."
+                    self._finish_track(track)
+                    return track
+
+            # Check fill criteria
+            filled = False
+            actual_entry = track.planned_entry
+
+            if track.entry_type == "now":
+                # Fills on the next closed candle after track creation
+                if track.direction == "BUY":
+                    actual_entry = max(track.planned_entry, candle.open)
+                else:
+                    actual_entry = min(track.planned_entry, candle.open)
+                filled = True
+            elif track.entry_type == "wait_pullback":
+                if candle.low <= track.planned_entry <= candle.high:
+                    filled = True
+                    # Check gap over entry:
+                    # BUY pullback chờ giá thấp hơn: gap xảy ra nếu nến mở cửa nhảy xuống dưới entry
+                    # SELL pullback chờ giá cao hơn: gap xảy ra nếu nến mở cửa nhảy lên trên entry
+                    if track.direction == "BUY" and candle.open < track.planned_entry:
+                        actual_entry = max(track.planned_entry, candle.open)
+                    elif track.direction == "SELL" and candle.open > track.planned_entry:
+                        actual_entry = min(track.planned_entry, candle.open)
+                    else:
+                        actual_entry = track.planned_entry
+
+            if filled:
+                track.status = TrackStatus.OPEN.value
+                track.actual_entry = round(float(actual_entry), 4)
+                track.entry_filled_at_ts = int(candle.ts)
+                tf_sec = TF_SECONDS.get(timeframe, 3600)
+                open_candles = self.config.get("TRACK_OPEN_EXPIRY_CANDLES", {}).get(timeframe, 72)
+                track.expiry_at_ts = int(candle.ts + open_candles * tf_sec)
+                track.result_note = f"Đã khớp Entry tại {track.actual_entry:.4f}. Bắt đầu theo dõi TP/SL."
+                self._save_track(track)
+                logger.info(f"[Tracker] Track {track.track_id[:8]} filled Entry @ {track.actual_entry}")
+                # ANTI-LOOK-AHEAD BIAS: Do NOT evaluate TP/SL on the same candle that filled Entry!
+                return track
+
+            # If not filled, check expiry
+            if candle.ts >= track.expiry_at_ts:
+                track.status = TrackStatus.EXPIRED.value
+                track.closed_at_ts = int(candle.ts)
+                track.result_note = "Lệnh chờ hết hạn theo dõi do không khớp Entry trong số nến quy định."
+                self._finish_track(track)
+                return track
+
+            return track
+
+        # ---------------------------------------------------------------------
+        # 2. Track is OPEN, PARTIAL_TP1, or PARTIAL_TP2
+        # ---------------------------------------------------------------------
+        if track.status in (TrackStatus.OPEN.value, TrackStatus.PARTIAL_TP1.value, TrackStatus.PARTIAL_TP2.value):
+            # Check expiry first
+            if candle.ts >= track.expiry_at_ts:
+                # Force close remaining position at candle close
+                self._close_remaining_at_price(track, candle.close, leverage, candle.ts, "Lệnh hết thời hạn theo dõi, đóng mô phỏng tại giá đóng cửa hiện tại.")
+                track.status = TrackStatus.EXPIRED.value
+                self._finish_track(track)
+                return track
+
+            # Evaluate TP / SL on this closed candle
+            risk_unit = abs(track.actual_entry - track.stop_loss)
+            if risk_unit < 1e-6:
+                risk_unit = 1e-6
+
+            def r_at_exit(p: float) -> float:
+                return (p - track.actual_entry) / risk_unit if track.direction == "BUY" else (track.actual_entry - p) / risk_unit
+
+            def margin_pnl_at_exit(p: float) -> float:
+                pct = ((p - track.actual_entry) / track.actual_entry) if track.direction == "BUY" else ((track.actual_entry - p) / track.actual_entry)
+                return pct * leverage * 100.0
+
+            tp1_p = track.tp_levels[0]["price"] if len(track.tp_levels) > 0 else None
+            tp2_p = track.tp_levels[1]["price"] if len(track.tp_levels) > 1 else None
+            tp3_p = track.tp_levels[2]["price"] if len(track.tp_levels) > 2 else None
+
+            if track.direction == "BUY":
+                sl_hit = candle.low <= track.stop_loss
+                tp1_hit = (candle.high >= tp1_p) if tp1_p else False
+                tp2_hit = (candle.high >= tp2_p) if tp2_p else False
+                tp3_hit = (candle.high >= tp3_p) if tp3_p else False
+            else:
+                sl_hit = candle.high >= track.stop_loss
+                tp1_hit = (candle.low <= tp1_p) if tp1_p else False
+                tp2_hit = (candle.low <= tp2_p) if tp2_p else False
+                tp3_hit = (candle.low <= tp3_p) if tp3_p else False
+
+            # Check next target TP
+            next_tp_hit = False
+            if track.status == TrackStatus.OPEN.value:
+                next_tp_hit = tp1_hit
+            elif track.status == TrackStatus.PARTIAL_TP1.value:
+                next_tp_hit = tp2_hit
+            elif track.status == TrackStatus.PARTIAL_TP2.value:
+                next_tp_hit = tp3_hit
+
+            # Ambiguous Candle check: Both SL and next Target TP breached in the same candle
+            if sl_hit and next_tp_hit:
+                track.status = TrackStatus.AMBIGUOUS.value
+                track.closed_at_ts = int(candle.ts)
+                track.result_note = (
+                    "Nến cùng lúc chạm Stop Loss và Take Profit. "
+                    "Dữ liệu OHLC không xác định được thứ tự khớp, "
+                    "do đó không tính thắng/thua vào thống kê chính."
+                )
+                self._finish_track(track)
+                return track
+
+            pct1 = _normalize_pct(track.tp_levels[0].get("close_pct", 0.40)) if len(track.tp_levels) > 0 else 0.40
+            pct2 = _normalize_pct(track.tp_levels[1].get("close_pct", 0.35)) if len(track.tp_levels) > 1 else 0.35
+            pct3 = _normalize_pct(track.tp_levels[2].get("close_pct", 0.25)) if len(track.tp_levels) > 2 else 0.25
+
+            # ---------------- Case A: Status is OPEN ----------------
+            if track.status == TrackStatus.OPEN.value:
+                if tp1_hit:
+                    track.tp1_hit_at_ts = int(candle.ts)
+                    track.realized_r += r_at_exit(tp1_p) * pct1
+                    track.realized_margin_pnl_pct += margin_pnl_at_exit(tp1_p) * pct1
+                    track.status = TrackStatus.PARTIAL_TP1.value
+                    track.result_note = f"Đạt TP1 tại {tp1_p:.4f}, chốt {int(pct1*100)}% vị thế."
+
+                    if tp2_hit and tp2_p:
+                        track.tp2_hit_at_ts = int(candle.ts)
+                        track.realized_r += r_at_exit(tp2_p) * pct2
+                        track.realized_margin_pnl_pct += margin_pnl_at_exit(tp2_p) * pct2
+                        track.status = TrackStatus.PARTIAL_TP2.value
+                        track.result_note = f"Đạt TP1 và TP2 tại {tp2_p:.4f}, chốt {int((pct1+pct2)*100)}% vị thế."
+
+                        if tp3_hit and tp3_p:
+                            track.tp3_hit_at_ts = int(candle.ts)
+                            track.realized_r += r_at_exit(tp3_p) * pct3
+                            track.realized_margin_pnl_pct += margin_pnl_at_exit(tp3_p) * pct3
+                            track.status = TrackStatus.CLOSED_TP3.value
+                            track.closed_at_ts = int(candle.ts)
+                            track.result_note = f"Đạt toàn bộ TP1-TP3, hoàn tất 100% vị thế thành công."
+                            self._finish_track(track)
+                            return track
+
+                    self._save_track(track)
+                    return track
+
+                elif sl_hit:
+                    track.sl_hit_at_ts = int(candle.ts)
+                    track.closed_at_ts = int(candle.ts)
+                    track.status = TrackStatus.CLOSED_SL.value
+                    track.realized_r = -1.0
+                    track.realized_margin_pnl_pct = margin_pnl_at_exit(track.stop_loss)
+                    track.result_note = f"Chạm Stop Loss tại {track.stop_loss:.4f} (-1.0R)."
+                    self._finish_track(track)
+                    return track
+
+            # ---------------- Case B: Status is PARTIAL_TP1 ----------------
+            elif track.status == TrackStatus.PARTIAL_TP1.value:
+                if tp2_hit and tp2_p:
+                    track.tp2_hit_at_ts = int(candle.ts)
+                    track.realized_r += r_at_exit(tp2_p) * pct2
+                    track.realized_margin_pnl_pct += margin_pnl_at_exit(tp2_p) * pct2
+                    track.status = TrackStatus.PARTIAL_TP2.value
+                    track.result_note = f"Đạt TP2 tại {tp2_p:.4f}, chốt thêm {int(pct2*100)}% vị thế."
+
+                    if tp3_hit and tp3_p:
+                        track.tp3_hit_at_ts = int(candle.ts)
+                        track.realized_r += r_at_exit(tp3_p) * pct3
+                        track.realized_margin_pnl_pct += margin_pnl_at_exit(tp3_p) * pct3
+                        track.status = TrackStatus.CLOSED_TP3.value
+                        track.closed_at_ts = int(candle.ts)
+                        track.result_note = f"Đạt toàn bộ TP3, hoàn tất 100% vị thế thành công."
+                        self._finish_track(track)
+                        return track
+
+                    self._save_track(track)
+                    return track
+
+                elif sl_hit:
+                    remaining_fraction = max(0.0, 1.0 - pct1)
+                    track.sl_hit_at_ts = int(candle.ts)
+                    track.closed_at_ts = int(candle.ts)
+                    track.status = TrackStatus.CLOSED_SL.value
+                    track.realized_r += (-1.0) * remaining_fraction
+                    track.realized_margin_pnl_pct += margin_pnl_at_exit(track.stop_loss) * remaining_fraction
+                    track.result_note = f"Chạm Stop Loss phần {int(remaining_fraction*100)}% vị thế còn lại sau khi đã chốt TP1."
+                    self._finish_track(track)
+                    return track
+
+            # ---------------- Case C: Status is PARTIAL_TP2 ----------------
+            elif track.status == TrackStatus.PARTIAL_TP2.value:
+                if tp3_hit and tp3_p:
+                    track.tp3_hit_at_ts = int(candle.ts)
+                    track.realized_r += r_at_exit(tp3_p) * pct3
+                    track.realized_margin_pnl_pct += margin_pnl_at_exit(tp3_p) * pct3
+                    track.status = TrackStatus.CLOSED_TP3.value
+                    track.closed_at_ts = int(candle.ts)
+                    track.result_note = f"Đạt mục tiêu tối đa TP3 tại {tp3_p:.4f}. Hoàn tất toàn bộ vị thế."
+                    self._finish_track(track)
+                    return track
+
+                elif sl_hit:
+                    remaining_fraction = max(0.0, 1.0 - pct1 - pct2)
+                    track.sl_hit_at_ts = int(candle.ts)
+                    track.closed_at_ts = int(candle.ts)
+                    track.status = TrackStatus.CLOSED_SL.value
+                    track.realized_r += (-1.0) * remaining_fraction
+                    track.realized_margin_pnl_pct += margin_pnl_at_exit(track.stop_loss) * remaining_fraction
+                    track.result_note = f"Chạm Stop Loss phần {int(remaining_fraction*100)}% vị thế còn lại sau khi đã chốt TP1 & TP2."
+                    self._finish_track(track)
+                    return track
+
+        return track
+
+    def _close_remaining_at_price(
+        self,
+        track: SignalTrack,
+        price: float,
+        leverage: int,
+        closed_ts: int,
+        note: str,
+    ) -> None:
+        """Close whatever fraction remains of an open track at a specific price (e.g. on expiry)."""
+        pct1 = _normalize_pct(track.tp_levels[0].get("close_pct", 0.40)) if len(track.tp_levels) > 0 else 0.40
+        pct2 = _normalize_pct(track.tp_levels[1].get("close_pct", 0.35)) if len(track.tp_levels) > 1 else 0.35
+
+        closed_pct = 0.0
+        if track.status == TrackStatus.PARTIAL_TP1.value:
+            closed_pct = pct1
+        elif track.status == TrackStatus.PARTIAL_TP2.value:
+            closed_pct = pct1 + pct2
+
+        rem_pct = max(0.0, 1.0 - closed_pct)
+        if rem_pct > 0.0 and track.actual_entry:
+            risk_unit = abs(track.actual_entry - track.stop_loss) or 1e-6
+            r_exit = (price - track.actual_entry) / risk_unit if track.direction == "BUY" else (track.actual_entry - price) / risk_unit
+            pnl_pct = (((price - track.actual_entry) / track.actual_entry) if track.direction == "BUY" else ((track.actual_entry - price) / track.actual_entry)) * leverage * 100.0
+
+            track.realized_r += r_exit * rem_pct
+            track.realized_margin_pnl_pct += pnl_pct * rem_pct
+
+        track.closed_at_ts = int(closed_ts)
+        track.result_note = note
+
+    def _finish_track(self, track: SignalTrack) -> None:
+        """Move track from active state to terminal state in database and refresh caches."""
+        stream_key = f"{track.asset}_{track.timeframe}"
+        self._active_tracks.pop(stream_key, None)
+        track.realized_r = round(track.realized_r, 4)
+        track.realized_margin_pnl_pct = round(track.realized_margin_pnl_pct, 2)
+        self._save_track(track)
+        self._cached_metrics = None
+        self._trim_database_if_needed()
+        logger.info(f"[Tracker] Finished track {track.track_id[:8]} [{track.asset} {track.timeframe}] Status={track.status} RealizedR={track.realized_r:.2f}R")
+
+    def get_metrics(
+        self,
+        asset: str = "ALL",
+        timeframe: str = "ALL",
+        confidence: str = "ALL",
+    ) -> dict:
+        """
+        Compute performance metrics for closed tracks.
+        Cached for O(1) polling responses.
+        """
+        now = time.time()
+        is_default = (asset == "ALL" and timeframe == "ALL" and confidence == "ALL")
+        if is_default and self._cached_metrics and (now - self._cached_metrics_ts) < 900:
+            return self._cached_metrics
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                query = "SELECT * FROM signal_tracks WHERE 1=1"
+                params: list = []
+                if asset != "ALL":
+                    query += " AND asset = ?"
+                    params.append(asset)
+                if timeframe != "ALL":
+                    query += " AND timeframe = ?"
+                    params.append(timeframe)
+                if confidence != "ALL":
+                    query += " AND confidence = ?"
+                    params.append(confidence)
+
+                query += " ORDER BY created_at_ts ASC"
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+
+                total_tracks = len(rows)
+                active_statuses = (
+                    TrackStatus.PENDING_ENTRY.value,
+                    TrackStatus.OPEN.value,
+                    TrackStatus.PARTIAL_TP1.value,
+                    TrackStatus.PARTIAL_TP2.value,
+                )
+                active_count = 0
+                pending_count = 0
+                open_count = 0
+
+                closed_count = 0
+                win_count = 0
+                loss_count = 0
+                expired_count = 0
+                invalidated_count = 0
+                ambiguous_count = 0
+
+                sum_win_r = 0.0
+                sum_loss_r = 0.0
+                total_realized_r = 0.0
+
+                filled_tracks = 0
+                tp1_hit_count = 0
+                tp2_hit_count = 0
+                tp3_hit_count = 0
+
+                equity_curve: list[dict] = []
+                cumulative_r = 0.0
+                peak_r = 0.0
+                max_drawdown = 0.0
+
+                for r in rows:
+                    st = r["status"]
+                    rr = float(r["realized_r"] or 0.0)
+
+                    if st in active_statuses:
+                        active_count += 1
+                        if st == TrackStatus.PENDING_ENTRY.value:
+                            pending_count += 1
+                        else:
+                            open_count += 1
+
+                    if r["actual_entry"] is not None:
+                        filled_tracks += 1
+
+                    # Parse payload to check tp hits
+                    try:
+                        p = json.loads(r["payload_json"])
+                        if p.get("tp1_hit_at_ts"):
+                            tp1_hit_count += 1
+                        if p.get("tp2_hit_at_ts"):
+                            tp2_hit_count += 1
+                        if p.get("tp3_hit_at_ts"):
+                            tp3_hit_count += 1
+                    except Exception:
+                        pass
+
+                    if st in (TrackStatus.CLOSED_TP3.value, TrackStatus.CLOSED_SL.value, TrackStatus.EXPIRED.value):
+                        closed_count += 1
+                        total_realized_r += rr
+                        if rr > 0:
+                            win_count += 1
+                            sum_win_r += rr
+                        elif rr < 0:
+                            loss_count += 1
+                            sum_loss_r += abs(rr)
+
+                        cumulative_r += rr
+                        if cumulative_r > peak_r:
+                            peak_r = cumulative_r
+                        dd = cumulative_r - peak_r
+                        if dd < max_drawdown:
+                            max_drawdown = dd
+
+                        equity_curve.append({
+                            "track_id": r["track_id"][:8],
+                            "closed_at_ts": r["closed_at_ts"] or r["created_at_ts"],
+                            "realized_r": round(rr, 2),
+                            "cumulative_r": round(cumulative_r, 2),
+                        })
+
+                    elif st == TrackStatus.INVALIDATED.value:
+                        invalidated_count += 1
+                    elif st == TrackStatus.AMBIGUOUS.value:
+                        ambiguous_count += 1
+
+                entry_fill_rate = round((filled_tracks / total_tracks * 100.0), 1) if total_tracks > 0 else 0.0
+                tp1_rate = round((tp1_hit_count / filled_tracks * 100.0), 1) if filled_tracks > 0 else 0.0
+                tp2_rate = round((tp2_hit_count / filled_tracks * 100.0), 1) if filled_tracks > 0 else 0.0
+                tp3_rate = round((tp3_hit_count / filled_tracks * 100.0), 1) if filled_tracks > 0 else 0.0
+
+                valid_closed = win_count + loss_count
+                win_rate = round((win_count / valid_closed * 100.0), 1) if valid_closed > 0 else 0.0
+                profit_factor = round(sum_win_r / sum_loss_r, 2) if sum_loss_r > 0 else None
+                expectancy_r = round(total_realized_r / closed_count, 2) if closed_count > 0 else 0.0
+
+                warning = None
+                if closed_count < 30:
+                    warning = "Chưa đủ mẫu thống kê — cần tối thiểu 30 lệnh đã đóng hợp lệ."
+
+                metrics = {
+                    "total_tracks": total_tracks,
+                    "active_tracks": active_count,
+                    "pending_count": pending_count,
+                    "open_count": open_count,
+                    "closed_count": closed_count,
+                    "win_count": win_count,
+                    "loss_count": loss_count,
+                    "expired_count": expired_count,
+                    "invalidated_count": invalidated_count,
+                    "ambiguous_count": ambiguous_count,
+                    "entry_fill_rate_pct": entry_fill_rate,
+                    "tp1_hit_rate_pct": tp1_rate,
+                    "tp2_hit_rate_pct": tp2_rate,
+                    "tp3_hit_rate_pct": tp3_rate,
+                    "win_rate_pct": win_rate,
+                    "profit_factor": profit_factor,
+                    "expectancy_r": expectancy_r,
+                    "average_r": expectancy_r,
+                    "total_r": round(total_realized_r, 2),
+                    "max_drawdown_r": round(max_drawdown, 2),
+                    "equity_curve_r": equity_curve[-500:],
+                    "sample_size_warning": warning,
+                }
+
+                if is_default:
+                    self._cached_metrics = metrics
+                    self._cached_metrics_ts = now
+
+                return metrics
+        except Exception as exc:
+            logger.error(f"[Tracker] Error calculating metrics: {exc}")
+            return {
+                "total_tracks": 0, "active_tracks": 0, "closed_count": 0,
+                "win_count": 0, "loss_count": 0, "entry_fill_rate_pct": 0.0,
+                "win_rate_pct": 0.0, "profit_factor": None, "expectancy_r": 0.0,
+                "total_r": 0.0, "max_drawdown_r": 0.0, "equity_curve_r": [],
+                "sample_size_warning": "Lỗi truy vấn cơ sở dữ liệu.",
+            }
+
+    def get_recent_tracks(
+        self,
+        asset: str = "ALL",
+        timeframe: str = "ALL",
+        confidence: str = "ALL",
+        limit: int = 20,
+    ) -> list[dict]:
+        """Fetch latest tracks from database ordered by creation date descending."""
+        limit = min(max(int(limit), 5), 100)
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                query = "SELECT payload_json FROM signal_tracks WHERE 1=1"
+                params: list = []
+                if asset != "ALL":
+                    query += " AND asset = ?"
+                    params.append(asset)
+                if timeframe != "ALL":
+                    query += " AND timeframe = ?"
+                    params.append(timeframe)
+                if confidence != "ALL":
+                    query += " AND confidence = ?"
+                    params.append(confidence)
+
+                query += " ORDER BY created_at_ts DESC LIMIT ?"
+                params.append(limit)
+
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                results = []
+                for r in rows:
+                    try:
+                        results.append(json.loads(r["payload_json"]))
+                    except Exception:
+                        pass
+                return results
+        except Exception as exc:
+            logger.error(f"[Tracker] Error retrieving recent tracks: {exc}")
+            return []
+
+    def get_summary(self) -> dict:
+        """Lightweight summary to embed inside /api/snapshot without extra query overhead."""
+        m = self.get_metrics("ALL", "ALL", "ALL")
+        return {
+            "active_tracks": m.get("active_tracks", 0),
+            "closed_count": m.get("closed_count", 0),
+            "profit_factor": m.get("profit_factor"),
+            "expectancy_r": m.get("expectancy_r", 0.0),
+            "win_rate_pct": m.get("win_rate_pct", 0.0),
+            "sample_size_warning": m.get("sample_size_warning"),
+        }
 
 
 # =============================================================================
@@ -2325,9 +3288,107 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       color: #fff;
       font-size: 0.85rem;
     }
-    .modal-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-    .btn-primary { background: #2563eb; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; }
-    .btn-secondary { background: #334155; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
+    /* Performance Tracker Styles */
+    .perf-disclaimer {
+      background: rgba(245, 158, 11, 0.08);
+      border-left: 4px solid var(--gold);
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      color: #fef3c7;
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .kpi-card {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .kpi-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .kpi-val {
+      font-size: 1.45rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .kpi-sub {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+    }
+    .val-green { color: var(--green) !important; }
+    .val-yellow { color: var(--gold) !important; }
+    .val-red { color: var(--red) !important; }
+    .val-muted { color: var(--text-muted) !important; }
+
+    .perf-filter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 14px;
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 8px;
+    }
+    .perf-filter-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-right: 4px;
+    }
+    .perf-filter-btn {
+      background: #1e293b;
+      color: var(--text-muted);
+      border: 1px solid var(--card-border);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .perf-filter-btn.active, .perf-filter-btn:hover {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    .svg-equity-container {
+      width: 100%;
+      height: 220px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 8px;
+      border: 1px solid var(--card-border);
+      position: relative;
+      margin-bottom: 20px;
+      overflow: hidden;
+    }
+    .svg-equity-container svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .status-badge-track {
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
   </style>
 </head>
 <body>
@@ -2604,6 +3665,118 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <div style="text-align:center;color:var(--text-muted);padding:30px;">
           Chưa có tín hiệu bất thường. Hệ thống đang theo dõi 24/7...
         </div>
+      </div>
+    </div>
+
+    <!-- SECTION: HIỆU SUẤT ĐỀ XUẤT (PAPER-TRACKING) -->
+    <div class="card" id="cardPerformanceTracker">
+      <div class="card-header">
+        <div class="card-title">
+          <span>📊 Hiệu Suất Đề Xuất (Paper-Tracking Forward-Test)</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span id="sampleWarningBadge" class="status-badge" style="background:rgba(245,158,11,0.12);color:var(--gold);border-color:rgba(245,158,11,0.3);display:none;">⚠️ Chưa đủ dữ liệu</span>
+          <span style="font-size:0.8rem;color:var(--text-muted);" id="perfLastUpdated">--</span>
+        </div>
+      </div>
+
+      <!-- 11.1 Disclaimer -->
+      <div class="perf-disclaimer">
+        ⚠️ <strong>Lưu ý quan trọng:</strong> Đây là kết quả theo dõi giả lập dựa trên nến OHLC đã đóng. Chưa bao gồm spread, phí giao dịch, funding, swap và trượt giá thực tế. Không phải cam kết lợi nhuận hoặc lời khuyên đầu tư.
+      </div>
+
+      <!-- Filters -->
+      <div class="perf-filter-bar">
+        <span class="perf-filter-label">Tài sản:</span>
+        <button class="perf-filter-btn active" data-filter="asset" data-val="ALL" onclick="setPerfFilter('asset', 'ALL')">Tất cả</button>
+        <button class="perf-filter-btn" data-filter="asset" data-val="BTC" onclick="setPerfFilter('asset', 'BTC')">BTC</button>
+        <button class="perf-filter-btn" data-filter="asset" data-val="XAU" onclick="setPerfFilter('asset', 'XAU')">XAU</button>
+        <button class="perf-filter-btn" data-filter="asset" data-val="OIL" onclick="setPerfFilter('asset', 'OIL')">OIL</button>
+
+        <span class="perf-filter-label" style="margin-left:10px;">Khung:</span>
+        <button class="perf-filter-btn active" data-filter="tf" data-val="ALL" onclick="setPerfFilter('tf', 'ALL')">Tất cả</button>
+        <button class="perf-filter-btn" data-filter="tf" data-val="1h" onclick="setPerfFilter('tf', '1h')">1h</button>
+        <button class="perf-filter-btn" data-filter="tf" data-val="4h" onclick="setPerfFilter('tf', '4h')">4h</button>
+
+        <span class="perf-filter-label" style="margin-left:10px;">Độ tin cậy:</span>
+        <button class="perf-filter-btn active" data-filter="conf" data-val="ALL" onclick="setPerfFilter('conf', 'ALL')">Tất cả</button>
+        <button class="perf-filter-btn" data-filter="conf" data-val="Cao" onclick="setPerfFilter('conf', 'Cao')">Cao</button>
+        <button class="perf-filter-btn" data-filter="conf" data-val="Trung bình" onclick="setPerfFilter('conf', 'Trung bình')">Trung bình</button>
+
+        <span class="perf-filter-label" style="margin-left:10px;">Hướng:</span>
+        <button class="perf-filter-btn active" data-filter="dir" data-val="ALL" onclick="setPerfFilter('dir', 'ALL')">Tất cả</button>
+        <button class="perf-filter-btn" data-filter="dir" data-val="BUY" onclick="setPerfFilter('dir', 'BUY')">BUY</button>
+        <button class="perf-filter-btn" data-filter="dir" data-val="SELL" onclick="setPerfFilter('dir', 'SELL')">SELL</button>
+      </div>
+
+      <!-- 11.2 KPI Cards -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">Profit Factor</div>
+          <div class="kpi-val" id="kpiProfitFactor">--</div>
+          <div class="kpi-sub" id="kpiProfitFactorSub">Tổng lời R / Tổng lỗ R</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Expectancy (Kỳ vọng)</div>
+          <div class="kpi-val" id="kpiExpectancy">--</div>
+          <div class="kpi-sub">Kỳ vọng lợi nhuận / lệnh</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Max Drawdown</div>
+          <div class="kpi-val val-red" id="kpiMaxDrawdown">--</div>
+          <div class="kpi-sub">Sụt giảm lớn nhất từ đỉnh</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Win Rate</div>
+          <div class="kpi-val" id="kpiWinRate">--</div>
+          <div class="kpi-sub" id="kpiWinCountSub">0 thắng / 0 lệnh</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Entry Fill Rate</div>
+          <div class="kpi-val" id="kpiFillRate">--</div>
+          <div class="kpi-sub">Tỉ lệ tín hiệu khớp điểm vào</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Mẫu Đã Đóng Hợp Lệ</div>
+          <div class="kpi-val" id="kpiSampleSize">--</div>
+          <div class="kpi-sub" id="kpiSampleSizeSub">Yêu cầu tối thiểu 30 lệnh</div>
+        </div>
+      </div>
+
+      <!-- 11.3 Equity Curve Chart (Pure SVG) -->
+      <div style="margin-bottom:8px;font-size:0.85rem;font-weight:600;display:flex;justify-content:space-between;align-items:center;">
+        <span>📈 Biểu Đồ Tăng Trưởng Vốn (Equity Curve theo R-Multiple)</span>
+        <span style="font-size:0.75rem;color:var(--text-muted);">Trục X: Số lệnh | Trục Y: Tổng R tích lũy</span>
+      </div>
+      <div class="svg-equity-container" id="equityChartContainer">
+        <svg id="equitySvg" viewBox="0 0 800 220" preserveAspectRatio="none">
+          <text x="400" y="110" fill="#94a3b8" font-size="14" text-anchor="middle">Đang tải dữ liệu tăng trưởng...</text>
+        </svg>
+      </div>
+
+      <!-- 11.4 Recent Tracks Table -->
+      <div style="margin-bottom:8px;font-size:0.85rem;font-weight:600;">
+        <span>📋 Lịch Sử Khuyến Nghị Gần Đây</span>
+      </div>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Thời gian</th>
+              <th>Tài sản</th>
+              <th>Khung</th>
+              <th>Hướng</th>
+              <th>Độ tin cậy</th>
+              <th style="text-align:right;">Entry</th>
+              <th>Kết quả / Ghi chú</th>
+              <th style="text-align:right;">Realized R</th>
+              <th>Trạng thái</th>
+            </tr>
+          </thead>
+          <tbody id="recentTracksTbody">
+            <tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:24px;">Đang tải danh sách theo dõi...</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -3435,17 +4608,282 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       }
     }
 
+    // --- PERFORMANCE TRACKER (PAPER-TRACKING FORWARD-TEST) ---
+    const perfFilters = {
+      asset: 'ALL',
+      tf: 'ALL',
+      conf: 'ALL',
+      dir: 'ALL'
+    };
+    let cachedPerfJsonStr = '';
+
+    function setPerfFilter(category, val) {
+      perfFilters[category] = val;
+      document.querySelectorAll(`.perf-filter-btn[data-filter="${category}"]`).forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-val') === val);
+      });
+      fetchPerformanceData();
+    }
+
+    async function fetchPerformanceData() {
+      try {
+        const query = new URLSearchParams({
+          asset: perfFilters.asset,
+          tf: perfFilters.tf,
+          confidence: perfFilters.conf,
+          limit: '50'
+        });
+        const res = await fetch(`/api/performance?${query.toString()}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const jsonStr = JSON.stringify(data);
+        if (jsonStr === cachedPerfJsonStr) return; // Không redraw nếu dữ liệu không đổi
+        cachedPerfJsonStr = jsonStr;
+        renderPerformance(data);
+      } catch (err) {
+        console.error('Error fetching performance metrics:', err);
+      }
+    }
+
+    function renderPerformance(data) {
+      if (!data || !data.metrics) return;
+      const m = data.metrics;
+
+      // Update timestamp
+      const timeEl = document.getElementById('perfLastUpdated');
+      if (timeEl) timeEl.textContent = data.last_updated || '';
+
+      // Sample size warning badge
+      const warnBadge = document.getElementById('sampleWarningBadge');
+      if (warnBadge) {
+        if (m.sample_size_warning) {
+          warnBadge.style.display = 'inline-flex';
+          warnBadge.textContent = '⚠️ ' + m.sample_size_warning;
+        } else {
+          warnBadge.style.display = 'none';
+        }
+      }
+
+      // 1. Profit Factor
+      const pfEl = document.getElementById('kpiProfitFactor');
+      const pfSub = document.getElementById('kpiProfitFactorSub');
+      if (pfEl) {
+        if (m.closed_count < 30) {
+          pfEl.textContent = m.profit_factor !== null ? m.profit_factor.toFixed(2) : '--';
+          pfEl.className = 'kpi-val val-muted';
+          if (pfSub) pfSub.textContent = 'Chưa đủ 30 mẫu để khẳng định';
+        } else if (m.profit_factor === null) {
+          pfEl.textContent = 'N/A';
+          pfEl.className = 'kpi-val val-muted';
+          if (pfSub) pfSub.textContent = 'Không có lệnh lỗ';
+        } else {
+          pfEl.textContent = m.profit_factor.toFixed(2);
+          if (m.profit_factor > 1.2) pfEl.className = 'kpi-val val-green';
+          else if (m.profit_factor >= 1.0) pfEl.className = 'kpi-val val-yellow';
+          else pfEl.className = 'kpi-val val-red';
+          if (pfSub) pfSub.textContent = m.profit_factor >= 1.0 ? 'Hệ thống có lợi thế thống kê' : 'Hệ thống đang âm vốn';
+        }
+      }
+
+      // 2. Expectancy
+      const expEl = document.getElementById('kpiExpectancy');
+      if (expEl) {
+        const sign = m.expectancy_r > 0 ? '+' : '';
+        expEl.textContent = `${sign}${m.expectancy_r.toFixed(2)}R / lệnh`;
+        expEl.className = 'kpi-val ' + (m.expectancy_r > 0 ? 'val-green' : (m.expectancy_r < 0 ? 'val-red' : 'val-muted'));
+      }
+
+      // 3. Max Drawdown
+      const ddEl = document.getElementById('kpiMaxDrawdown');
+      if (ddEl) {
+        ddEl.textContent = `${m.max_drawdown_r.toFixed(2)}R`;
+      }
+
+      // 4. Win Rate
+      const wrEl = document.getElementById('kpiWinRate');
+      const wcSub = document.getElementById('kpiWinCountSub');
+      if (wrEl) {
+        wrEl.textContent = `${m.win_rate_pct.toFixed(1)}%`;
+        if (wcSub) wcSub.textContent = `${m.win_count} thắng / ${m.win_count + m.loss_count} lệnh đóng`;
+      }
+
+      // 5. Entry Fill Rate
+      const frEl = document.getElementById('kpiFillRate');
+      if (frEl) {
+        frEl.textContent = `${m.entry_fill_rate_pct.toFixed(1)}%`;
+      }
+
+      // 6. Sample Size
+      const ssEl = document.getElementById('kpiSampleSize');
+      const ssSub = document.getElementById('kpiSampleSizeSub');
+      if (ssEl) {
+        ssEl.textContent = `${m.closed_count} / 30`;
+        if (m.closed_count >= 30) {
+          ssEl.className = 'kpi-val val-green';
+          if (ssSub) ssSub.textContent = 'Đủ điều kiện thống kê tin cậy';
+        } else {
+          ssEl.className = 'kpi-val val-yellow';
+          if (ssSub) ssSub.textContent = `Cần thêm ${30 - m.closed_count} lệnh nữa`;
+        }
+      }
+
+      // Render Equity Curve (SVG)
+      renderEquitySvg(m.equity_curve_r || []);
+
+      // Render Recent Tracks Table
+      renderRecentTracks(data.recent_tracks || []);
+    }
+
+    function renderEquitySvg(curve) {
+      const svg = document.getElementById('equitySvg');
+      if (!svg) return;
+
+      if (!curve || curve.length === 0) {
+        svg.innerHTML = `
+          <line x1="0" y1="110" x2="800" y2="110" stroke="#334155" stroke-dasharray="4,4" />
+          <text x="400" y="115" fill="#94a3b8" font-size="13" text-anchor="middle">Chưa có lệnh đóng để vẽ biểu đồ tăng trưởng (cần ít nhất 1 lệnh kết thúc)</text>
+        `;
+        return;
+      }
+
+      const points = [{ cumulative_r: 0.0, track_id: 'Start' }, ...curve];
+      let minR = 0.0;
+      let maxR = 0.0;
+      points.forEach(p => {
+        if (p.cumulative_r < minR) minR = p.cumulative_r;
+        if (p.cumulative_r > maxR) maxR = p.cumulative_r;
+      });
+
+      const range = (maxR - minR) || 2.0;
+      const padY = range * 0.15;
+      const yMin = minR - padY;
+      const yMax = maxR + padY;
+
+      const W = 800;
+      const H = 220;
+      const pL = 50;
+      const pR = 20;
+      const pT = 20;
+      const pB = 30;
+
+      function toX(idx) {
+        if (points.length <= 1) return pL;
+        return pL + (idx / (points.length - 1)) * (W - pL - pR);
+      }
+      function toY(val) {
+        return pT + (1 - (val - yMin) / (yMax - yMin)) * (H - pT - pB);
+      }
+
+      const zeroY = toY(0.0);
+      const coords = points.map((p, i) => `${toX(i).toFixed(1)},${toY(p.cumulative_r).toFixed(1)}`).join(' ');
+      const areaCoords = `${toX(0)},${zeroY} ` + coords + ` ${toX(points.length - 1)},${zeroY}`;
+
+      const isProfit = points[points.length - 1].cumulative_r >= 0;
+      const strokeColor = isProfit ? '#10b981' : '#ef4444';
+      const gradId = isProfit ? 'gradGreen' : 'gradRed';
+
+      svg.innerHTML = `
+        <defs>
+          <linearGradient id="gradGreen" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#10b981" stop-opacity="0.35"/>
+            <stop offset="100%" stop-color="#10b981" stop-opacity="0.0"/>
+          </linearGradient>
+          <linearGradient id="gradRed" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#ef4444" stop-opacity="0.35"/>
+            <stop offset="100%" stop-color="#ef4444" stop-opacity="0.0"/>
+          </linearGradient>
+        </defs>
+
+        <line x1="${pL}" y1="${toY(yMax - padY)}" x2="${W - pR}" y2="${toY(yMax - padY)}" stroke="#1e293b" stroke-width="1" />
+        <line x1="${pL}" y1="${zeroY}" x2="${W - pR}" y2="${zeroY}" stroke="#475569" stroke-width="1.5" stroke-dasharray="3,3" />
+        <line x1="${pL}" y1="${toY(yMin + padY)}" x2="${W - pR}" y2="${toY(yMin + padY)}" stroke="#1e293b" stroke-width="1" />
+
+        <text x="${pL - 8}" y="${zeroY + 4}" fill="#94a3b8" font-size="11" text-anchor="end">0.0R</text>
+        <text x="${pL - 8}" y="${toY(maxR) + 4}" fill="#10b981" font-size="11" text-anchor="end">+${maxR.toFixed(1)}R</text>
+        ${minR < 0 ? `<text x="${pL - 8}" y="${toY(minR) + 4}" fill="#ef4444" font-size="11" text-anchor="end">${minR.toFixed(1)}R</text>` : ''}
+
+        <polygon points="${areaCoords}" fill="url(#${gradId})" />
+        <polyline fill="none" stroke="${strokeColor}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="${coords}" />
+
+        ${points.map((p, i) => `
+          <circle cx="${toX(i)}" cy="${toY(p.cumulative_r)}" r="3" fill="${p.cumulative_r >= 0 ? '#10b981' : '#ef4444'}" stroke="#090d16" stroke-width="1.5">
+            <title>Lệnh ${i}: ${p.cumulative_r >= 0 ? '+' : ''}${p.cumulative_r}R</title>
+          </circle>
+        `).join('')}
+
+        <text x="${toX(points.length - 1)}" y="${H - 8}" fill="#94a3b8" font-size="11" text-anchor="middle">Lệnh #${points.length - 1}</text>
+      `;
+    }
+
+    function renderRecentTracks(tracks) {
+      const tbody = document.getElementById('recentTracksTbody');
+      if (!tbody) return;
+
+      let filtered = tracks;
+      if (perfFilters.dir !== 'ALL') {
+        filtered = filtered.filter(t => t.direction === perfFilters.dir);
+      }
+
+      if (!filtered || filtered.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:24px;">Không có khuyến nghị nào phù hợp với bộ lọc.</td></tr>`;
+        return;
+      }
+
+      const statusMap = {
+        'pending_entry': { icon: '⏳', label: 'Chờ khớp entry', bg: 'rgba(245,158,11,0.15)', col: '#f59e0b' },
+        'open':          { icon: '🔵', label: 'Đang mở',        bg: 'rgba(59,130,246,0.15)', col: '#3b82f6' },
+        'partial_tp1':   { icon: '🟢', label: 'Đạt TP1, còn vị thế', bg: 'rgba(16,185,129,0.15)', col: '#10b981' },
+        'partial_tp2':   { icon: '🟢', label: 'Đạt TP2, còn vị thế', bg: 'rgba(16,185,129,0.20)', col: '#10b981' },
+        'closed_tp3':    { icon: '✅', label: 'Hoàn tất TP3',   bg: 'rgba(16,185,129,0.25)', col: '#10b981' },
+        'closed_sl':     { icon: '🔴', label: 'Chạm Stop Loss', bg: 'rgba(239,68,68,0.15)', col: '#ef4444' },
+        'expired':       { icon: '⌛', label: 'Hết thời hạn',   bg: 'rgba(148,163,184,0.15)', col: '#94a3b8' },
+        'invalidated':   { icon: '🚫', label: 'Bị vô hiệu trước Entry', bg: 'rgba(239,68,68,0.1)', col: '#ef4444' },
+        'ambiguous':     { icon: '⚠️', label: 'Không xác định TP/SL nến', bg: 'rgba(245,158,11,0.2)', col: '#f59e0b' },
+      };
+
+      tbody.innerHTML = filtered.map(t => {
+        const st = statusMap[t.status] || { icon: '⚪', label: t.status, bg: 'rgba(255,255,255,0.05)', col: '#fff' };
+        const dirCol = t.direction === 'BUY' ? 'var(--green)' : 'var(--red)';
+        const rVal = t.realized_r || 0.0;
+        const rSign = rVal > 0 ? '+' : '';
+        const rCol = rVal > 0 ? 'var(--green)' : (rVal < 0 ? 'var(--red)' : 'var(--text-muted)');
+        const entryStr = t.actual_entry ? Number(t.actual_entry).toLocaleString() : (t.planned_entry ? Number(t.planned_entry).toLocaleString() : '--');
+
+        return `
+          <tr>
+            <td style="font-size:0.78rem;color:var(--text-muted);white-space:nowrap;">${t.created_at_str || ''}</td>
+            <td><strong>${t.asset}</strong></td>
+            <td><span class="conf-tag conf-mid">${t.timeframe}</span></td>
+            <td><strong style="color:${dirCol};">${t.direction}</strong></td>
+            <td><span style="font-size:0.8rem;">${t.confidence} (${t.confidence_score}/5)</span></td>
+            <td style="text-align:right;font-family:monospace;font-weight:600;">$${entryStr}</td>
+            <td style="font-size:0.8rem;color:#cbd5e1;max-width:260px;">${t.result_note || '--'}</td>
+            <td style="text-align:right;font-family:monospace;font-weight:700;color:${rCol};">${rSign}${rVal.toFixed(2)}R</td>
+            <td>
+              <span class="status-badge-track" style="background:${st.bg};color:${st.col};border:1px solid ${st.col}40;">
+                ${st.icon} ${st.label}
+              </span>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
     // --- VÒNG LẶP CẬP NHẬT (PERFORMANCE GUARDRAILS) ---
     window.addEventListener('DOMContentLoaded', () => {
       initChart();
       updateDashboard();
       fetchCandleData();
+      fetchPerformanceData();
 
       // Snapshot số liệu & tín hiệu: mỗi 3 giây
       setInterval(updateDashboard, 3000);
 
       // Biểu đồ nến: mỗi 15 giây (tiết kiệm băng thông & tải render canvas)
       setInterval(fetchCandleData, 15000);
+
+      // Hiệu suất đề xuất (Paper-tracking): mỗi 30 giây (tiết kiệm CPU & I/O)
+      setInterval(fetchPerformanceData, 30000);
     });
   </script>
 </body>
@@ -3473,6 +4911,7 @@ class DashboardServer:
         self._app.router.add_get("/health",       self.handle_health)
         self._app.router.add_get("/api/snapshot", self.handle_snapshot)
         self._app.router.add_get("/api/candles",  self.handle_candles)
+        self._app.router.add_get("/api/performance", self.handle_performance)
         self._app.router.add_get("/api/health",   self.handle_health)
         self._app.router.add_post("/api/config",  self.handle_save_config)
         self._runner: Optional[web.AppRunner] = None
@@ -3592,6 +5031,9 @@ class DashboardServer:
                 adv_dict["validity"] = validity
                 advice_payload[a][tf] = adv_dict
 
+        tracker = getattr(self._orchestrator, "outcome_tracker", None)
+        tracker_summary = tracker.get_summary() if tracker else None
+
         data = {
             "status": "online",
             "uptime_seconds": uptime_sec,
@@ -3602,6 +5044,43 @@ class DashboardServer:
             "indicators": self._orchestrator._latest_indicators,
             "signals": list(self._orchestrator._recent_signals),
             "advice": advice_payload,
+            "tracker_summary": tracker_summary,
+        }
+        return web.json_response(data)
+
+    async def handle_performance(self, request: web.Request) -> web.Response:
+        """
+        Paper-tracking / Forward-testing performance analytics endpoint.
+        Returns metrics, breakdown, equity curve, and recent tracks.
+        """
+        tracker = getattr(self._orchestrator, "outcome_tracker", None)
+        if not tracker:
+            return web.json_response({"status": "error", "message": "Tracker not initialized"}, status=503)
+
+        asset = request.query.get("asset", "ALL").upper()
+        tf = request.query.get("tf", "ALL").lower()
+        confidence = request.query.get("confidence", "ALL")
+        limit_str = request.query.get("limit", "20")
+        try:
+            limit = int(limit_str)
+        except ValueError:
+            limit = 20
+
+        metrics = tracker.get_metrics(asset=asset, timeframe=tf, confidence=confidence)
+        recent_tracks = tracker.get_recent_tracks(asset=asset, timeframe=tf, confidence=confidence, limit=limit)
+
+        data = {
+            "status": "ok",
+            "tracking_mode": "paper_forward_test",
+            "last_updated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "filters": {
+                "asset": asset,
+                "timeframe": tf,
+                "confidence": confidence,
+            },
+            "metrics": metrics,
+            "recent_tracks": recent_tracks,
+            "disclaimer": "Đây là kết quả paper-tracking dựa trên nến OHLC đã đóng. Kết quả chưa bao gồm spread, commission, funding, swap và slippage thực tế; không phải cam kết hiệu quả giao dịch.",
         }
         return web.json_response(data)
 
@@ -3697,6 +5176,10 @@ class IndicatorOrchestrator:
         self._latest_indicators: dict[str, dict[str, dict]]   = {}
         self._recent_signals:    deque[dict]                  = deque(maxlen=50)
         self._latest_advice:     dict[str, dict[str, TradeAdvice]] = {}
+        self.outcome_tracker:    Optional[SignalOutcomeTracker] = SignalOutcomeTracker(
+            db_path=CONFIG.get("TRACKER_DB_PATH", "./data/signal_tracker.db"),
+            config=CONFIG,
+        )
 
     def _compute_advice_for_asset(self, asset: str, tf: str, ind: dict) -> None:
         """Compute trade advice using multi-timeframe indicators without triggering notifications."""
@@ -3834,6 +5317,26 @@ class IndicatorOrchestrator:
 
         # Compute trade advice (Web UI only -- NO Telegram dispatch)
         self._compute_advice_for_asset(asset, tf, ind)
+        advice = self._latest_advice.get(asset, {}).get(tf)
+
+        # Signal Outcome Tracker (Paper-tracking / Forward-testing)
+        enabled_tfs = CONFIG.get("TRACKER_ENABLED_TIMEFRAMES", ["1h", "4h"])
+        if self.outcome_tracker and tf in enabled_tfs:
+            # A. Cập nhật các track cũ bằng candle vừa đóng
+            self.outcome_tracker.process_closed_candle(
+                asset=asset,
+                timeframe=tf,
+                candle=latest,
+                latest_advice=advice,
+            )
+            # B. Sau đó mới xét tạo track mới từ advice hiện tại
+            if advice:
+                self.outcome_tracker.maybe_create_track(
+                    asset=asset,
+                    timeframe=tf,
+                    advice=advice,
+                    candle_ts=int(latest.ts),
+                )
 
     # ------------------------------------------------------------------ loops
     async def _asset_loop(self, asset: str, tf: str) -> None:

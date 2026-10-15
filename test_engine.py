@@ -7,7 +7,8 @@ from engine import (
     Signal, TelegramDispatcher, DashboardServer, IndicatorOrchestrator,
     TwelveDataFetcher, CONFIG, _parse_port, _load_dotenv, _update_dotenv,
     ConfluenceDecisionEngine, TradeAdvice, TrendState, RsiZone, BbPosition, Action, Confidence,
-    AdviceValidityStatus, check_advice_validity
+    AdviceValidityStatus, check_advice_validity,
+    TrackStatus, SignalTrack, SignalOutcomeTracker
 )
 
 class TestEngine(unittest.TestCase):
@@ -554,6 +555,249 @@ class TestEngine(unittest.TestCase):
             atr=4.0, cfg=CONFIG
         )
         self.assertEqual(validity["status"], "fresh")
+
+    def test_tracker_creates_only_for_valid_buy_sell_advice(self):
+        """WAIT, confidence thấp, invalidated advice không được tạo track."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
+
+            # 1. Action WAIT
+            wait_adv = TradeAdvice(action="WAIT", confidence="Cao", confidence_score=4, entry_price=100.0, stop_loss=95.0, take_profit_1=105.0)
+            self.assertFalse(tracker.should_create_track(wait_adv, "BTC", "1h"))
+
+            # 2. Confidence Thấp
+            low_conf = TradeAdvice(action="BUY", confidence="Thấp", confidence_score=1, entry_price=100.0, stop_loss=95.0, take_profit_1=105.0)
+            self.assertFalse(tracker.should_create_track(low_conf, "BTC", "1h"))
+
+            # 3. Validity Invalidated
+            inv_adv = TradeAdvice(action="BUY", confidence="Cao", confidence_score=4, entry_price=100.0, stop_loss=95.0, take_profit_1=105.0, validity={"status": "invalidated"})
+            self.assertFalse(tracker.should_create_track(inv_adv, "BTC", "1h"))
+
+            # 4. Valid BUY advice
+            valid_adv = TradeAdvice(action="BUY", confidence="Cao", confidence_score=4, entry_price=100.0, stop_loss=95.0, take_profit_1=105.0)
+            self.assertTrue(tracker.should_create_track(valid_adv, "BTC", "1h"))
+
+    def test_pending_pullback_entry_fills_only_when_candle_crosses_zone(self):
+        """wait_pullback chỉ fill khi low <= entry <= high."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
+
+            adv = TradeAdvice(
+                action="BUY", confidence="Cao", confidence_score=4,
+                entry_type="wait_pullback", entry_price=100.0, stop_loss=95.0, take_profit_1=105.0
+            )
+            track = tracker.maybe_create_track("BTC", "1h", adv, candle_ts=1000)
+            self.assertIsNotNone(track)
+            self.assertEqual(track.status, TrackStatus.PENDING_ENTRY.value)
+
+            # Candle 1: range [101, 105] không chứa entry 100
+            c1 = Candle(ts=2000, open=102.0, high=105.0, low=101.0, close=104.0, volume=10.0)
+            res1 = tracker.process_closed_candle("BTC", "1h", c1)
+            self.assertEqual(res1.status, TrackStatus.PENDING_ENTRY.value)
+
+            # Candle 2: range [99, 103] đi qua entry 100 -> Fill!
+            c2 = Candle(ts=3000, open=101.0, high=103.0, low=99.0, close=102.0, volume=10.0)
+            res2 = tracker.process_closed_candle("BTC", "1h", c2)
+            self.assertEqual(res2.status, TrackStatus.OPEN.value)
+            self.assertEqual(res2.actual_entry, 100.0)
+
+    def test_entry_does_not_evaluate_tp_or_sl_on_same_candle(self):
+        """Candle fill Entry không được đồng thời dùng để chốt TP/SL."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
+
+            adv = TradeAdvice(
+                action="BUY", confidence="Cao", confidence_score=4,
+                entry_type="now", entry_price=100.0, stop_loss=90.0, take_profit_1=110.0
+            )
+            track = tracker.maybe_create_track("BTC", "1h", adv, candle_ts=1000)
+
+            # Nến này fill Entry và có high=120 (vượt TP 110) và low=85 (vượt SL 90)
+            c1 = Candle(ts=2000, open=100.0, high=120.0, low=85.0, close=105.0, volume=10.0)
+            res = tracker.process_closed_candle("BTC", "1h", c1)
+            # Phải là OPEN, KHÔNG được chuyển thành CLOSED_TP, CLOSED_SL hay AMBIGUOUS ở cây nến fill này!
+            self.assertEqual(res.status, TrackStatus.OPEN.value)
+            self.assertEqual(res.entry_filled_at_ts, 2000)
+
+    def test_sell_tp1_then_stop_loss_calculates_weighted_r(self):
+        """SELL đạt TP1 40%, sau đó SL phần 60% còn lại:
+        realized_r phải là weighted result, không được đơn giản là -1R."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
+
+            adv = TradeAdvice(
+                action="SELL", confidence="Cao", confidence_score=4,
+                entry_type="now", entry_price=100.0, stop_loss=102.0,
+                tp_levels=[
+                    {"label": "TP1", "price": 99.0, "close_pct": 0.40, "margin_profit_pct": 5.0},
+                    {"label": "TP2", "price": 98.0, "close_pct": 0.35, "margin_profit_pct": 7.5},
+                    {"label": "TP3", "price": 97.0, "close_pct": 0.25, "margin_profit_pct": 10.0},
+                ]
+            )
+            track = tracker.maybe_create_track("BTC", "1h", adv, candle_ts=1000)
+
+            # Nến 1: Fill Entry
+            c1 = Candle(ts=2000, open=100.0, high=101.0, low=99.5, close=100.0, volume=1.0)
+            tracker.process_closed_candle("BTC", "1h", c1)
+
+            # Nến 2: Chạm TP1 (low=98.8 <= 99.0, high=100.5 < 102.0)
+            # risk_per_unit = |100 - 102| = 2.0. R_tp1 = (100 - 99)/2.0 = 0.5R.
+            # Weighted TP1: 0.5R * 0.40 = +0.2R.
+            c2 = Candle(ts=3000, open=100.0, high=100.5, low=98.8, close=99.2, volume=1.0)
+            res2 = tracker.process_closed_candle("BTC", "1h", c2)
+            self.assertEqual(res2.status, TrackStatus.PARTIAL_TP1.value)
+            self.assertAlmostEqual(res2.realized_r, 0.20, places=2)
+
+            # Nến 3: Chạm SL (high=102.5 >= 102.0)
+            # 60% còn lại bị -1.0R * 0.60 = -0.60R.
+            # Tổng R: 0.20 - 0.60 = -0.40R.
+            c3 = Candle(ts=4000, open=99.5, high=102.5, low=99.5, close=102.0, volume=1.0)
+            res3 = tracker.process_closed_candle("BTC", "1h", c3)
+            self.assertEqual(res3.status, TrackStatus.CLOSED_SL.value)
+            self.assertAlmostEqual(res3.realized_r, -0.40, places=2)
+
+    def test_ambiguous_candle_excluded_from_win_loss_metrics(self):
+        """Cùng nến chạm TP và SL -> AMBIGUOUS, không tính vào win/loss."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
+
+            # Case BUY: SL=95, TP1=105
+            adv = TradeAdvice(action="BUY", confidence="Cao", confidence_score=4, entry_type="now", entry_price=100.0, stop_loss=95.0, take_profit_1=105.0)
+            tracker.maybe_create_track("BTC", "1h", adv, candle_ts=1000)
+            c1 = Candle(ts=2000, open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0)
+            tracker.process_closed_candle("BTC", "1h", c1)
+
+            # Nến tiếp theo vừa quét SL 95 vừa quét TP 105
+            c2 = Candle(ts=3000, open=100.0, high=106.0, low=94.0, close=99.0, volume=1.0)
+            res_buy = tracker.process_closed_candle("BTC", "1h", c2)
+            self.assertEqual(res_buy.status, TrackStatus.AMBIGUOUS.value)
+
+            # Case SELL: SL=105, TP1=95
+            adv_sell = TradeAdvice(action="SELL", confidence="Cao", confidence_score=4, entry_type="now", entry_price=100.0, stop_loss=105.0, take_profit_1=95.0)
+            tracker.maybe_create_track("XAU", "1h", adv_sell, candle_ts=1000)
+            c3 = Candle(ts=2000, open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0)
+            tracker.process_closed_candle("XAU", "1h", c3)
+
+            c4 = Candle(ts=3000, open=100.0, high=106.0, low=94.0, close=99.0, volume=1.0)
+            res_sell = tracker.process_closed_candle("XAU", "1h", c4)
+            self.assertEqual(res_sell.status, TrackStatus.AMBIGUOUS.value)
+
+            # Kiểm tra metrics: Cả 2 đều loại khỏi win_count và loss_count
+            m = tracker.get_metrics("ALL", "ALL", "ALL")
+            self.assertEqual(m["ambiguous_count"], 2)
+            self.assertEqual(m["win_count"], 0)
+            self.assertEqual(m["loss_count"], 0)
+
+    def test_invalidated_advice_before_entry_is_not_counted_as_loss(self):
+        """Advice invalidated trước Entry không được coi là lệnh thua."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
+
+            adv = TradeAdvice(action="BUY", confidence="Cao", confidence_score=4, entry_type="wait_pullback", entry_price=100.0, stop_loss=95.0, take_profit_1=105.0)
+            tracker.maybe_create_track("BTC", "1h", adv, candle_ts=1000)
+
+            # Nến chưa chạm entry nhưng latest_advice bị invalidated
+            inv_advice = TradeAdvice(action="BUY", confidence="Cao", confidence_score=4, entry_price=100.0, stop_loss=95.0, take_profit_1=105.0, validity={"status": "invalidated"})
+            c1 = Candle(ts=2000, open=102.0, high=104.0, low=101.0, close=103.0, volume=1.0)
+            res = tracker.process_closed_candle("BTC", "1h", c1, latest_advice=inv_advice)
+
+            self.assertEqual(res.status, TrackStatus.INVALIDATED.value)
+            self.assertEqual(res.realized_r, 0.0)
+
+            m = tracker.get_metrics("ALL", "ALL", "ALL")
+            self.assertEqual(m["invalidated_count"], 1)
+            self.assertEqual(m["loss_count"], 0)
+
+    def test_pending_track_expires_after_configured_candles(self):
+        """Pending entry quá hạn phải thành EXPIRED."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            cfg = dict(CONFIG)
+            cfg["TRACK_PENDING_EXPIRY_CANDLES"] = {"1h": 2}
+            tracker = SignalOutcomeTracker(db_path=db_path, config=cfg)
+
+            adv = TradeAdvice(action="BUY", confidence="Cao", confidence_score=4, entry_type="wait_pullback", entry_price=100.0, stop_loss=95.0, take_profit_1=105.0)
+            track = tracker.maybe_create_track("BTC", "1h", adv, candle_ts=1000)
+            self.assertEqual(track.expiry_at_ts, 1000 + 2 * 3600)
+
+            # Nến 1: ts=2000 (chưa quá 1000 + 7200 = 8200)
+            c1 = Candle(ts=2000, open=105.0, high=106.0, low=104.0, close=105.0, volume=1.0)
+            tracker.process_closed_candle("BTC", "1h", c1)
+            self.assertEqual(track.status, TrackStatus.PENDING_ENTRY.value)
+
+            # Nến 2: ts=8500 (vượt quá 8200)
+            c2 = Candle(ts=8500, open=105.0, high=106.0, low=104.0, close=105.0, volume=1.0)
+            res = tracker.process_closed_candle("BTC", "1h", c2)
+            self.assertEqual(res.status, TrackStatus.EXPIRED.value)
+
+    def test_metrics_profit_factor_and_expectancy(self):
+        """Kiểm tra công thức Profit Factor, Expectancy và Total R."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
+
+            # Giả lập 2 track thắng (+2R, +1R) và 1 track thua (-1R)
+            t1 = SignalTrack(track_id="t1", created_at_ts=100, created_at_str="", asset="BTC", timeframe="1h", direction="BUY", confidence="Cao", confidence_score=4, status=TrackStatus.CLOSED_TP3.value, entry_type="now", planned_entry=100.0, actual_entry=100.0, entry_filled_at_ts=100, stop_loss=95.0, tp_levels=[], initial_advice_validity="fresh", advice_reasoning=[], realized_r=2.0)
+            t2 = SignalTrack(track_id="t2", created_at_ts=200, created_at_str="", asset="BTC", timeframe="1h", direction="BUY", confidence="Cao", confidence_score=4, status=TrackStatus.CLOSED_TP3.value, entry_type="now", planned_entry=100.0, actual_entry=100.0, entry_filled_at_ts=200, stop_loss=95.0, tp_levels=[], initial_advice_validity="fresh", advice_reasoning=[], realized_r=1.0)
+            t3 = SignalTrack(track_id="t3", created_at_ts=300, created_at_str="", asset="BTC", timeframe="1h", direction="BUY", confidence="Cao", confidence_score=4, status=TrackStatus.CLOSED_SL.value, entry_type="now", planned_entry=100.0, actual_entry=100.0, entry_filled_at_ts=300, stop_loss=95.0, tp_levels=[], initial_advice_validity="fresh", advice_reasoning=[], realized_r=-1.0)
+
+            tracker._save_track(t1)
+            tracker._save_track(t2)
+            tracker._save_track(t3)
+
+            m = tracker.get_metrics("ALL", "ALL", "ALL")
+            self.assertEqual(m["win_count"], 2)
+            self.assertEqual(m["loss_count"], 1)
+            self.assertEqual(m["closed_count"], 3)
+            self.assertAlmostEqual(m["total_r"], 2.0, places=2)
+            # Profit Factor = (2.0 + 1.0) / 1.0 = 3.0
+            self.assertEqual(m["profit_factor"], 3.0)
+            # Expectancy = 2.0 / 3 = 0.67R
+            self.assertAlmostEqual(m["expectancy_r"], 0.67, places=2)
+
+    def test_metrics_does_not_claim_profit_with_under_30_samples(self):
+        """Sample < 30 phải trả sample_size_warning."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
+
+            t1 = SignalTrack(track_id="t1", created_at_ts=100, created_at_str="", asset="BTC", timeframe="1h", direction="BUY", confidence="Cao", confidence_score=4, status=TrackStatus.CLOSED_TP3.value, entry_type="now", planned_entry=100.0, actual_entry=100.0, entry_filled_at_ts=100, stop_loss=95.0, tp_levels=[], initial_advice_validity="fresh", advice_reasoning=[], realized_r=2.0)
+            tracker._save_track(t1)
+
+            m = tracker.get_metrics("ALL", "ALL", "ALL")
+            self.assertIsNotNone(m["sample_size_warning"])
+            self.assertIn("tối thiểu 30", m["sample_size_warning"])
+
+    def test_tracker_database_is_bounded(self):
+        """Khi vượt TRACKER_MAX_HISTORY_RECORDS, phải trim terminal records cũ."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test.db")
+            cfg = dict(CONFIG)
+            cfg["TRACKER_MAX_HISTORY_RECORDS"] = 5
+            tracker = SignalOutcomeTracker(db_path=db_path, config=cfg)
+
+            # Insert 7 terminal tracks
+            for i in range(7):
+                t = SignalTrack(
+                    track_id=f"t_{i}", created_at_ts=1000 + i, created_at_str="", asset="BTC", timeframe="1h",
+                    direction="BUY", confidence="Cao", confidence_score=4, status=TrackStatus.CLOSED_SL.value,
+                    entry_type="now", planned_entry=100.0, actual_entry=100.0, entry_filled_at_ts=1000 + i,
+                    stop_loss=95.0, tp_levels=[], initial_advice_validity="fresh", advice_reasoning=[],
+                    realized_r=-1.0
+                )
+                tracker._save_track(t)
+
+            tracker._trim_database_if_needed()
+
+            with tracker._get_connection() as conn:
+                cnt = conn.execute("SELECT COUNT(*) as c FROM signal_tracks").fetchone()["c"]
+                self.assertLessEqual(cnt, 5)
 
 
 if __name__ == "__main__":
