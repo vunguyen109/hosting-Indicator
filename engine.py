@@ -2334,15 +2334,15 @@ class SignalOutcomeTracker:
                 cursor = conn.cursor()
                 query = "SELECT * FROM signal_tracks WHERE 1=1"
                 params: list = []
-                if asset != "ALL":
+                if asset and str(asset).strip().upper() != "ALL":
                     query += " AND asset = ?"
-                    params.append(asset)
-                if timeframe != "ALL":
+                    params.append(str(asset).strip().upper())
+                if timeframe and str(timeframe).strip().upper() != "ALL":
                     query += " AND timeframe = ?"
-                    params.append(timeframe)
-                if confidence != "ALL":
+                    params.append(str(timeframe).strip().lower())
+                if confidence and str(confidence).strip().upper() != "ALL":
                     query += " AND confidence = ?"
-                    params.append(confidence)
+                    params.append(str(confidence).strip())
 
                 query += " ORDER BY created_at_ts ASC"
                 cursor.execute(query, params)
@@ -2503,15 +2503,15 @@ class SignalOutcomeTracker:
                 cursor = conn.cursor()
                 query = "SELECT payload_json FROM signal_tracks WHERE 1=1"
                 params: list = []
-                if asset != "ALL":
+                if asset and str(asset).strip().upper() != "ALL":
                     query += " AND asset = ?"
-                    params.append(asset)
-                if timeframe != "ALL":
+                    params.append(str(asset).strip().upper())
+                if timeframe and str(timeframe).strip().upper() != "ALL":
                     query += " AND timeframe = ?"
-                    params.append(timeframe)
-                if confidence != "ALL":
+                    params.append(str(timeframe).strip().lower())
+                if confidence and str(confidence).strip().upper() != "ALL":
                     query += " AND confidence = ?"
-                    params.append(confidence)
+                    params.append(str(confidence).strip())
 
                 query += " ORDER BY created_at_ts DESC LIMIT ?"
                 params.append(limit)
@@ -5369,9 +5369,12 @@ class DashboardServer:
         if not tracker:
             return web.json_response({"status": "error", "message": "Tracker not initialized"}, status=503)
 
-        asset = request.query.get("asset", "ALL").upper()
-        tf = request.query.get("tf", "ALL").lower()
-        confidence = request.query.get("confidence", "ALL")
+        raw_asset = request.query.get("asset", "ALL").strip()
+        asset = "ALL" if raw_asset.upper() == "ALL" else raw_asset.upper()
+        raw_tf = request.query.get("tf", "ALL").strip()
+        tf = "ALL" if raw_tf.upper() == "ALL" else raw_tf.lower()
+        raw_conf = request.query.get("confidence", "ALL").strip()
+        confidence = "ALL" if raw_conf.upper() == "ALL" else raw_conf
         limit_str = request.query.get("limit", "20")
         try:
             limit = int(limit_str)

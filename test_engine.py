@@ -976,7 +976,69 @@ def test_btc_1h_case_regression_still_matches_verified_numbers():
     assert abs(payload["sl_price"] - 82594.2353) < 0.01
 
 
+def test_performance_filters_case_insensitivity_and_defaults(tmp_path):
+    """Đảm bảo query với timeframe='ALL', 'all', hoặc không truyền param đều không bị lọc nhầm thành timeframe='all'."""
+    import asyncio
+    import json
+    from engine import SignalOutcomeTracker, SignalTrack, TrackStatus, DashboardServer, IndicatorOrchestrator
+
+    db_path = str(tmp_path / "tracker_test.db")
+    tracker = SignalOutcomeTracker(db_path=db_path)
+
+    t1 = SignalTrack(
+        track_id="track_1", created_at_ts=1000, created_at_str="2026-10-16 01:00:00 UTC",
+        asset="BTC", timeframe="1h", direction="SELL", confidence="Trung bình", confidence_score=3,
+        status=TrackStatus.OPEN.value, entry_type="now", planned_entry=80000.0, actual_entry=80000.0,
+        entry_filled_at_ts=1000, stop_loss=81000.0, tp_levels=[], initial_advice_validity="fresh",
+        advice_reasoning=["Test reasoning"], realized_r=0.0
+    )
+    t2 = SignalTrack(
+        track_id="track_2", created_at_ts=2000, created_at_str="2026-10-16 02:00:00 UTC",
+        asset="XAU", timeframe="4h", direction="BUY", confidence="Cao", confidence_score=4,
+        status=TrackStatus.PENDING_ENTRY.value, entry_type="wait_pullback", planned_entry=4150.0, actual_entry=None,
+        entry_filled_at_ts=None, stop_loss=4130.0, tp_levels=[], initial_advice_validity="fresh",
+        advice_reasoning=["Test reasoning"], realized_r=0.0
+    )
+    tracker._save_track(t1)
+    tracker._save_track(t2)
+
+    # 1. Kiểm tra trực tiếp tracker.get_metrics
+    assert tracker.get_metrics(timeframe="ALL")["total_tracks"] == 2
+    assert tracker.get_metrics(timeframe="all")["total_tracks"] == 2
+    assert tracker.get_metrics(timeframe="1h")["total_tracks"] == 1
+    assert tracker.get_metrics(timeframe="4h")["total_tracks"] == 1
+
+    # 2. Kiểm tra trực tiếp tracker.get_recent_tracks
+    assert len(tracker.get_recent_tracks(timeframe="ALL")) == 2
+    assert len(tracker.get_recent_tracks(timeframe="all")) == 2
+    assert len(tracker.get_recent_tracks(timeframe="1h")) == 1
+
+    # 3. Kiểm tra thông qua endpoint /api/performance của DashboardServer
+    orch = IndicatorOrchestrator()
+    orch.outcome_tracker = tracker
+    server = DashboardServer(orch, "127.0.0.1", 8080)
+
+    class MockRequest:
+        def __init__(self, query):
+            self.query = query
+
+    # Khi frontend gọi mặc định với tf="ALL" (như trong dashboard.html)
+    req1 = MockRequest({"asset": "ALL", "tf": "ALL", "confidence": "ALL"})
+    res1 = asyncio.run(server.handle_performance(req1))
+    data1 = json.loads(res1.text)
+    assert len(data1["recent_tracks"]) == 2
+    assert data1["metrics"]["total_tracks"] == 2
+
+    # Khi client gọi không truyền param
+    req2 = MockRequest({})
+    res2 = asyncio.run(server.handle_performance(req2))
+    data2 = json.loads(res2.text)
+    assert len(data2["recent_tracks"]) == 2
+    assert data2["metrics"]["total_tracks"] == 2
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
