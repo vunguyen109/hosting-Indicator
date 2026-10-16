@@ -118,6 +118,8 @@ def _parse_port(default: int = 8080) -> int:
         return default
 
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # =============================================================================
 # SECTION 1: CONFIGURATION
 # =============================================================================
@@ -234,13 +236,13 @@ CONFIG = {
     # Poll 5 seconds after candle close for exchange data to settle
     "poll_offset_seconds": 5,
 
-    # ---- State persistence (relative path for container portability) ----
-    "state_file":           os.environ.get("STATE_FILE", "./data/state.json"),
+    # ---- State persistence (absolute path based on BASE_DIR) ------------
+    "state_file":           os.path.abspath(os.environ.get("STATE_FILE", os.path.join(BASE_DIR, "data", "state.json"))),
     "state_max_bytes":      1_500_000,   # 1.5 MB ceiling before trim
     "state_flush_interval": 900,         # flush every 15 minutes
 
-    # ---- Logging (relative path for container portability) --------------
-    "log_file":        os.environ.get("LOG_FILE", "./logs/app.log"),
+    # ---- Logging (absolute path based on BASE_DIR) ----------------------
+    "log_file":        os.path.abspath(os.environ.get("LOG_FILE", os.path.join(BASE_DIR, "logs", "app.log"))),
     "log_max_bytes":    5_242_880,       # 5 MB per file
     "log_backup_count": 2,               # 2 backup files => max 15 MB logs
 
@@ -255,7 +257,7 @@ CONFIG = {
     "TRACKER_DEFAULT_LEVERAGE":     5,
     "TRACKER_MAX_HISTORY_RECORDS":  500,
     "TRACKER_MAX_DB_SIZE_MB":       20,
-    "TRACKER_DB_PATH":              os.environ.get("TRACKER_DB_PATH", "./data/signal_tracker.db"),
+    "TRACKER_DB_PATH":              os.path.abspath(os.environ.get("TRACKER_DB_PATH", os.path.join(BASE_DIR, "data", "signal_tracker.db"))),
 }
 
 # Timeframe identifier -> seconds
@@ -1415,9 +1417,10 @@ class SignalOutcomeTracker:
     Bounded SQLite persistence with WAL mode & automated cleanup.
     """
 
-    def __init__(self, db_path: str = "./data/signal_tracker.db", config: dict = None) -> None:
+    def __init__(self, db_path: str = None, config: dict = None) -> None:
         self.config = config or CONFIG
-        self.db_path = db_path or self.config.get("TRACKER_DB_PATH", "./data/signal_tracker.db")
+        raw_db = db_path or self.config.get("TRACKER_DB_PATH", os.path.join(BASE_DIR, "data", "signal_tracker.db"))
+        self.db_path = os.path.abspath(raw_db)
         self._active_tracks: dict[str, SignalTrack] = {}  # key: f"{asset}_{timeframe}"
         self._last_vacuum_ts: float = 0.0
         self._cached_metrics: Optional[dict] = None
@@ -1585,7 +1588,7 @@ class SignalOutcomeTracker:
                 ))
                 conn.commit()
         except Exception as exc:
-            logger.error(f"[Tracker] Failed to save track {track.track_id}: {exc}")
+            logger.error(f"[Tracker] Database write error for track {track.track_id}: {exc}", exc_info=True)
 
     def _trim_database_if_needed(self) -> None:
         """Keep database bounded within TRACKER_MAX_HISTORY_RECORDS and TRACKER_MAX_DB_SIZE_MB."""
@@ -5241,11 +5244,24 @@ class IndicatorOrchestrator:
                 await asyncio.sleep(1)   # respect rate limits during init
 
         # Compute initial advice for all buffers
+        enabled_tfs = CONFIG.get("TRACKER_ENABLED_TIMEFRAMES", ["1h", "4h"])
         for a, cfg_a in CONFIG["assets"].items():
             for t in cfg_a.get("timeframes", []):
                 ind_snap = self._latest_indicators.get(a, {}).get(t)
                 if ind_snap:
                     self._compute_advice_for_asset(a, t, ind_snap)
+                    if self.outcome_tracker and t in enabled_tfs:
+                        init_adv = self._latest_advice.get(a, {}).get(t)
+                        buf_init = self._bufs.get(a, {}).get(t)
+                        last_c = buf_init.latest if buf_init else None
+                        if init_adv and last_c:
+                            logger.info(f"[Tracker] Initial advice track evaluated for [{a} {t}]: {init_adv.action} ({init_adv.confidence})")
+                            self.outcome_tracker.maybe_create_track(
+                                asset=a,
+                                timeframe=t,
+                                advice=init_adv,
+                                candle_ts=int(last_c.ts),
+                            )
 
     async def reload_asset_buffers(self, asset_names: list[str]) -> None:
         """Fetch historical candles and compute indicators for specific assets in background."""
@@ -5269,10 +5285,23 @@ class IndicatorOrchestrator:
                 await asyncio.sleep(1)
 
             # Recompute advice for reloaded assets
+            enabled_tfs = CONFIG.get("TRACKER_ENABLED_TIMEFRAMES", ["1h", "4h"])
             for tf in cfg["timeframes"]:
                 ind_snap = self._latest_indicators.get(asset, {}).get(tf)
                 if ind_snap:
                     self._compute_advice_for_asset(asset, tf, ind_snap)
+                    if self.outcome_tracker and tf in enabled_tfs:
+                        rel_adv = self._latest_advice.get(asset, {}).get(tf)
+                        rel_buf = self._bufs.get(asset, {}).get(tf)
+                        rel_last = rel_buf.latest if rel_buf else None
+                        if rel_adv and rel_last:
+                            logger.info(f"[Tracker] Reload advice track evaluated for [{asset} {tf}]: {rel_adv.action} ({rel_adv.confidence})")
+                            self.outcome_tracker.maybe_create_track(
+                                asset=asset,
+                                timeframe=tf,
+                                advice=rel_adv,
+                                candle_ts=int(rel_last.ts),
+                            )
 
     # --------------------------------------------------------------- fetching
     async def _fetch(
