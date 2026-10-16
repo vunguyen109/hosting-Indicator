@@ -804,8 +804,8 @@
       </div>
       <div class="tabs-group">
         <span class="group-label">Khung giờ:</span>
-        <button class="tab-btn active" id="btnTf15m" onclick="selectTimeframe('15m')">15 Phút (Ngắn hạn)</button>
-        <button class="tab-btn" id="btnTf1h" onclick="selectTimeframe('1h')">1 Giờ (Trung hạn)</button>
+        <button class="tab-btn" id="btnTf15m" style="display:none;" onclick="selectTimeframe('15m')">15 Phút (Ngắn hạn)</button>
+        <button class="tab-btn active" id="btnTf1h" onclick="selectTimeframe('1h')">1 Giờ (Trung hạn)</button>
         <button class="tab-btn" id="btnTf4h" onclick="selectTimeframe('4h')">4 Giờ (Swing)</button>
       </div>
     </div>
@@ -1193,7 +1193,7 @@
   <script>
     // --- BIẾN TRẠNG THÁI CLIENT ---
     let currentAsset = 'BTC';
-    let currentTimeframe = '15m';
+    let currentTimeframe = '1h';
     let chartInstance = null;
     let candleSeries = null;
     let ema20Series = null;
@@ -1409,8 +1409,10 @@
       // 2. Điểm Xung lực RSI (35%)
       const scoreRsi = Math.max(0, Math.min(100, rsi));
       let textRsi = '⚖️ Cân bằng';
-      if (rsi >= 70) textRsi = '🔥 Quá mua';
-      else if (rsi <= 30) textRsi = '❄️ Quá bán';
+      if (rsi >= 75) textRsi = '🔥 Quá mua';
+      else if (rsi >= 60) textRsi = '📈 Nghiêng mua';
+      else if (rsi <= 25) textRsi = '❄️ Quá bán';
+      else if (rsi <= 40) textRsi = '📉 Nghiêng bán';
 
       // 3. Điểm Vị trí Bollinger Bands (25%)
       let scoreBb = 50;
@@ -1823,7 +1825,20 @@
       }
 
       // Entry / SL / TP
-      if (advice.action === 'WAIT') {
+      if (advice.display_action === 'HIDDEN') {
+        if (actionBadge && actionText) {
+          actionText.textContent = 'TRUNG LẬP';
+          actionBadge.className = 'advice-action-badge action-wait';
+        }
+        if (metaBadge) metaBadge.style.display = 'none';
+        setLevelsOpacity('1');
+        if (levelsGrid) levelsGrid.style.display = 'none';
+        if (swingTpBox) swingTpBox.style.display = 'none';
+        if (waitMessage) {
+          waitMessage.style.display = 'flex';
+          waitMessage.innerHTML = '<span>⏸</span><span>' + (advice.display_label || 'Tín hiệu yếu – chưa đủ điều kiện khuyến nghị') + '</span>';
+        }
+      } else if (advice.action === 'WAIT') {
         setLevelsOpacity('1');
         if (levelsGrid) levelsGrid.style.display = 'none';
         if (swingTpBox) swingTpBox.style.display = 'none';

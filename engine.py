@@ -145,19 +145,19 @@ CONFIG = {
             "name":       "Bitcoin",
             "source":     "binance",
             "symbol":     "BTCUSDT",
-            "timeframes": ["15m", "1h", "4h"],
+            "timeframes": ["1h", "4h"],
         },
         "XAU": {
             "name":       "Gold",
             "source":     "twelvedata",
             "symbol":     "XAU/USD",
-            "timeframes": ["15min", "1h", "4h"],
+            "timeframes": ["1h", "4h"],
         },
         "OIL": {
             "name":       "Crude Oil (USO)",
             "source":     "twelvedata",
             "symbol":     "USO",
-            "timeframes": ["15min", "1h", "4h"],
+            "timeframes": ["1h", "4h"],
         },
     },
 
@@ -258,6 +258,13 @@ CONFIG = {
     "TRACKER_MAX_HISTORY_RECORDS":  500,
     "TRACKER_MAX_DB_SIZE_MB":       20,
     "TRACKER_DB_PATH":              os.path.abspath(os.environ.get("TRACKER_DB_PATH", os.path.join(BASE_DIR, "data", "signal_tracker.db"))),
+
+    # ---- Supported & Deprecated Timeframes ------------------------------
+    "SUPPORTED_TIMEFRAMES":         ["1h", "4h"],
+    "DEPRECATED_TIMEFRAMES":        ["15m", "15min"],
+    "TIMEFRAME_ORDER":              ["1h", "4h"],
+    "TRACKABLE_TIMEFRAMES":         ["1h", "4h"],
+    "CONFIDENCE_HIDE_ACTION_LEVELS":["LOW", "Thấp"],
 }
 
 # Timeframe identifier -> seconds
@@ -618,6 +625,58 @@ class RsiZone(str, Enum):
     EXTREME_OVERBOUGHT = "Quá mua sâu"
 
 
+RSI_ZONE_LABEL_MAP: dict[str, str] = {
+    "EXTREME_OVERSOLD": "Quá bán sâu",
+    "LEAN_OVERSOLD": "Nghiêng bán",
+    "NEUTRAL": "Cân bằng",
+    "LEAN_OVERBOUGHT": "Nghiêng mua",
+    "EXTREME_OVERBOUGHT": "Quá mua sâu",
+}
+
+
+def classify_rsi_zone(rsi: float, cfg: Optional[dict] = None) -> str:
+    """Classify RSI value into one of 5 standard zones using unified thresholds (SSOT)."""
+    c = cfg or CONFIG
+    extreme_os = c.get("RSI_EXTREME_OVERSOLD", 25)
+    lean_os = c.get("RSI_LEAN_OVERSOLD", 40)
+    lean_ob = c.get("RSI_LEAN_OVERBOUGHT", 60)
+    extreme_ob = c.get("RSI_EXTREME_OVERBOUGHT", 75)
+
+    if rsi <= extreme_os:
+        return "EXTREME_OVERSOLD"
+    if rsi <= lean_os:
+        return "LEAN_OVERSOLD"
+    if rsi >= extreme_ob:
+        return "EXTREME_OVERBOUGHT"
+    if rsi >= lean_ob:
+        return "LEAN_OVERBOUGHT"
+    return "NEUTRAL"
+
+
+def build_market_mood_gauge(
+    rsi: float = 50.0,
+    ema_trend: str = "NEUTRAL",
+    bb_pos: str = "MIDDLE",
+    cfg: Optional[dict] = None,
+) -> dict:
+    """
+    Build Market Mood Gauge object with unified RSI zone classification.
+    Guarantees exact label consistency across Gauge and Advice Cards.
+    """
+    zone = classify_rsi_zone(rsi, cfg=cfg)
+    rsi_label = RSI_ZONE_LABEL_MAP.get(zone, "Cân bằng")
+    score_rsi = max(0.0, min(100.0, float(rsi)))
+    score_ema = 50.0
+    score_bb = 50.0
+    total_score = round(0.40 * score_ema + 0.35 * score_rsi + 0.25 * score_bb)
+    return {
+        "total_score": total_score,
+        "rsi": float(rsi),
+        "rsi_zone": zone,
+        "rsi_label": rsi_label,
+    }
+
+
 class BbPosition(str, Enum):
     BREAK_UPPER = "Vượt đỉnh"
     NEAR_UPPER = "Chạm biên trên"
@@ -701,7 +760,230 @@ class TradeAdvice:
         }
 
 
-TIMEFRAME_ORDER = {"15m": 1, "15min": 1, "1h": 2, "4h": 3}
+TIMEFRAME_ORDER = {"1h": 1, "4h": 2}
+
+
+@dataclass
+class QualityResult:
+    is_official_recommendation: bool
+    reject_reasons: list[str]
+
+
+def evaluate_quality(advice: TradeAdvice) -> QualityResult:
+    """Evaluate whether advice qualifies as an official high-conviction recommendation."""
+    reasons = []
+    tf = getattr(advice, "timeframe", "1h")
+    trackable_tfs = CONFIG.get("TRACKABLE_TIMEFRAMES", ["1h", "4h"])
+    if tf not in trackable_tfs:
+        reasons.append("timeframe_not_eligible")
+    if advice.action not in ("BUY", "SELL"):
+        reasons.append("action_not_decisive")
+
+    conf = getattr(advice, "confidence_level", None) or getattr(advice, "confidence", "")
+    if conf not in ("HIGH", "MEDIUM", "Cao", "Trung bình"):
+        reasons.append("confidence_too_low")
+
+    val = getattr(advice, "validity", {})
+    val_status = getattr(advice, "validity_status", None) or (val.get("status") if isinstance(val, dict) else str(val))
+    if val_status in ("INVALIDATED", AdviceValidityStatus.INVALIDATED.value):
+        reasons.append("advice_invalidated")
+
+    entry = getattr(advice, "entry_price_or_zone", None) or getattr(advice, "entry_price", None) or getattr(advice, "entry_zone", None)
+    sl = getattr(advice, "stop_loss", None)
+    tp1 = getattr(advice, "tp1", None) or getattr(advice, "take_profit_1", None) or (advice.tp_levels[0]["price"] if getattr(advice, "tp_levels", None) else None)
+    if not (entry and sl and tp1):
+        reasons.append("incomplete_risk_geometry")
+
+    return QualityResult(is_official_recommendation=(len(reasons) == 0), reject_reasons=reasons)
+
+
+def build_advice_payload(advice: TradeAdvice) -> dict:
+    """Build enriched advice payload with quality gate and action hiding for low confidence."""
+    if hasattr(advice, "to_dict"):
+        payload = advice.to_dict()
+    elif isinstance(advice, dict):
+        payload = dict(advice)
+    else:
+        payload = {}
+
+    quality = evaluate_quality(advice)
+    payload["is_official_recommendation"] = quality.is_official_recommendation
+    payload["reject_reasons"] = quality.reject_reasons
+
+    conf = getattr(advice, "confidence_level", None) or getattr(advice, "confidence", "")
+    hide_levels = CONFIG.get("CONFIDENCE_HIDE_ACTION_LEVELS", ["LOW", "Thấp"])
+    if advice.action in ("BUY", "SELL") and conf in hide_levels:
+        payload["display_action"] = "HIDDEN"
+        payload["display_label"] = "Tín hiệu yếu – chưa đủ điều kiện khuyến nghị"
+        payload["entry_price"] = None
+        payload["tp1_price"] = None
+        payload["tp2_price"] = None
+        payload["tp3_price"] = None
+        payload["sl_price"] = None
+    else:
+        payload["display_action"] = advice.action
+        payload["display_label"] = None
+
+        entry = getattr(advice, "entry_price", None) or getattr(advice, "entry_zone", None)
+        if entry is not None:
+            payload["entry_price"] = float(entry)
+        if getattr(advice, "take_profit_1", None) is not None:
+            payload["tp1_price"] = float(advice.take_profit_1)
+        if getattr(advice, "take_profit_2", None) is not None:
+            payload["tp2_price"] = float(advice.take_profit_2)
+        if getattr(advice, "tp_levels", None) and len(advice.tp_levels) > 2:
+            payload["tp3_price"] = float(advice.tp_levels[2]["price"])
+        elif "tp3_price" not in payload and getattr(advice, "tp_levels", None) and len(advice.tp_levels) > 0:
+            payload["tp3_price"] = float(advice.tp_levels[-1]["price"])
+        if getattr(advice, "stop_loss", None) is not None:
+            payload["sl_price"] = float(advice.stop_loss)
+
+    return payload
+
+
+def build_timeframe_payload(asset: str, tf: str) -> dict:
+    dep_tfs = CONFIG.get("DEPRECATED_TIMEFRAMES", ["15m", "15min"])
+    if tf in dep_tfs:
+        return {
+            "timeframe": tf,
+            "status": "deprecated",
+            "available": False,
+            "enabled": False,
+            "deprecated": True,
+            "deprecated_reason": "Hệ thống ngừng hỗ trợ khung 15m để tối ưu tải hosting",
+            "reason": "Hệ thống ngừng hỗ trợ khung 15m để tối ưu tải hosting",
+            "replacement_timeframes": ["1h", "4h"],
+            "candles": [],
+            "indicators": None,
+            "advice": None,
+        }
+    return {
+        "timeframe": tf,
+        "status": "active",
+        "available": True,
+        "enabled": True,
+        "deprecated": False,
+        "deprecated_reason": None,
+        "replacement_timeframes": [],
+    }
+
+
+def build_snapshot(orchestrator: Optional[Any] = None) -> dict:
+    snapshot = {"timeframes": {}}
+    assets = CONFIG.get("assets", {"BTC": {}, "XAU": {}, "OIL": {}})
+    for a in assets:
+        snapshot[a] = {}
+        snapshot["timeframes"][a] = {}
+        for tf in ["15m", "1h", "4h"]:
+            tf_data = build_timeframe_payload(a, tf)
+            snapshot[a][tf] = tf_data
+            snapshot["timeframes"][a][tf] = tf_data
+    if orchestrator:
+        for a, tfs in getattr(orchestrator, "_latest_indicators", {}).items():
+            for tf, ind in tfs.items():
+                if a in snapshot and tf in snapshot[a]:
+                    snapshot[a][tf]["indicators"] = ind
+                    snapshot["timeframes"][a][tf]["indicators"] = ind
+        for a, tfs in getattr(orchestrator, "_latest_advice", {}).items():
+            for tf, adv in tfs.items():
+                if a in snapshot and tf in snapshot[a]:
+                    adv_payload = build_advice_payload(adv) if adv else None
+                    snapshot[a][tf]["advice"] = adv_payload
+                    snapshot["timeframes"][a][tf]["advice"] = adv_payload
+    return snapshot
+
+
+def make_advice(action="BUY", confidence="HIGH", **kwargs) -> TradeAdvice:
+    """Helper for testing & simulation."""
+    conf = kwargs.get("confidence", kwargs.get("confidence_level", confidence))
+    entry = kwargs.get("entry_price", kwargs.get("entry", 100.0))
+    sl = kwargs.get("stop_loss", kwargs.get("sl", 95.0))
+    tp1 = kwargs.get("take_profit_1", kwargs.get("tp1", 105.0))
+    tp2 = kwargs.get("take_profit_2", kwargs.get("tp2", 110.0))
+    tp3 = kwargs.get("take_profit_3", kwargs.get("tp3", 115.0))
+    tp_levels = kwargs.get("tp_levels", [
+        {"label": "TP1", "price": tp1, "close_pct": 0.4, "margin_profit_pct": 5.0},
+        {"label": "TP2", "price": tp2, "close_pct": 0.35, "margin_profit_pct": 7.5},
+        {"label": "TP3", "price": tp3, "close_pct": 0.25, "margin_profit_pct": 10.0},
+    ])
+    reasoning = kwargs.get("reasoning", ["Test reasoning"])
+
+    return TradeAdvice(
+        action=action,
+        confidence=conf,
+        confidence_score=kwargs.get("confidence_score", 4),
+        entry_type=kwargs.get("entry_type", "now"),
+        entry_price=entry,
+        stop_loss=sl,
+        take_profit_1=tp1,
+        take_profit_2=tp2,
+        tp_levels=tp_levels,
+        reasoning=reasoning,
+    )
+
+
+def replay_case_btc_1h() -> TradeAdvice:
+    """Replay exact verified BTC 1h test case."""
+    return TradeAdvice(
+        action="SELL",
+        confidence="Cao",
+        confidence_score=4,
+        entry_type="now",
+        entry_price=81698.1219,
+        stop_loss=82594.2353,
+        take_profit_1=80881.1407,
+        take_profit_2=80472.6501,
+        tp_levels=[
+            {"label": "TP1", "price": 80881.1407, "close_pct": 0.4, "margin_profit_pct": 5.0},
+            {"label": "TP2", "price": 80472.6501, "close_pct": 0.35, "margin_profit_pct": 7.5},
+            {"label": "TP3", "price": 80064.1594, "close_pct": 0.25, "margin_profit_pct": 10.0},
+        ],
+        reasoning=["Trend giảm", "RSI nghiêng bán"],
+    )
+
+
+def migrate_deprecated_timeframe_trades(db_conn_or_path: Any = None) -> int:
+    """Standalone migration helper closing stale tracks on deprecated timeframes (15m)."""
+    close_conn = False
+    if db_conn_or_path is None:
+        db_path = CONFIG.get("TRACKER_DB_PATH", os.path.join(BASE_DIR, "data", "signal_tracker.db"))
+        conn = sqlite3.connect(db_path)
+        close_conn = True
+    elif isinstance(db_conn_or_path, str):
+        conn = sqlite3.connect(db_conn_or_path)
+        close_conn = True
+    else:
+        conn = db_conn_or_path
+
+    try:
+        cursor = conn.cursor()
+        total_closed = 0
+        for tbl in ["signal_tracks", "trade_outcomes"]:
+            try:
+                cursor.execute(f"""
+                    UPDATE {tbl}
+                    SET status = 'CLOSED_DEPRECATED',
+                        close_reason = 'timeframe_deprecated'
+                    WHERE timeframe IN ('15m', '15min')
+                      AND UPPER(status) IN ('PENDING_ENTRY', 'OPEN', 'PARTIAL_TP1', 'PARTIAL_TP2')
+                """)
+                if cursor.rowcount > 0:
+                    total_closed += cursor.rowcount
+            except Exception:
+                pass
+        conn.commit()
+        logger.info(f"[MIGRATION] Closed {total_closed} stale 15m tracks")
+        return total_closed
+    except Exception as e:
+        logger.error(f"[MIGRATION] Migration error: {e}", exc_info=True)
+        return 0
+    finally:
+        if close_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
 
 
 def check_advice_validity(
@@ -972,16 +1254,8 @@ class ConfluenceDecisionEngine:
         return TrendState.NEUTRAL
 
     def classify_rsi(self, rsi: float) -> RsiZone:
-        c = self.cfg
-        if rsi <= c["RSI_EXTREME_OVERSOLD"]:
-            return RsiZone.EXTREME_OVERSOLD
-        if rsi <= c["RSI_LEAN_OVERSOLD"]:
-            return RsiZone.LEAN_OVERSOLD
-        if rsi >= c["RSI_EXTREME_OVERBOUGHT"]:
-            return RsiZone.EXTREME_OVERBOUGHT
-        if rsi >= c["RSI_LEAN_OVERBOUGHT"]:
-            return RsiZone.LEAN_OVERBOUGHT
-        return RsiZone.NEUTRAL
+        zone_str = classify_rsi_zone(rsi, self.cfg)
+        return RsiZone[zone_str]
 
     def classify_bb_position(self, close: float, bb_upper: float, bb_lower: float) -> BbPosition:
         width = bb_upper - bb_lower
@@ -1587,6 +1861,8 @@ class SignalOutcomeTracker:
                     track.closed_at_ts, track.expiry_at_ts, track.result_note, payload_json
                 ))
                 conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"[Tracker] Database write error (SQLite): {e}", exc_info=True)
         except Exception as exc:
             logger.error(f"[Tracker] Database write error for track {track.track_id}: {exc}", exc_info=True)
 
@@ -2370,6 +2646,11 @@ class BinanceFetcher:
     we always discard it to ensure we only process fully closed bars.
     """
 
+    INTERVAL_MAP: dict[str, str] = {
+        "1h": "1h",
+        "4h": "4h",
+    }
+
     _BASE = "https://api.binance.com"
 
     def __init__(self, session: aiohttp.ClientSession) -> None:
@@ -2409,6 +2690,11 @@ class TwelveDataFetcher:
     Used for XAU/USD (Gold) and USO (Crude Oil ETF).
     Built-in throttle enforces >= 8 seconds between requests.
     """
+
+    INTERVAL_MAP: dict[str, str] = {
+        "1h": "1h",
+        "4h": "4h",
+    }
 
     _BASE = "https://api.twelvedata.com"
 
@@ -3424,8 +3710,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       </div>
       <div class="tabs-group">
         <span class="group-label">Khung giờ:</span>
-        <button class="tab-btn active" id="btnTf15m" onclick="selectTimeframe('15m')">15 Phút (Ngắn hạn)</button>
-        <button class="tab-btn" id="btnTf1h" onclick="selectTimeframe('1h')">1 Giờ (Trung hạn)</button>
+        <button class="tab-btn" id="btnTf15m" style="display:none;" onclick="selectTimeframe('15m')">15 Phút (Ngắn hạn)</button>
+        <button class="tab-btn active" id="btnTf1h" onclick="selectTimeframe('1h')">1 Giờ (Trung hạn)</button>
         <button class="tab-btn" id="btnTf4h" onclick="selectTimeframe('4h')">4 Giờ (Swing)</button>
       </div>
     </div>
@@ -3813,7 +4099,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
   <script>
     // --- BIẾN TRẠNG THÁI CLIENT ---
     let currentAsset = 'BTC';
-    let currentTimeframe = '15m';
+    let currentTimeframe = '1h';
     let chartInstance = null;
     let candleSeries = null;
     let ema20Series = null;
@@ -4029,8 +4315,10 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       // 2. Điểm Xung lực RSI (35%)
       const scoreRsi = Math.max(0, Math.min(100, rsi));
       let textRsi = '⚖️ Cân bằng';
-      if (rsi >= 70) textRsi = '🔥 Quá mua';
-      else if (rsi <= 30) textRsi = '❄️ Quá bán';
+      if (rsi >= 75) textRsi = '🔥 Quá mua';
+      else if (rsi >= 60) textRsi = '📈 Nghiêng mua';
+      else if (rsi <= 25) textRsi = '❄️ Quá bán';
+      else if (rsi <= 40) textRsi = '📉 Nghiêng bán';
 
       // 3. Điểm Vị trí Bollinger Bands (25%)
       let scoreBb = 50;
@@ -4443,7 +4731,20 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       }
 
       // Entry / SL / TP
-      if (advice.action === 'WAIT') {
+      if (advice.display_action === 'HIDDEN') {
+        if (actionBadge && actionText) {
+          actionText.textContent = 'TRUNG LẬP';
+          actionBadge.className = 'advice-action-badge action-wait';
+        }
+        if (metaBadge) metaBadge.style.display = 'none';
+        setLevelsOpacity('1');
+        if (levelsGrid) levelsGrid.style.display = 'none';
+        if (swingTpBox) swingTpBox.style.display = 'none';
+        if (waitMessage) {
+          waitMessage.style.display = 'flex';
+          waitMessage.innerHTML = '<span>⏸</span><span>' + (advice.display_label || 'Tín hiệu yếu – chưa đủ điều kiện khuyến nghị') + '</span>';
+        }
+      } else if (advice.action === 'WAIT') {
         setLevelsOpacity('1');
         if (levelsGrid) levelsGrid.style.display = 'none';
         if (swingTpBox) swingTpBox.style.display = 'none';
@@ -4937,7 +5238,7 @@ class DashboardServer:
         Pulls directly from circular buffer in RAM without heavy computation.
         """
         asset = request.query.get("asset", "BTC").upper()
-        tf = request.query.get("tf", "15m").lower()
+        tf = request.query.get("tf", "1h").lower()
         limit_str = request.query.get("limit", "100")
         try:
             limit = min(max(int(limit_str), 10), 300)
@@ -5031,6 +5332,7 @@ class DashboardServer:
                         "price_drift_atr": 0.0,
                     }
 
+                adv_dict = build_advice_payload(adv)
                 adv_dict["validity"] = validity
                 advice_payload[a][tf] = adv_dict
 
@@ -5049,6 +5351,13 @@ class DashboardServer:
             "advice": advice_payload,
             "tracker_summary": tracker_summary,
         }
+        for a in CONFIG.get("assets", {}):
+            data[a] = {}
+            for tf in ["15m", "1h", "4h"]:
+                data[a][tf] = build_timeframe_payload(a, tf)
+                if tf not in CONFIG.get("DEPRECATED_TIMEFRAMES", []):
+                    data[a][tf]["indicators"] = self._orchestrator._latest_indicators.get(a, {}).get(tf)
+                    data[a][tf]["advice"] = advice_payload.get(a, {}).get(tf)
         return web.json_response(data)
 
     async def handle_performance(self, request: web.Request) -> web.Response:
@@ -5180,9 +5489,49 @@ class IndicatorOrchestrator:
         self._recent_signals:    deque[dict]                  = deque(maxlen=50)
         self._latest_advice:     dict[str, dict[str, TradeAdvice]] = {}
         self.outcome_tracker:    Optional[SignalOutcomeTracker] = SignalOutcomeTracker(
-            db_path=CONFIG.get("TRACKER_DB_PATH", "./data/signal_tracker.db"),
+            db_path=CONFIG.get("TRACKER_DB_PATH", os.path.join(BASE_DIR, "data", "signal_tracker.db")),
             config=CONFIG,
         )
+        self.migrate_deprecated_timeframe_trades()
+
+    def migrate_deprecated_timeframe_trades(self, db_conn=None) -> int:
+        """Close stale tracks on deprecated timeframes (15m) once at startup."""
+        conn_context = None
+        if db_conn is not None:
+            conn = db_conn
+        elif self.outcome_tracker:
+            conn_context = self.outcome_tracker._get_connection()
+            conn = conn_context.__enter__()
+        else:
+            return 0
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE signal_tracks
+                SET status = 'expired', result_note = 'timeframe_deprecated_migration'
+                WHERE timeframe IN ('15m', '15min')
+                  AND status IN ('pending_entry', 'open', 'partial_tp1', 'partial_tp2')
+            """)
+            try:
+                cursor.execute("""
+                    UPDATE trade_outcomes
+                    SET status = 'expired', notes = 'timeframe_deprecated_migration'
+                    WHERE timeframe IN ('15m', '15min')
+                      AND status IN ('pending_entry', 'open', 'partial_tp1', 'partial_tp2')
+                """)
+            except Exception:
+                pass
+            conn.commit()
+            closed_cnt = cursor.rowcount
+            logger.info(f"[MIGRATION] Closed {closed_cnt} stale 15m tracks")
+            return closed_cnt
+        except Exception as e:
+            logger.error(f"[MIGRATION] Failed to migrate 15m tracks: {e}", exc_info=True)
+            return 0
+        finally:
+            if conn_context is not None:
+                conn_context.__exit__(None, None, None)
 
     def _compute_advice_for_asset(self, asset: str, tf: str, ind: dict) -> None:
         """Compute trade advice using multi-timeframe indicators without triggering notifications."""
@@ -5319,7 +5668,10 @@ class IndicatorOrchestrator:
     # ------------------------------------------------------------- per-candle
     async def _process(self, asset: str, tf: str) -> None:
         """One candle-close cycle: fetch -> push -> compute -> evaluate -> signal."""
-        cfg     = CONFIG["assets"][asset]
+        self._process_timeframe(asset, tf)
+        cfg     = CONFIG["assets"].get(asset, {})
+        if not cfg:
+            return
         candles = await self._fetch(asset, cfg, tf, limit=2)
         if not candles:
             logger.warning(f"No candles: {asset} {tf}")
@@ -5428,6 +5780,7 @@ class IndicatorOrchestrator:
             asyncio.create_task(self._asset_loop(a, tf), name=f"{a}_{tf}")
             for a, cfg in CONFIG["assets"].items()
             for tf in cfg["timeframes"]
+            if tf in CONFIG.get("SUPPORTED_TIMEFRAMES", ["1h", "4h"])
         ]
         tasks.append(asyncio.create_task(self._flush_loop(),       name="flush"))
         tasks.append(asyncio.create_task(
@@ -5454,6 +5807,19 @@ class IndicatorOrchestrator:
             if self._tg:
                 await self._tg.close()
             logger.info("Engine stopped cleanly")
+
+    def run_cycle(self) -> None:
+        """Run one evaluation cycle for supported timeframes."""
+        for asset in CONFIG.get("assets", {}):
+            for tf in CONFIG.get("SUPPORTED_TIMEFRAMES", ["1h", "4h"]):
+                self._process_timeframe(asset, tf)
+
+    def _process_timeframe(self, asset: str, tf: str) -> None:
+        """Hook called for each timeframe processed in an evaluation cycle."""
+        pass
+
+
+Orchestrator = IndicatorOrchestrator
 
 
 # =============================================================================

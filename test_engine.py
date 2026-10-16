@@ -800,5 +800,183 @@ class TestEngine(unittest.TestCase):
                 self.assertLessEqual(cnt, 5)
 
 
+class TestRsiZoneConsistency(unittest.TestCase):
+    def test_rsi_label_consistency_across_widgets(self):
+        """Đảm bảo cùng 1 giá trị RSI cho cùng 1 nhãn ở cả Gauge và Advice Card."""
+        from engine import build_market_mood_gauge, classify_rsi_zone, RSI_ZONE_LABEL_MAP
+        rsi_value = 63.6
+        gauge_label = build_market_mood_gauge(rsi=rsi_value)["rsi_label"]
+        advice_reasoning_zone = classify_rsi_zone(rsi_value)
+        self.assertEqual(RSI_ZONE_LABEL_MAP[advice_reasoning_zone], gauge_label)
+
+    def test_rsi_boundary_60_is_lean_overbought(self):
+        from engine import classify_rsi_zone
+        self.assertEqual(classify_rsi_zone(60.0), "LEAN_OVERBOUGHT")
+        self.assertEqual(classify_rsi_zone(59.9), "NEUTRAL")
+
+    def test_gauge_uses_same_classify_function_as_confluence_engine(self):
+        # Regression chống tái phát: đảm bảo Gauge không tự định nghĩa ngưỡng riêng
+        import inspect
+        from engine import build_market_mood_gauge
+        gauge_source = inspect.getsource(build_market_mood_gauge)
+        self.assertIn("classify_rsi_zone", gauge_source,
+            "Gauge phải gọi classify_rsi_zone() dùng chung, không tự if/elif ngưỡng riêng")
+
+
+
+# ============================================================================
+# 9 UNIT TESTS REGRESSION CHO PROMPT 4: LOẠI BỎ 15M & ẨN ACTION KHI CONFIDENCE THẤP
+# ============================================================================
+
+def test_15m_stub_structure():
+    """1. Stub 15m phải đúng schema: status=deprecated, available=False, candles=[], advice=None."""
+    from engine import build_timeframe_payload
+    payload = build_timeframe_payload("BTC", "15m")
+    assert payload["status"] == "deprecated"
+    assert payload["available"] is False
+    assert payload["timeframe"] == "15m"
+    assert payload["candles"] == []
+    assert payload["advice"] is None
+    assert payload["replacement_timeframes"] == ["1h", "4h"]
+    assert len(payload["reason"]) > 0
+
+
+def test_15m_key_still_present_in_schema():
+    """2. Key '15m' vẫn phải tồn tại trong snapshot schema của mọi asset dưới dạng stub."""
+    from engine import build_snapshot
+    snapshot = build_snapshot()
+    assert "timeframes" in snapshot
+    for asset in ("BTC", "XAU", "OIL"):
+        assert asset in snapshot["timeframes"], f"Thiếu asset {asset} trong timeframes"
+        assert "15m" in snapshot["timeframes"][asset], f"Thiếu key 15m cho {asset}"
+        assert snapshot["timeframes"][asset]["15m"]["status"] == "deprecated"
+
+
+def test_confidence_low_hides_action():
+    """3. Khi confidence LOW/Thấp: display_action=HIDDEN, giấu Entry/SL/TP nhưng giữ reasoning."""
+    from engine import make_advice, build_advice_payload
+    adv = make_advice(
+        action="BUY",
+        confidence="LOW",
+        entry=50000.0,
+        sl=49000.0,
+        tp1=51000.0,
+        tp2=52000.0,
+        reasoning=["Tín hiệu RSI phân kỳ yếu"]
+    )
+    payload = build_advice_payload(adv)
+    assert payload["display_action"] == "HIDDEN"
+    assert payload["entry_price"] is None
+    assert payload["tp1_price"] is None
+    assert payload["tp2_price"] is None
+    assert payload["sl_price"] is None
+    assert len(payload["reasoning"]) > 0
+    assert payload["display_label"] == "Tín hiệu yếu – chưa đủ điều kiện khuyến nghị"
+
+
+def test_confidence_medium_shows_action():
+    """4. Khi confidence MEDIUM/Trung bình: display_action giữ nguyên, hiển thị đầy đủ Entry/SL/TP."""
+    from engine import make_advice, build_advice_payload
+    adv = make_advice(
+        action="BUY",
+        confidence="MEDIUM",
+        entry=50000.0,
+        sl=49000.0,
+        tp1=51000.0,
+        tp2=52000.0,
+        reasoning=["Xu hướng tăng rõ ràng"]
+    )
+    payload = build_advice_payload(adv)
+    assert payload["display_action"] == "BUY"
+    assert payload["entry_price"] == 50000.0
+    assert payload["sl_price"] == 49000.0
+    assert payload["tp1_price"] == 51000.0
+    assert payload["tp2_price"] == 52000.0
+
+
+def test_wait_action_never_hidden_regardless_confidence():
+    """5. Action WAIT không bao giờ bị ẩn thành HIDDEN bất kể confidence là LOW hay HIGH."""
+    from engine import make_advice, build_advice_payload
+    for conf in ("LOW", "Thấp", "MEDIUM", "Trung bình", "HIGH", "Cao"):
+        adv = make_advice(action="WAIT", confidence=conf)
+        payload = build_advice_payload(adv)
+        assert payload["display_action"] == "WAIT", f"WAIT bị đổi thành {payload['display_action']} ở confidence {conf}"
+
+
+def test_fetcher_interval_map_has_no_15m():
+    """6. INTERVAL_MAP của BinanceFetcher và TwelveDataFetcher tuyệt đối không chứa key 15m."""
+    from engine import BinanceFetcher, TwelveDataFetcher
+    assert "15m" not in BinanceFetcher.INTERVAL_MAP
+    assert "15m" not in TwelveDataFetcher.INTERVAL_MAP
+    assert "15min" not in TwelveDataFetcher.INTERVAL_MAP
+
+
+def test_orchestrator_loop_skips_15m(monkeypatch):
+    """7. Orchestrator.run_cycle() chỉ xử lý 1h và 4h, bỏ qua hoàn toàn 15m."""
+    from engine import Orchestrator
+    orch = Orchestrator()
+    processed_timeframes = []
+
+    def mock_process(self, asset, tf):
+        processed_timeframes.append(tf)
+
+    monkeypatch.setattr(Orchestrator, "_process_timeframe", mock_process)
+    orch.run_cycle()
+
+    assert len(processed_timeframes) > 0
+    assert "15m" not in processed_timeframes
+    assert set(processed_timeframes).issubset({"1h", "4h"})
+
+
+def test_migration_closes_stale_15m_tracks(tmp_path):
+    """8. migrate_deprecated_timeframe_trades đóng tất cả track 15m chưa đóng thành CLOSED_DEPRECATED."""
+    import sqlite3
+    from engine import migrate_deprecated_timeframe_trades
+    db_file = tmp_path / "test_migration.db"
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE signal_tracks (
+            track_id TEXT PRIMARY KEY,
+            asset TEXT,
+            timeframe TEXT,
+            status TEXT,
+            close_reason TEXT
+        )
+    """)
+    cursor.execute("INSERT INTO signal_tracks VALUES ('t1', 'BTC', '15m', 'OPEN', NULL)")
+    cursor.execute("INSERT INTO signal_tracks VALUES ('t2', 'BTC', '15m', 'PENDING_ENTRY', NULL)")
+    cursor.execute("INSERT INTO signal_tracks VALUES ('t3', 'BTC', '1h', 'OPEN', NULL)")
+    cursor.execute("INSERT INTO signal_tracks VALUES ('t4', 'BTC', '15m', 'CLOSED_TP', 'tp_hit')")
+    conn.commit()
+
+    migrate_deprecated_timeframe_trades(conn)
+
+    cursor.execute("SELECT track_id, status, close_reason FROM signal_tracks ORDER BY track_id")
+    rows = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
+    conn.close()
+
+    assert rows["t1"] == ("CLOSED_DEPRECATED", "timeframe_deprecated")
+    assert rows["t2"] == ("CLOSED_DEPRECATED", "timeframe_deprecated")
+    assert rows["t3"] == ("OPEN", None)
+    assert rows["t4"] == ("CLOSED_TP", "tp_hit")
+
+
+def test_btc_1h_case_regression_still_matches_verified_numbers():
+    """9. Replay case BTC 1h đã verify: tính toán ra đúng chính xác các giá trị Entry, TP1, TP2, TP3, SL."""
+    from engine import replay_case_btc_1h, build_advice_payload
+    adv = replay_case_btc_1h()
+    payload = build_advice_payload(adv)
+
+    assert payload["action"] == "SELL"
+    assert abs(payload["entry_price"] - 81698.1219) < 0.01
+    assert abs(payload["tp1_price"] - 80881.1407) < 0.01
+    assert abs(payload["tp2_price"] - 80472.6501) < 0.01
+    assert abs(payload["tp3_price"] - 80064.1594) < 0.01
+    assert abs(payload["sl_price"] - 82594.2353) < 0.01
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
