@@ -1037,6 +1037,93 @@ def test_performance_filters_case_insensitivity_and_defaults(tmp_path):
     assert data2["metrics"]["total_tracks"] == 2
 
 
+class TestOutcomeTrackerCandidateCheckLog(unittest.TestCase):
+    """Prompt 1 / Check 1.6 — regression cho log chẩn đoán candidate_check.
+    Không kiểm tra logic should_create_track() (đã có coverage riêng nếu tồn tại),
+    chỉ xác nhận log được phát đúng, đúng field, và không làm đổi hành vi gốc."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.tmp_db = os.path.join(self.tmp_dir, "test_tracker_candidate.db")
+        self.tracker = SignalOutcomeTracker(db_path=self.tmp_db)
+
+    def test_candidate_check_log_true_and_track_persisted(self):
+        """is_candidate=True → log đúng field, track ghi vào DB."""
+        advice = TradeAdvice(
+            action="BUY",
+            confidence="Cao",
+            confidence_score=5,
+            entry_type="now",
+            entry_price=4150.0,
+            stop_loss=4100.0,
+            take_profit_1=4190.0,
+            take_profit_2=4210.0,
+            tp_levels=[
+                {"label": "TP1", "price": 4190.0, "close_pct": 0.4, "margin_profit_pct": 5.0},
+            ],
+            reasoning=["unit test candidate_check true"],
+        )
+        with self.assertLogs(level="INFO") as cm:
+            track = self.tracker.maybe_create_track(
+                asset="XAU_TEST",
+                timeframe="1h",
+                advice=advice,
+                candle_ts=1700000000,
+            )
+
+        self.assertIsNotNone(track, "Advice hợp lệ phải tạo được track")
+
+        joined = "\n".join(cm.output)
+        self.assertIn("[OUTCOME_TRACKER_DEBUG] candidate_check", joined)
+        self.assertIn("asset=XAU_TEST", joined)
+        self.assertIn("tf=1h", joined)
+        self.assertIn("action=BUY", joined)
+        self.assertIn("confidence=Cao", joined)
+        self.assertIn("is_candidate=True", joined)
+
+        import sqlite3
+        conn = sqlite3.connect(self.tracker.db_path)
+        rows = conn.execute(
+            "SELECT * FROM signal_tracks WHERE asset='XAU_TEST'"
+        ).fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 1, "Track phải được ghi vào DB khi is_candidate=True")
+
+    def test_candidate_check_log_false_low_confidence_no_track(self):
+        """is_candidate=False (confidence=Thấp) → log đúng field, không ghi DB."""
+        advice = TradeAdvice(
+            action="BUY",
+            confidence="Thấp",    # LOW → should_create_track() reject
+            confidence_score=1,
+            entry_type="now",
+            entry_price=4150.0,
+            stop_loss=4100.0,
+            take_profit_1=4190.0,
+        )
+        with self.assertLogs(level="INFO") as cm:
+            track = self.tracker.maybe_create_track(
+                asset="XAU_TEST2",
+                timeframe="1h",
+                advice=advice,
+                candle_ts=1700000000,
+            )
+
+        self.assertIsNone(track, "Confidence Thấp không được tạo track")
+
+        joined = "\n".join(cm.output)
+        self.assertIn("[OUTCOME_TRACKER_DEBUG] candidate_check", joined)
+        self.assertIn("confidence=Thấp", joined)
+        self.assertIn("is_candidate=False", joined)
+
+        import sqlite3
+        conn = sqlite3.connect(self.tracker.db_path)
+        rows = conn.execute(
+            "SELECT * FROM signal_tracks WHERE asset='XAU_TEST2'"
+        ).fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 0, "Không được ghi track khi is_candidate=False")
+
+
 if __name__ == "__main__":
     unittest.main()
 

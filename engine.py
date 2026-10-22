@@ -1965,7 +1965,26 @@ class SignalOutcomeTracker:
         candle_ts: int,
     ) -> Optional[SignalTrack]:
         """Conditionally create a new SignalTrack if advice passes criteria."""
-        if not self.should_create_track(advice, asset, timeframe):
+        is_candidate = self.should_create_track(advice, asset, timeframe)
+
+        # [OUTCOME_TRACKER_DEBUG] Prompt 1 / Check 1.6 — diagnostic only.
+        # Read-only snapshot of the same fields should_create_track() inspects.
+        # Does NOT alter the gating decision; is_candidate is unchanged source of truth.
+        _validity = getattr(advice, "validity", {})
+        _val_status = _validity.get("status") if isinstance(_validity, dict) else str(_validity)
+        _has_entry = bool(advice.entry_price or advice.entry_zone)
+        _has_sl = bool(advice.stop_loss)
+        _has_tp1 = bool(
+            advice.take_profit_1 or (advice.tp_levels[0]["price"] if advice.tp_levels else None)
+        )
+        logger.info(
+            "[OUTCOME_TRACKER_DEBUG] candidate_check asset=%s tf=%s action=%s confidence=%s "
+            "validity=%s has_entry=%s has_sl=%s has_tp1=%s is_candidate=%s",
+            asset, timeframe, advice.action, advice.confidence, _val_status,
+            _has_entry, _has_sl, _has_tp1, is_candidate,
+        )
+
+        if not is_candidate:
             return None
 
         planned_entry = float(advice.entry_price or advice.entry_zone)
