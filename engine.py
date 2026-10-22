@@ -677,6 +677,19 @@ def build_market_mood_gauge(
     }
 
 
+def _compute_indicators_with_zone(buf: "CircularBuffer") -> dict:
+    """SSOT wrapper: tính indicators + gắn rsi_zone ngay tại nguồn.
+    PHẢI dùng thay cho IndicatorEngine.compute_all() ở MỌI nơi ghi vào
+    _latest_indicators (init / hot-reload / nến đóng), để đảm bảo rsi_zone
+    không bao giờ lệch pha giữa các điểm gọi.
+    Field mới: "rsi_zone". Không đổi bất kỳ field nào khác của ind (constraint #6).
+    """
+    ind = IndicatorEngine.compute_all(buf)
+    if ind.get("rsi") is not None:
+        ind["rsi_zone"] = classify_rsi_zone(ind["rsi"], cfg=CONFIG)
+    return ind
+
+
 class BbPosition(str, Enum):
     BREAK_UPPER = "Vượt đỉnh"
     NEAR_UPPER = "Chạm biên trên"
@@ -4333,11 +4346,16 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
       // 2. Điểm Xung lực RSI (35%)
       const scoreRsi = Math.max(0, Math.min(100, rsi));
-      let textRsi = '⚖️ Cân bằng';
-      if (rsi >= 75) textRsi = '🔥 Quá mua';
-      else if (rsi >= 60) textRsi = '📈 Nghiêng mua';
-      else if (rsi <= 25) textRsi = '❄️ Quá bán';
-      else if (rsi <= 40) textRsi = '📉 Nghiêng bán';
+      // SSOT: zone đến từ backend classify_rsi_zone() qua assetData.rsi_zone.
+      // JS KHÔNG tự phân loại ngưỡng số — chỉ ánh xạ enum -> wording hiển thị.
+      const RSI_GAUGE_LABELS = {
+        EXTREME_OVERBOUGHT: '🔥 Quá mua',
+        LEAN_OVERBOUGHT:    '📈 Nghiêng mua',
+        NEUTRAL:            '⚖️ Cân bằng',
+        LEAN_OVERSOLD:      '📉 Nghiêng bán',
+        EXTREME_OVERSOLD:   '❄️ Quá bán',
+      };
+      const textRsi = RSI_GAUGE_LABELS[assetData.rsi_zone] || '⚖️ Cân bằng';
 
       // 3. Điểm Vị trí Bollinger Bands (25%)
       let scoreBb = 50;
@@ -4408,16 +4426,18 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             const price = item.close != null ? Number(item.close).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4}) : '--';
 
             // Dịch RSI
+            const RSI_TABLE_LABELS = {
+              EXTREME_OVERBOUGHT: (r) => `<span class="tag-status status-warning">🔥 Tăng quá nóng (${r.toFixed(1)})</span>`,
+              LEAN_OVERBOUGHT:    (r) => `<span class="tag-status status-warning">📈 Nghiêng mua (${r.toFixed(1)})</span>`,
+              NEUTRAL:            (r) => `<span class="tag-status status-safe">⚖️ Cân bằng (${r.toFixed(1)})</span>`,
+              LEAN_OVERSOLD:      (r) => `<span class="tag-status status-neutral">📉 Nghiêng bán (${r.toFixed(1)})</span>`,
+              EXTREME_OVERSOLD:   (r) => `<span class="tag-status status-neutral">❄️ Bán tháo quá đà (${r.toFixed(1)})</span>`,
+            };
             let rsiTag = '<span class="tag-status status-calm">--</span>';
             if (item.rsi != null) {
               const r = Number(item.rsi);
-              if (r >= 70) {
-                rsiTag = `<span class="tag-status status-warning">🔥 Tăng quá nóng (${r.toFixed(1)})</span>`;
-              } else if (r <= 30) {
-                rsiTag = `<span class="tag-status status-neutral">❄️ Bán tháo quá đà (${r.toFixed(1)})</span>`;
-              } else {
-                rsiTag = `<span class="tag-status status-safe">⚖️ Cân bằng (${r.toFixed(1)})</span>`;
-              }
+              const labelFn = RSI_TABLE_LABELS[item.rsi_zone] || RSI_TABLE_LABELS.NEUTRAL;
+              rsiTag = labelFn(r);
             }
 
             // Dịch Xu hướng EMA
@@ -5610,7 +5630,7 @@ class IndicatorOrchestrator:
                 logger.info(f"  [{asset} {tf}] loaded {len(buf)} candles")
                 # Immediately compute indicators so Web Dashboard has data on launch
                 if len(buf) > 0:
-                    ind = IndicatorEngine.compute_all(buf)
+                    ind = _compute_indicators_with_zone(buf)
                     self._latest_indicators.setdefault(asset, {})[tf] = ind
                 await asyncio.sleep(1)   # respect rate limits during init
 
@@ -5651,7 +5671,7 @@ class IndicatorOrchestrator:
                     buf.push(c)
                 logger.info(f"  [{asset} {tf}] loaded {len(buf)} candles (hot-reload)")
                 if len(buf) > 0:
-                    ind = IndicatorEngine.compute_all(buf)
+                    ind = _compute_indicators_with_zone(buf)
                     self._latest_indicators.setdefault(asset, {})[tf] = ind
                 await asyncio.sleep(1)
 
@@ -5705,7 +5725,7 @@ class IndicatorOrchestrator:
             logger.debug(f"[{asset} {tf}] duplicate ts={latest.ts}, skipped")
             return
         buf.push(latest)
-        ind = IndicatorEngine.compute_all(buf)
+        ind = _compute_indicators_with_zone(buf)
         # Store in latest indicators cache for Web UI & snapshot API
         self._latest_indicators.setdefault(asset, {})[tf] = ind
 

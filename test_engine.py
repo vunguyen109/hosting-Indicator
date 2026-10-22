@@ -1124,6 +1124,70 @@ class TestOutcomeTrackerCandidateCheckLog(unittest.TestCase):
         self.assertEqual(len(rows), 0, "Không được ghi track khi is_candidate=False")
 
 
+class TestRsiZoneSSOTAcrossAllIndicatorSources(unittest.TestCase):
+    """Prompt 3 (mở rộng) — đảm bảo rsi_zone nhất quán ở cả 3 điểm ghi
+    _latest_indicators: init (_init_buffers), hot-reload (reload_asset_buffers),
+    nến đóng (_process). Tái hiện đúng lớp bug quan sát: RSI=63.6 từng bị
+    phân loại khác nhau do nhiều bộ ngưỡng JS độc lập (70/30 vs 60/40)."""
+
+    def _make_buf(self, n=40):
+        buf = CircularBuffer(50, "BTC", "1h")
+        for i in range(n):
+            buf.push(Candle(
+                ts=1000 + i * 3600,
+                open=100.0 + i * 0.3,
+                high=105.0 + i * 0.3,
+                low=95.0 + i * 0.3,
+                close=100.0 + i * 0.5,
+                volume=10.0,
+            ))
+        return buf
+
+    def test_helper_adds_rsi_zone_matching_classify_rsi_zone(self):
+        from engine import classify_rsi_zone, _compute_indicators_with_zone
+        buf = self._make_buf()
+        ind = _compute_indicators_with_zone(buf)
+        self.assertIn("rsi", ind)
+        self.assertIn("rsi_zone", ind)
+        expected_zone = classify_rsi_zone(ind["rsi"], cfg=CONFIG)
+        self.assertEqual(ind["rsi_zone"], expected_zone)
+
+    def test_rsi_field_and_all_other_fields_unchanged(self):
+        """Constraint #6: chỉ thêm field rsi_zone, không đổi field nào khác."""
+        from engine import _compute_indicators_with_zone
+        buf_plain = self._make_buf()
+        buf_wrapped = self._make_buf()
+        ind_plain = IndicatorEngine.compute_all(buf_plain)
+        ind_wrapped = _compute_indicators_with_zone(buf_wrapped)
+
+        for key, value in ind_plain.items():
+            self.assertIn(key, ind_wrapped)
+            self.assertEqual(ind_wrapped[key], value, f"Field '{key}' bị thay đổi")
+
+        self.assertNotIn("rsi_zone", ind_plain)
+        self.assertIn("rsi_zone", ind_wrapped)
+
+    def test_zone_boundaries_59_9_60_0_69_9(self):
+        from engine import classify_rsi_zone
+        self.assertEqual(classify_rsi_zone(59.9, cfg=CONFIG), "NEUTRAL")
+        self.assertEqual(classify_rsi_zone(60.0, cfg=CONFIG), "LEAN_OVERBOUGHT")
+        self.assertEqual(classify_rsi_zone(69.9, cfg=CONFIG), "LEAN_OVERBOUGHT")
+
+    def test_no_duplicate_direct_compute_all_calls_outside_helper(self):
+        """Chặn tái phát lệch pha: chỉ được có đúng 1 lời gọi
+        IndicatorEngine.compute_all(buf) trong toàn bộ engine.py —
+        bên trong _compute_indicators_with_zone(). Nếu có call site khác
+        bỏ qua helper, rsi_zone sẽ lại lệch pha như bug gốc."""
+        with open("engine.py", encoding="utf-8") as f:
+            src = f.read()
+        direct_calls = src.count("IndicatorEngine.compute_all(buf)")
+        self.assertEqual(
+            direct_calls, 1,
+            "Phát hiện có call site tính indicators KHÔNG qua "
+            "_compute_indicators_with_zone() — nguy cơ rsi_zone lệch pha."
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 
