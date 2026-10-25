@@ -972,18 +972,18 @@ def migrate_deprecated_timeframe_trades(db_conn_or_path: Any = None) -> int:
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE signal_tracks
-            SET status = 'CLOSED_DEPRECATED',
-                close_reason = 'timeframe_deprecated'
+            SET status = 'expired',
+                result_note = 'timeframe_deprecated_migration'
             WHERE timeframe IN ('15m', '15min')
-              AND UPPER(status) IN ('PENDING_ENTRY', 'OPEN', 'PARTIAL_TP1', 'PARTIAL_TP2')
+              AND status IN ('pending_entry', 'open', 'partial_tp1', 'partial_tp2')
         """)
-        total_closed = max(0, cursor.rowcount)
+        closed_cnt = cursor.rowcount
         conn.commit()
-        logger.info(f"[MIGRATION] Closed {total_closed} stale 15m tracks")
-        return total_closed
+        logger.info(f"[MIGRATION] Closed {closed_cnt} stale 15m tracks")
+        return closed_cnt
     except Exception as e:
         logger.error(f"[MIGRATION] Migration error: {e}", exc_info=True)
-        return 0
+        raise
     finally:
         if close_conn:
             try:
@@ -5514,33 +5514,11 @@ class IndicatorOrchestrator:
 
     def migrate_deprecated_timeframe_trades(self, db_conn=None) -> int:
         """Close stale tracks on deprecated timeframes (15m) once at startup."""
-        conn_context = None
         if db_conn is not None:
-            conn = db_conn
-        elif self.outcome_tracker:
-            conn_context = self.outcome_tracker._get_connection()
-            conn = conn_context.__enter__()
-        else:
-            return 0
-
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE signal_tracks
-                SET status = 'expired', result_note = 'timeframe_deprecated_migration'
-                WHERE timeframe IN ('15m', '15min')
-                  AND status IN ('pending_entry', 'open', 'partial_tp1', 'partial_tp2')
-            """)
-            closed_cnt = max(0, cursor.rowcount)
-            conn.commit()
-            logger.info(f"[MIGRATION] Closed {closed_cnt} stale 15m tracks")
-            return closed_cnt
-        except Exception as e:
-            logger.error(f"[MIGRATION] Failed to migrate 15m tracks: {e}", exc_info=True)
-            return 0
-        finally:
-            if conn_context is not None:
-                conn_context.__exit__(None, None, None)
+            return migrate_deprecated_timeframe_trades(db_conn)
+        if self.outcome_tracker and hasattr(self.outcome_tracker, "db_path"):
+            return migrate_deprecated_timeframe_trades(self.outcome_tracker.db_path)
+        return migrate_deprecated_timeframe_trades()
 
     def _compute_advice_for_asset(self, asset: str, tf: str, ind: dict) -> None:
         """Compute trade advice using multi-timeframe indicators without triggering notifications."""

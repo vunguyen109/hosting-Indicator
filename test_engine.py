@@ -929,11 +929,14 @@ class TestPrompt4DeprecationAndActionHiding(unittest.TestCase):
         self.assertTrue(set(processed_timeframes).issubset({"1h", "4h"}))
 
     def test_migration_closes_stale_15m_tracks(self):
-        """8. migrate_deprecated_timeframe_trades đóng tất cả track 15m chưa đóng thành CLOSED_DEPRECATED."""
+        """8. migrate_deprecated_timeframe_trades đóng tất cả track 15m chưa đóng thành 'expired' với result_note chuẩn."""
         import sqlite3
-        from engine import migrate_deprecated_timeframe_trades
+        from unittest.mock import MagicMock
+        from engine import migrate_deprecated_timeframe_trades, IndicatorOrchestrator
+
+        # Case 1: Gọi trực tiếp hàm standalone với conn
         with tempfile.TemporaryDirectory() as tmp_dir:
-            db_file = os.path.join(tmp_dir, "test_migration.db")
+            db_file = os.path.join(tmp_dir, "test_mig_standalone.db")
             conn = sqlite3.connect(db_file)
             cursor = conn.cursor()
             cursor.execute("""
@@ -942,25 +945,87 @@ class TestPrompt4DeprecationAndActionHiding(unittest.TestCase):
                     asset TEXT,
                     timeframe TEXT,
                     status TEXT,
-                    close_reason TEXT
+                    result_note TEXT
                 )
             """)
-            cursor.execute("INSERT INTO signal_tracks VALUES ('t1', 'BTC', '15m', 'OPEN', NULL)")
-            cursor.execute("INSERT INTO signal_tracks VALUES ('t2', 'BTC', '15m', 'PENDING_ENTRY', NULL)")
-            cursor.execute("INSERT INTO signal_tracks VALUES ('t3', 'BTC', '1h', 'OPEN', NULL)")
-            cursor.execute("INSERT INTO signal_tracks VALUES ('t4', 'BTC', '15m', 'CLOSED_TP', 'tp_hit')")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('t1', 'BTC', '15m', 'open', NULL)")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('t2', 'BTC', '15m', 'pending_entry', NULL)")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('t3', 'BTC', '1h', 'open', NULL)")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('t4', 'BTC', '15m', 'tp_hit', 'closed_tp')")
             conn.commit()
 
-            migrate_deprecated_timeframe_trades(conn)
+            closed_cnt = migrate_deprecated_timeframe_trades(conn)
+            self.assertEqual(closed_cnt, 2, "Hàm standalone phải đóng chính xác 2 track 15m chưa chốt")
 
-            cursor.execute("SELECT track_id, status, close_reason FROM signal_tracks ORDER BY track_id")
+            cursor.execute("SELECT track_id, status, result_note FROM signal_tracks ORDER BY track_id")
             rows = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
             conn.close()
 
-            self.assertEqual(rows["t1"], ("CLOSED_DEPRECATED", "timeframe_deprecated"))
-            self.assertEqual(rows["t2"], ("CLOSED_DEPRECATED", "timeframe_deprecated"))
-            self.assertEqual(rows["t3"], ("OPEN", None))
-            self.assertEqual(rows["t4"], ("CLOSED_TP", "tp_hit"))
+            self.assertEqual(rows["t1"], ("expired", "timeframe_deprecated_migration"))
+            self.assertEqual(rows["t2"], ("expired", "timeframe_deprecated_migration"))
+            self.assertEqual(rows["t3"], ("open", None))
+            self.assertEqual(rows["t4"], ("tp_hit", "closed_tp"))
+
+        # Case 2: Gọi qua wrapper orch.migrate_deprecated_timeframe_trades(db_conn=conn)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = os.path.join(tmp_dir, "test_mig_orch_conn.db")
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE signal_tracks (
+                    track_id TEXT PRIMARY KEY,
+                    asset TEXT,
+                    timeframe TEXT,
+                    status TEXT,
+                    result_note TEXT
+                )
+            """)
+            cursor.execute("INSERT INTO signal_tracks VALUES ('o1', 'BTC', '15m', 'open', NULL)")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('o2', 'BTC', '15m', 'partial_tp1', NULL)")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('o3', 'BTC', '4h', 'open', NULL)")
+            conn.commit()
+
+            orch = IndicatorOrchestrator()
+            closed_cnt = orch.migrate_deprecated_timeframe_trades(db_conn=conn)
+            self.assertEqual(closed_cnt, 2, "Wrapper orch(db_conn) phải đóng chính xác 2 track")
+
+            cursor.execute("SELECT track_id, status, result_note FROM signal_tracks ORDER BY track_id")
+            rows = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
+            conn.close()
+
+            self.assertEqual(rows["o1"], ("expired", "timeframe_deprecated_migration"))
+            self.assertEqual(rows["o2"], ("expired", "timeframe_deprecated_migration"))
+            self.assertEqual(rows["o3"], ("open", None))
+
+        # Case 3: Nhánh fallback qua self.outcome_tracker.db_path khi không truyền db_conn
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = os.path.join(tmp_dir, "test_mig_fallback.db")
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE signal_tracks (
+                    track_id TEXT PRIMARY KEY,
+                    asset TEXT,
+                    timeframe TEXT,
+                    status TEXT,
+                    result_note TEXT
+                )
+            """)
+            cursor.execute("INSERT INTO signal_tracks VALUES ('fb1', 'BTC', '15m', 'pending_entry', NULL)")
+            conn.commit()
+            conn.close()
+
+            orch = IndicatorOrchestrator()
+            orch.outcome_tracker = MagicMock(db_path=db_file)
+            closed_cnt = orch.migrate_deprecated_timeframe_trades()
+            self.assertEqual(closed_cnt, 1, "Fallback qua outcome_tracker.db_path phải đóng đúng 1 track")
+
+            verify_conn = sqlite3.connect(db_file)
+            v_cur = verify_conn.cursor()
+            v_cur.execute("SELECT status, result_note FROM signal_tracks WHERE track_id='fb1'")
+            row = v_cur.fetchone()
+            verify_conn.close()
+            self.assertEqual(row, ("expired", "timeframe_deprecated_migration"))
 
     def test_btc_1h_case_regression_still_matches_verified_numbers(self):
         """9. Replay case BTC 1h đã verify: tính toán ra đúng chính xác các giá trị Entry, TP1, TP2, TP3, SL."""
