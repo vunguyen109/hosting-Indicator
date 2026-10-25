@@ -970,20 +970,14 @@ def migrate_deprecated_timeframe_trades(db_conn_or_path: Any = None) -> int:
 
     try:
         cursor = conn.cursor()
-        total_closed = 0
-        for tbl in ["signal_tracks", "trade_outcomes"]:
-            try:
-                cursor.execute(f"""
-                    UPDATE {tbl}
-                    SET status = 'CLOSED_DEPRECATED',
-                        close_reason = 'timeframe_deprecated'
-                    WHERE timeframe IN ('15m', '15min')
-                      AND UPPER(status) IN ('PENDING_ENTRY', 'OPEN', 'PARTIAL_TP1', 'PARTIAL_TP2')
-                """)
-                if cursor.rowcount > 0:
-                    total_closed += cursor.rowcount
-            except Exception:
-                pass
+        cursor.execute("""
+            UPDATE signal_tracks
+            SET status = 'CLOSED_DEPRECATED',
+                close_reason = 'timeframe_deprecated'
+            WHERE timeframe IN ('15m', '15min')
+              AND UPPER(status) IN ('PENDING_ENTRY', 'OPEN', 'PARTIAL_TP1', 'PARTIAL_TP2')
+        """)
+        total_closed = max(0, cursor.rowcount)
         conn.commit()
         logger.info(f"[MIGRATION] Closed {total_closed} stale 15m tracks")
         return total_closed
@@ -4277,8 +4271,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     // --- TẢI DỮ LIỆU NẾN CHO CHART ---
     async function fetchCandleData() {
       try {
-        const tfParam = (currentAsset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
-        const res = await fetch(`/api/candles?asset=${currentAsset}&tf=${tfParam}&limit=100`);
+        const res = await fetch(`/api/candles?asset=${currentAsset}&tf=${currentTimeframe}&limit=100`);
         if (!res.ok) return;
         const candles = await res.json();
         if (!candles || candles.length === 0) return;
@@ -4502,8 +4495,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (rowsHtml) tbody.innerHTML = rowsHtml;
 
         // 2. Cập nhật Gauge cho tài sản đang được chọn
-        const targetTf = (currentAsset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
-        const activeAssetData = indMap[currentAsset]?.[targetTf];
+        const activeAssetData = indMap[currentAsset]?.[currentTimeframe];
         if (activeAssetData) {
           updateCompositeGauge(activeAssetData);
         }
@@ -4641,8 +4633,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     // --- RENDER TRADE ADVICE CARD ---
     function renderAdviceCard(snapshot, asset, tf) {
       if (!snapshot || !snapshot.advice) return;
-      const targetTf = (asset !== 'BTC' && tf === '15m') ? '15min' : tf;
-      const advice = snapshot.advice?.[asset]?.[targetTf];
+      const advice = snapshot.advice?.[asset]?.[tf];
 
       const badgeAsset = document.getElementById('adviceAssetBadge');
       if (badgeAsset) badgeAsset.textContent = `[${asset} · ${tf}]`;
@@ -4896,9 +4887,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('activeChartTitle').textContent = `[${asset} · ${currentTimeframe}]`;
       fetchCandleData();
       if (cachedSnapshot) {
-        const targetTf = (asset !== 'BTC' && currentTimeframe === '15m') ? '15min' : currentTimeframe;
         if (cachedSnapshot.indicators) {
-          updateCompositeGauge(cachedSnapshot.indicators[asset]?.[targetTf]);
+          updateCompositeGauge(cachedSnapshot.indicators[asset]?.[currentTimeframe]);
         }
         renderAdviceCard(cachedSnapshot, asset, currentTimeframe);
       }
@@ -4913,9 +4903,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       document.getElementById('activeChartTitle').textContent = `[${currentAsset} · ${tf}]`;
       fetchCandleData();
       if (cachedSnapshot) {
-        const targetTf = (currentAsset !== 'BTC' && tf === '15m') ? '15min' : tf;
         if (cachedSnapshot.indicators) {
-          updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[targetTf]);
+          updateCompositeGauge(cachedSnapshot.indicators[currentAsset]?.[tf]);
         }
         renderAdviceCard(cachedSnapshot, currentAsset, tf);
       }
@@ -5276,15 +5265,10 @@ class DashboardServer:
         except ValueError:
             limit = 100
 
-        # Support timeframe alias between 15m and 15min
         buf = None
         asset_bufs = self._orchestrator._bufs.get(asset, {})
         if tf in asset_bufs:
             buf = asset_bufs[tf]
-        elif tf == "15m" and "15min" in asset_bufs:
-            buf = asset_bufs["15min"]
-        elif tf == "15min" and "15m" in asset_bufs:
-            buf = asset_bufs["15m"]
 
         if not buf:
             return web.json_response([], status=200)
@@ -5547,17 +5531,8 @@ class IndicatorOrchestrator:
                 WHERE timeframe IN ('15m', '15min')
                   AND status IN ('pending_entry', 'open', 'partial_tp1', 'partial_tp2')
             """)
-            try:
-                cursor.execute("""
-                    UPDATE trade_outcomes
-                    SET status = 'expired', notes = 'timeframe_deprecated_migration'
-                    WHERE timeframe IN ('15m', '15min')
-                      AND status IN ('pending_entry', 'open', 'partial_tp1', 'partial_tp2')
-                """)
-            except Exception:
-                pass
+            closed_cnt = max(0, cursor.rowcount)
             conn.commit()
-            closed_cnt = cursor.rowcount
             logger.info(f"[MIGRATION] Closed {closed_cnt} stale 15m tracks")
             return closed_cnt
         except Exception as e:

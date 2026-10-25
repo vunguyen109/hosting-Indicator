@@ -825,216 +825,263 @@ class TestRsiZoneConsistency(unittest.TestCase):
 
 
 # ============================================================================
-# 9 UNIT TESTS REGRESSION CHO PROMPT 4: LOẠI BỎ 15M & ẨN ACTION KHI CONFIDENCE THẤP
+# UNIT TESTS REGRESSION CHO PROMPT 4: LOẠI BỎ 15M, ẨN ACTION, ROWCOUNT & DỌN ORPHAN CODE
 # ============================================================================
 
-def test_15m_stub_structure():
-    """1. Stub 15m phải đúng schema: status=deprecated, available=False, candles=[], advice=None."""
-    from engine import build_timeframe_payload
-    payload = build_timeframe_payload("BTC", "15m")
-    assert payload["status"] == "deprecated"
-    assert payload["available"] is False
-    assert payload["timeframe"] == "15m"
-    assert payload["candles"] == []
-    assert payload["advice"] is None
-    assert payload["replacement_timeframes"] == ["1h", "4h"]
-    assert len(payload["reason"]) > 0
+class TestPrompt4DeprecationAndActionHiding(unittest.TestCase):
+    """
+    Test suite regression cho Prompt 4: Loại bỏ 15m, ẩn Action khi confidence Thấp,
+    kiểm tra rowcount migration chính xác và loại bỏ orphan code 15m.
+    """
 
+    def test_15m_stub_structure(self):
+        """1. Stub 15m phải đúng schema: status=deprecated, available=False, candles=[], advice=None."""
+        from engine import build_timeframe_payload
+        payload = build_timeframe_payload("BTC", "15m")
+        self.assertEqual(payload["status"], "deprecated")
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["timeframe"], "15m")
+        self.assertEqual(payload["candles"], [])
+        self.assertIsNone(payload["advice"])
+        self.assertEqual(payload["replacement_timeframes"], ["1h", "4h"])
+        self.assertGreater(len(payload["reason"]), 0)
 
-def test_15m_key_still_present_in_schema():
-    """2. Key '15m' vẫn phải tồn tại trong snapshot schema của mọi asset dưới dạng stub."""
-    from engine import build_snapshot
-    snapshot = build_snapshot()
-    assert "timeframes" in snapshot
-    for asset in ("BTC", "XAU", "OIL"):
-        assert asset in snapshot["timeframes"], f"Thiếu asset {asset} trong timeframes"
-        assert "15m" in snapshot["timeframes"][asset], f"Thiếu key 15m cho {asset}"
-        assert snapshot["timeframes"][asset]["15m"]["status"] == "deprecated"
+    def test_15m_key_still_present_in_schema(self):
+        """2. Key '15m' vẫn phải tồn tại trong snapshot schema của mọi asset dưới dạng stub."""
+        from engine import build_snapshot
+        snapshot = build_snapshot()
+        self.assertIn("timeframes", snapshot)
+        for asset in ("BTC", "XAU", "OIL"):
+            self.assertIn(asset, snapshot["timeframes"], f"Thiếu asset {asset} trong timeframes")
+            self.assertIn("15m", snapshot["timeframes"][asset], f"Thiếu key 15m cho {asset}")
+            self.assertEqual(snapshot["timeframes"][asset]["15m"]["status"], "deprecated")
 
-
-def test_confidence_low_hides_action():
-    """3. Khi confidence LOW/Thấp: display_action=HIDDEN, giấu Entry/SL/TP nhưng giữ reasoning."""
-    from engine import make_advice, build_advice_payload
-    adv = make_advice(
-        action="BUY",
-        confidence="LOW",
-        entry=50000.0,
-        sl=49000.0,
-        tp1=51000.0,
-        tp2=52000.0,
-        reasoning=["Tín hiệu RSI phân kỳ yếu"]
-    )
-    payload = build_advice_payload(adv)
-    assert payload["display_action"] == "HIDDEN"
-    assert payload["entry_price"] is None
-    assert payload["tp1_price"] is None
-    assert payload["tp2_price"] is None
-    assert payload["sl_price"] is None
-    assert len(payload["reasoning"]) > 0
-    assert payload["display_label"] == "Tín hiệu yếu – chưa đủ điều kiện khuyến nghị"
-
-
-def test_confidence_medium_shows_action():
-    """4. Khi confidence MEDIUM/Trung bình: display_action giữ nguyên, hiển thị đầy đủ Entry/SL/TP."""
-    from engine import make_advice, build_advice_payload
-    adv = make_advice(
-        action="BUY",
-        confidence="MEDIUM",
-        entry=50000.0,
-        sl=49000.0,
-        tp1=51000.0,
-        tp2=52000.0,
-        reasoning=["Xu hướng tăng rõ ràng"]
-    )
-    payload = build_advice_payload(adv)
-    assert payload["display_action"] == "BUY"
-    assert payload["entry_price"] == 50000.0
-    assert payload["sl_price"] == 49000.0
-    assert payload["tp1_price"] == 51000.0
-    assert payload["tp2_price"] == 52000.0
-
-
-def test_wait_action_never_hidden_regardless_confidence():
-    """5. Action WAIT không bao giờ bị ẩn thành HIDDEN bất kể confidence là LOW hay HIGH."""
-    from engine import make_advice, build_advice_payload
-    for conf in ("LOW", "Thấp", "MEDIUM", "Trung bình", "HIGH", "Cao"):
-        adv = make_advice(action="WAIT", confidence=conf)
-        payload = build_advice_payload(adv)
-        assert payload["display_action"] == "WAIT", f"WAIT bị đổi thành {payload['display_action']} ở confidence {conf}"
-
-
-def test_fetcher_interval_map_has_no_15m():
-    """6. INTERVAL_MAP của BinanceFetcher và TwelveDataFetcher tuyệt đối không chứa key 15m."""
-    from engine import BinanceFetcher, TwelveDataFetcher
-    assert "15m" not in BinanceFetcher.INTERVAL_MAP
-    assert "15m" not in TwelveDataFetcher.INTERVAL_MAP
-    assert "15min" not in TwelveDataFetcher.INTERVAL_MAP
-
-
-def test_orchestrator_loop_skips_15m(monkeypatch):
-    """7. Orchestrator.run_cycle() chỉ xử lý 1h và 4h, bỏ qua hoàn toàn 15m."""
-    from engine import Orchestrator
-    orch = Orchestrator()
-    processed_timeframes = []
-
-    def mock_process(self, asset, tf):
-        processed_timeframes.append(tf)
-
-    monkeypatch.setattr(Orchestrator, "_process_timeframe", mock_process)
-    orch.run_cycle()
-
-    assert len(processed_timeframes) > 0
-    assert "15m" not in processed_timeframes
-    assert set(processed_timeframes).issubset({"1h", "4h"})
-
-
-def test_migration_closes_stale_15m_tracks(tmp_path):
-    """8. migrate_deprecated_timeframe_trades đóng tất cả track 15m chưa đóng thành CLOSED_DEPRECATED."""
-    import sqlite3
-    from engine import migrate_deprecated_timeframe_trades
-    db_file = tmp_path / "test_migration.db"
-    conn = sqlite3.connect(str(db_file))
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE signal_tracks (
-            track_id TEXT PRIMARY KEY,
-            asset TEXT,
-            timeframe TEXT,
-            status TEXT,
-            close_reason TEXT
+    def test_confidence_low_hides_action(self):
+        """3. Khi confidence LOW/Thấp: display_action=HIDDEN, giấu Entry/SL/TP nhưng giữ reasoning."""
+        from engine import make_advice, build_advice_payload
+        adv = make_advice(
+            action="BUY",
+            confidence="LOW",
+            entry=50000.0,
+            sl=49000.0,
+            tp1=51000.0,
+            tp2=52000.0,
+            reasoning=["Tín hiệu RSI phân kỳ yếu"]
         )
-    """)
-    cursor.execute("INSERT INTO signal_tracks VALUES ('t1', 'BTC', '15m', 'OPEN', NULL)")
-    cursor.execute("INSERT INTO signal_tracks VALUES ('t2', 'BTC', '15m', 'PENDING_ENTRY', NULL)")
-    cursor.execute("INSERT INTO signal_tracks VALUES ('t3', 'BTC', '1h', 'OPEN', NULL)")
-    cursor.execute("INSERT INTO signal_tracks VALUES ('t4', 'BTC', '15m', 'CLOSED_TP', 'tp_hit')")
-    conn.commit()
+        payload = build_advice_payload(adv)
+        self.assertEqual(payload["display_action"], "HIDDEN")
+        self.assertIsNone(payload["entry_price"])
+        self.assertIsNone(payload["tp1_price"])
+        self.assertIsNone(payload["tp2_price"])
+        self.assertIsNone(payload["sl_price"])
+        self.assertGreater(len(payload["reasoning"]), 0)
+        self.assertEqual(payload["display_label"], "Tín hiệu yếu – chưa đủ điều kiện khuyến nghị")
 
-    migrate_deprecated_timeframe_trades(conn)
+    def test_confidence_medium_shows_action(self):
+        """4. Khi confidence MEDIUM/Trung bình: display_action giữ nguyên, hiển thị đầy đủ Entry/SL/TP."""
+        from engine import make_advice, build_advice_payload
+        adv = make_advice(
+            action="BUY",
+            confidence="MEDIUM",
+            entry=50000.0,
+            sl=49000.0,
+            tp1=51000.0,
+            tp2=52000.0,
+            reasoning=["Xu hướng tăng rõ ràng"]
+        )
+        payload = build_advice_payload(adv)
+        self.assertEqual(payload["display_action"], "BUY")
+        self.assertEqual(payload["entry_price"], 50000.0)
+        self.assertEqual(payload["sl_price"], 49000.0)
+        self.assertEqual(payload["tp1_price"], 51000.0)
+        self.assertEqual(payload["tp2_price"], 52000.0)
 
-    cursor.execute("SELECT track_id, status, close_reason FROM signal_tracks ORDER BY track_id")
-    rows = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
-    conn.close()
+    def test_wait_action_never_hidden_regardless_confidence(self):
+        """5. Action WAIT không bao giờ bị ẩn thành HIDDEN bất kể confidence là LOW hay HIGH."""
+        from engine import make_advice, build_advice_payload
+        for conf in ("LOW", "Thấp", "MEDIUM", "Trung bình", "HIGH", "Cao"):
+            adv = make_advice(action="WAIT", confidence=conf)
+            payload = build_advice_payload(adv)
+            self.assertEqual(payload["display_action"], "WAIT", f"WAIT bị đổi thành {payload['display_action']} ở confidence {conf}")
 
-    assert rows["t1"] == ("CLOSED_DEPRECATED", "timeframe_deprecated")
-    assert rows["t2"] == ("CLOSED_DEPRECATED", "timeframe_deprecated")
-    assert rows["t3"] == ("OPEN", None)
-    assert rows["t4"] == ("CLOSED_TP", "tp_hit")
+    def test_fetcher_interval_map_has_no_15m(self):
+        """6. INTERVAL_MAP của BinanceFetcher và TwelveDataFetcher tuyệt đối không chứa key 15m."""
+        from engine import BinanceFetcher, TwelveDataFetcher
+        self.assertNotIn("15m", BinanceFetcher.INTERVAL_MAP)
+        self.assertNotIn("15m", TwelveDataFetcher.INTERVAL_MAP)
+        self.assertNotIn("15min", TwelveDataFetcher.INTERVAL_MAP)
 
+    def test_orchestrator_loop_skips_15m(self):
+        """7. Orchestrator.run_cycle() chỉ xử lý 1h và 4h, bỏ qua hoàn toàn 15m."""
+        from engine import Orchestrator
+        from unittest.mock import patch
+        orch = Orchestrator()
+        processed_timeframes = []
 
-def test_btc_1h_case_regression_still_matches_verified_numbers():
-    """9. Replay case BTC 1h đã verify: tính toán ra đúng chính xác các giá trị Entry, TP1, TP2, TP3, SL."""
-    from engine import replay_case_btc_1h, build_advice_payload
-    adv = replay_case_btc_1h()
-    payload = build_advice_payload(adv)
+        def mock_process(self_orch, asset, tf):
+            processed_timeframes.append(tf)
 
-    assert payload["action"] == "SELL"
-    assert abs(payload["entry_price"] - 81698.1219) < 0.01
-    assert abs(payload["tp1_price"] - 80881.1407) < 0.01
-    assert abs(payload["tp2_price"] - 80472.6501) < 0.01
-    assert abs(payload["tp3_price"] - 80064.1594) < 0.01
-    assert abs(payload["sl_price"] - 82594.2353) < 0.01
+        with patch.object(Orchestrator, "_process_timeframe", mock_process):
+            orch.run_cycle()
 
+        self.assertGreater(len(processed_timeframes), 0)
+        self.assertNotIn("15m", processed_timeframes)
+        self.assertTrue(set(processed_timeframes).issubset({"1h", "4h"}))
 
-def test_performance_filters_case_insensitivity_and_defaults(tmp_path):
-    """Đảm bảo query với timeframe='ALL', 'all', hoặc không truyền param đều không bị lọc nhầm thành timeframe='all'."""
-    import asyncio
-    import json
-    from engine import SignalOutcomeTracker, SignalTrack, TrackStatus, DashboardServer, IndicatorOrchestrator
+    def test_migration_closes_stale_15m_tracks(self):
+        """8. migrate_deprecated_timeframe_trades đóng tất cả track 15m chưa đóng thành CLOSED_DEPRECATED."""
+        import sqlite3
+        from engine import migrate_deprecated_timeframe_trades
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = os.path.join(tmp_dir, "test_migration.db")
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE signal_tracks (
+                    track_id TEXT PRIMARY KEY,
+                    asset TEXT,
+                    timeframe TEXT,
+                    status TEXT,
+                    close_reason TEXT
+                )
+            """)
+            cursor.execute("INSERT INTO signal_tracks VALUES ('t1', 'BTC', '15m', 'OPEN', NULL)")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('t2', 'BTC', '15m', 'PENDING_ENTRY', NULL)")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('t3', 'BTC', '1h', 'OPEN', NULL)")
+            cursor.execute("INSERT INTO signal_tracks VALUES ('t4', 'BTC', '15m', 'CLOSED_TP', 'tp_hit')")
+            conn.commit()
 
-    db_path = str(tmp_path / "tracker_test.db")
-    tracker = SignalOutcomeTracker(db_path=db_path)
+            migrate_deprecated_timeframe_trades(conn)
 
-    t1 = SignalTrack(
-        track_id="track_1", created_at_ts=1000, created_at_str="2026-10-16 01:00:00 UTC",
-        asset="BTC", timeframe="1h", direction="SELL", confidence="Trung bình", confidence_score=3,
-        status=TrackStatus.OPEN.value, entry_type="now", planned_entry=80000.0, actual_entry=80000.0,
-        entry_filled_at_ts=1000, stop_loss=81000.0, tp_levels=[], initial_advice_validity="fresh",
-        advice_reasoning=["Test reasoning"], realized_r=0.0
-    )
-    t2 = SignalTrack(
-        track_id="track_2", created_at_ts=2000, created_at_str="2026-10-16 02:00:00 UTC",
-        asset="XAU", timeframe="4h", direction="BUY", confidence="Cao", confidence_score=4,
-        status=TrackStatus.PENDING_ENTRY.value, entry_type="wait_pullback", planned_entry=4150.0, actual_entry=None,
-        entry_filled_at_ts=None, stop_loss=4130.0, tp_levels=[], initial_advice_validity="fresh",
-        advice_reasoning=["Test reasoning"], realized_r=0.0
-    )
-    tracker._save_track(t1)
-    tracker._save_track(t2)
+            cursor.execute("SELECT track_id, status, close_reason FROM signal_tracks ORDER BY track_id")
+            rows = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
+            conn.close()
 
-    # 1. Kiểm tra trực tiếp tracker.get_metrics
-    assert tracker.get_metrics(timeframe="ALL")["total_tracks"] == 2
-    assert tracker.get_metrics(timeframe="all")["total_tracks"] == 2
-    assert tracker.get_metrics(timeframe="1h")["total_tracks"] == 1
-    assert tracker.get_metrics(timeframe="4h")["total_tracks"] == 1
+            self.assertEqual(rows["t1"], ("CLOSED_DEPRECATED", "timeframe_deprecated"))
+            self.assertEqual(rows["t2"], ("CLOSED_DEPRECATED", "timeframe_deprecated"))
+            self.assertEqual(rows["t3"], ("OPEN", None))
+            self.assertEqual(rows["t4"], ("CLOSED_TP", "tp_hit"))
 
-    # 2. Kiểm tra trực tiếp tracker.get_recent_tracks
-    assert len(tracker.get_recent_tracks(timeframe="ALL")) == 2
-    assert len(tracker.get_recent_tracks(timeframe="all")) == 2
-    assert len(tracker.get_recent_tracks(timeframe="1h")) == 1
+    def test_btc_1h_case_regression_still_matches_verified_numbers(self):
+        """9. Replay case BTC 1h đã verify: tính toán ra đúng chính xác các giá trị Entry, TP1, TP2, TP3, SL."""
+        from engine import replay_case_btc_1h, build_advice_payload
+        adv = replay_case_btc_1h()
+        payload = build_advice_payload(adv)
 
-    # 3. Kiểm tra thông qua endpoint /api/performance của DashboardServer
-    orch = IndicatorOrchestrator()
-    orch.outcome_tracker = tracker
-    server = DashboardServer(orch, "127.0.0.1", 8080)
+        self.assertEqual(payload["action"], "SELL")
+        self.assertAlmostEqual(payload["entry_price"], 81698.1219, places=2)
+        self.assertAlmostEqual(payload["tp1_price"], 80881.1407, places=2)
+        self.assertAlmostEqual(payload["tp2_price"], 80472.6501, places=2)
+        self.assertAlmostEqual(payload["tp3_price"], 80064.1594, places=2)
+        self.assertAlmostEqual(payload["sl_price"], 82594.2353, places=2)
 
-    class MockRequest:
-        def __init__(self, query):
-            self.query = query
+    def test_performance_filters_case_insensitivity_and_defaults(self):
+        """10. Đảm bảo query với timeframe='ALL', 'all', hoặc không truyền param đều không bị lọc nhầm."""
+        import json
+        from engine import SignalOutcomeTracker, SignalTrack, TrackStatus, DashboardServer, IndicatorOrchestrator
 
-    # Khi frontend gọi mặc định với tf="ALL" (như trong dashboard.html)
-    req1 = MockRequest({"asset": "ALL", "tf": "ALL", "confidence": "ALL"})
-    res1 = asyncio.run(server.handle_performance(req1))
-    data1 = json.loads(res1.text)
-    assert len(data1["recent_tracks"]) == 2
-    assert data1["metrics"]["total_tracks"] == 2
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "tracker_test.db")
+            tracker = SignalOutcomeTracker(db_path=db_path)
 
-    # Khi client gọi không truyền param
-    req2 = MockRequest({})
-    res2 = asyncio.run(server.handle_performance(req2))
-    data2 = json.loads(res2.text)
-    assert len(data2["recent_tracks"]) == 2
-    assert data2["metrics"]["total_tracks"] == 2
+            t1 = SignalTrack(
+                track_id="track_1", created_at_ts=1000, created_at_str="2026-10-16 01:00:00 UTC",
+                asset="BTC", timeframe="1h", direction="SELL", confidence="Trung bình", confidence_score=3,
+                status=TrackStatus.OPEN.value, entry_type="now", planned_entry=80000.0, actual_entry=80000.0,
+                entry_filled_at_ts=1000, stop_loss=81000.0, tp_levels=[], initial_advice_validity="fresh",
+                advice_reasoning=["Test reasoning"], realized_r=0.0
+            )
+            t2 = SignalTrack(
+                track_id="track_2", created_at_ts=2000, created_at_str="2026-10-16 02:00:00 UTC",
+                asset="XAU", timeframe="4h", direction="BUY", confidence="Cao", confidence_score=4,
+                status=TrackStatus.PENDING_ENTRY.value, entry_type="wait_pullback", planned_entry=4150.0, actual_entry=None,
+                entry_filled_at_ts=None, stop_loss=4130.0, tp_levels=[], initial_advice_validity="fresh",
+                advice_reasoning=["Test reasoning"], realized_r=0.0
+            )
+            tracker._save_track(t1)
+            tracker._save_track(t2)
+
+            # 1. Kiểm tra trực tiếp tracker.get_metrics
+            self.assertEqual(tracker.get_metrics(timeframe="ALL")["total_tracks"], 2)
+            self.assertEqual(tracker.get_metrics(timeframe="all")["total_tracks"], 2)
+            self.assertEqual(tracker.get_metrics(timeframe="1h")["total_tracks"], 1)
+            self.assertEqual(tracker.get_metrics(timeframe="4h")["total_tracks"], 1)
+
+            # 2. Kiểm tra trực tiếp tracker.get_recent_tracks
+            self.assertEqual(len(tracker.get_recent_tracks(timeframe="ALL")), 2)
+            self.assertEqual(len(tracker.get_recent_tracks(timeframe="all")), 2)
+            self.assertEqual(len(tracker.get_recent_tracks(timeframe="1h")), 1)
+
+            # 3. Kiểm tra thông qua endpoint /api/performance của DashboardServer
+            orch = IndicatorOrchestrator()
+            orch.outcome_tracker = tracker
+            server = DashboardServer(orch, "127.0.0.1", 8080)
+
+            class MockRequest:
+                def __init__(self, query):
+                    self.query = query
+
+            req1 = MockRequest({"asset": "ALL", "tf": "ALL", "confidence": "ALL"})
+            res1 = asyncio.run(server.handle_performance(req1))
+            data1 = json.loads(res1.text)
+            self.assertEqual(len(data1["recent_tracks"]), 2)
+            self.assertEqual(data1["metrics"]["total_tracks"], 2)
+
+            req2 = MockRequest({})
+            res2 = asyncio.run(server.handle_performance(req2))
+            data2 = json.loads(res2.text)
+            self.assertEqual(len(data2["recent_tracks"]), 2)
+            self.assertEqual(data2["metrics"]["total_tracks"], 2)
+
+    def test_orchestrator_migration_exact_count_and_status(self):
+        """11. Kiểm tra migrate_deprecated_timeframe_trades đóng chính xác 1 track 15m thành 'expired'."""
+        import sqlite3
+        from engine import IndicatorOrchestrator
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "test_mig_exact.db")
+            conn = sqlite3.connect(db_path)
+            conn.execute("""
+                CREATE TABLE signal_tracks (
+                    track_id TEXT PRIMARY KEY,
+                    asset TEXT,
+                    timeframe TEXT,
+                    status TEXT,
+                    result_note TEXT
+                )
+            """)
+            conn.execute("INSERT INTO signal_tracks VALUES ('tr_15m', 'BTC', '15m', 'pending_entry', NULL)")
+            conn.execute("INSERT INTO signal_tracks VALUES ('tr_1h', 'BTC', '1h', 'pending_entry', NULL)")
+            conn.commit()
+
+            orch = IndicatorOrchestrator()
+            closed_cnt = orch.migrate_deprecated_timeframe_trades(db_conn=conn)
+            self.assertEqual(closed_cnt, 1, "closed_cnt phải đúng bằng 1 track được cập nhật")
+
+            cursor = conn.cursor()
+            cursor.execute("SELECT track_id, status, result_note FROM signal_tracks WHERE track_id='tr_15m'")
+            row = cursor.fetchone()
+            self.assertEqual(row[1], "expired")
+            self.assertEqual(row[2], "timeframe_deprecated_migration")
+            conn.close()
+
+    def test_html_dashboard_no_15m_alias_ternary(self):
+        """12. Xác nhận HTML_DASHBOARD không còn bất kỳ ternary alias 15m -> 15min nào."""
+        from engine import HTML_DASHBOARD
+        self.assertNotIn("'15min' :", HTML_DASHBOARD)
+        self.assertNotIn('"15min" :', HTML_DASHBOARD)
+
+    def test_handle_candles_15m_request_returns_empty_no_alias_lookup(self):
+        """13. Gọi /api/candles?asset=BTC&tf=15m trả về [] do buffer 15m không còn tồn tại."""
+        import json
+        orch = IndicatorOrchestrator()
+        server = DashboardServer(orch, "127.0.0.1", 8080)
+        class MockRequest:
+            def __init__(self, query):
+                self.query = query
+        req = MockRequest({"asset": "BTC", "tf": "15m"})
+        resp = asyncio.run(server.handle_candles(req))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(resp.text), [])
 
 
 class TestOutcomeTrackerCandidateCheckLog(unittest.TestCase):
