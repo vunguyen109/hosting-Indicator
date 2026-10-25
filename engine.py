@@ -4830,7 +4830,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         if (waitMessage) waitMessage.style.display = 'none';
         if (levelsGrid) levelsGrid.style.display = 'grid';
 
-        const liveClose = snapshot.indicators?.[asset]?.[targetTf]?.close;
+        const liveClose = snapshot.indicators?.[asset]?.[tf]?.close;
         const livePriceStr = liveClose != null ? ('$' + Number(liveClose).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})) : '--';
 
         const entryValEl = document.getElementById('adviceEntryVal');
@@ -4842,7 +4842,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         } else {
           entryValEl.textContent = '$' + Number(advice.entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
           entryValEl.setAttribute('data-raw', advice.entry_zone);
-          const liveEma = snapshot.indicators?.[asset]?.[targetTf]?.ema_fast;
+          const liveEma = snapshot.indicators?.[asset]?.[tf]?.ema_fast;
           const liveEmaStr = (validity && validity.updated_entry_zone != null)
             ? ('$' + Number(validity.updated_entry_zone).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4}))
             : (liveEma != null ? ('$' + Number(liveEma).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4})) : '--');

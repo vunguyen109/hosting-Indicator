@@ -1348,6 +1348,11 @@ class TestHandleIndexSSOT(unittest.TestCase):
         # Sau khi dọn dẹp, xác nhận lại file dummy không còn sót lại
         self.assertFalse(os.path.exists(dummy_path))
 
+    def test_html_dashboard_render_advice_card_has_no_undefined_target_tf(self):
+        """Xác nhận không còn bất kỳ biến undefined targetTf nào trong HTML_DASHBOARD."""
+        from engine import HTML_DASHBOARD
+        self.assertNotIn("targetTf", HTML_DASHBOARD, "Biến ma targetTf không được xuất hiện trong HTML_DASHBOARD")
+
 
 class TestPrompt5Diagnostics(unittest.TestCase):
 
