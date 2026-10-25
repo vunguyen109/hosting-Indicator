@@ -1472,6 +1472,35 @@ class TestTwelveDataFetcherLock(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(gap_1_2, 0.045, f"gap_1_2 was {gap_1_2:.4f}s, expected >= 0.045s")
         self.assertGreaterEqual(gap_2_3, 0.045, f"gap_2_3 was {gap_2_3:.4f}s, expected >= 0.045s")
 
+    async def test_twelvedata_fetcher_exception_releases_lock_and_throttles_next_call(self):
+        import time
+        import aiohttp
+
+        call_times = []
+
+        class ErrorSession:
+            def get(self, url, params=None, timeout=None):
+                call_times.append(time.monotonic())
+                raise aiohttp.ClientError("Simulated network timeout")
+
+        fetcher = TwelveDataFetcher(ErrorSession(), api_key="test_key_valid", min_gap=0.05)
+
+        # 1. Request 1 gặp Exception trong nhánh try/except
+        res1 = await fetcher.fetch_candles("XAU/USD", "1h", limit=10)
+        self.assertEqual(res1, [])
+
+        # 2. Bất biến Release Lock: Lock không bao giờ bị kẹt lại sau lỗi
+        self.assertFalse(fetcher.lock.locked())
+
+        # 3. Request 2 tiếp nối: Phải chờ đủ min_gap (50ms) vì request 1 đã cập nhật _last_call trong except
+        res2 = await fetcher.fetch_candles("USO", "1h", limit=10)
+        self.assertEqual(res2, [])
+        self.assertFalse(fetcher.lock.locked())
+
+        self.assertEqual(len(call_times), 2)
+        gap = call_times[1] - call_times[0]
+        self.assertGreaterEqual(gap, 0.045, f"Gap sau lỗi phải >= 0.045s, thực tế là {gap:.4f}s")
+
 
 class TestNewAssetsSupport(unittest.TestCase):
     def test_config_contains_eth_and_xag(self):
