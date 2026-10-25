@@ -1349,6 +1349,55 @@ class TestHandleIndexSSOT(unittest.TestCase):
         self.assertFalse(os.path.exists(dummy_path))
 
 
+class TestPrompt5Diagnostics(unittest.TestCase):
+
+    def test_regime_diagnostic_log_emits_correct_values(self):
+        from engine import ConfluenceDecisionEngine, CONFIG, logger
+        engine = ConfluenceDecisionEngine(CONFIG)
+        snapshot = {
+            "ts": 1_700_000_000,
+            "close": 100.0,
+            "atr": 2.0,
+            "ema_fast": 100.3,   # ema_diff_atr = 0.3/2.0 = 0.150 -> sát ngưỡng WEAK_ATR_MULT
+            "ema_slow": 100.0,
+            "rsi": 55.0,
+            "bb_upper": 102.0,
+            "bb_mid": 100.0,
+            "bb_lower": 98.0,
+        }
+        with self.assertLogs(logger, level="INFO") as cm:
+            advice = engine.decide("BTC", "1h", snapshot, recent_signals=[], recent_candles=None)
+
+        self.assertTrue(any("[REGIME_DIAGNOSTIC]" in msg for msg in cm.output))
+        self.assertTrue(any("ema_diff_atr=0.150" in msg for msg in cm.output))
+        self.assertTrue(any("asset=BTC tf=1h" in msg for msg in cm.output))
+        self.assertTrue(any("is_sideway=True" in msg for msg in cm.output))
+        self.assertEqual(advice.action, "WAIT")  # regression chốt hành vi hiện tại, chưa đổi logic
+
+    def test_entry_diagnostic_log_emits_on_wait_pullback(self):
+        from engine import ConfluenceDecisionEngine, CONFIG, logger
+        engine = ConfluenceDecisionEngine(CONFIG)
+        snapshot = {
+            "ts": 1_700_000_000,
+            "close": 112.0,
+            "atr": 5.0,
+            "ema_fast": 110.0,   # distance_atr = |112-110|/5 = 0.400 > threshold 0.3
+            "ema_slow": 100.0,
+            "rsi": 65.0,
+            "bb_upper": 120.0,
+            "bb_mid": 105.0,
+            "bb_lower": 90.0,
+        }
+        with self.assertLogs(logger, level="INFO") as cm:
+            advice = engine.decide("OIL", "1h", snapshot, recent_signals=[], recent_candles=None)
+
+        self.assertTrue(any("[ENTRY_DIAGNOSTIC]" in msg for msg in cm.output))
+        self.assertTrue(any("entry_type=wait_pullback" in msg for msg in cm.output))
+        self.assertTrue(any("distance_atr=0.400" in msg for msg in cm.output))
+        self.assertEqual(advice.action, "BUY")
+        self.assertEqual(advice.entry_type, "wait_pullback")
+
+
 if __name__ == "__main__":
     unittest.main()
 

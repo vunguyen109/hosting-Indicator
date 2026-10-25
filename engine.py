@@ -1572,6 +1572,50 @@ class ConfluenceDecisionEngine:
                     tp2 = ref_price - tp2_mult * atr
                     tp2_rule = "Giữ lệnh đến khi Xu hướng EMA chuyển từ Giảm sang Cân bằng/Tăng"
 
+        # ============================================================
+        # [PROMPT 5 — STAGE A] Diagnostic-only logging. Zero behavior change.
+        # Không ảnh hưởng action/score/entry — chỉ quan sát để thu thập bằng chứng.
+        # Chạy 1 lần/nến đóng (cùng vòng đời với decide()), KHÔNG theo nhịp poll 3s.
+        # ============================================================
+
+        # --- [REGIME_DIAGNOSTIC] — giả thuyết whipsaw / thiếu regime filter ---
+        ema_diff_atr = (snapshot["ema_fast"] - snapshot["ema_slow"]) / atr if atr > 0 else 0.0
+
+        relevant_signals = [
+            s for s in recent_signals
+            if (s.get("asset") if isinstance(s, dict) else getattr(s, "asset", None)) == asset
+            and (s.get("timeframe") if isinstance(s, dict) else getattr(s, "timeframe", None)) == timeframe
+        ]
+        if relevant_signals:
+            last_signal_ts = max(
+                (s.get("ts") if isinstance(s, dict) else getattr(s, "ts", 0)) or 0
+                for s in relevant_signals
+            )
+            tf_sec = TF_SECONDS.get(timeframe, 3600)
+            bars_since_last_signal = max(0, round((snapshot.get("ts", 0) - last_signal_ts) / tf_sec))
+        else:
+            bars_since_last_signal = -1  # chưa có tín hiệu nào trong lịch sử gần đây
+
+        logger.info(
+            "[REGIME_DIAGNOSTIC] asset=%s tf=%s ts=%s action=%s score=%d confidence_score=%d "
+            "trend=%s ema_diff_atr=%.3f rsi_zone=%s bb_pos=%s "
+            "is_sideway=%s is_extreme_overextended=%s conflict=%s mtf_agree=%s "
+            "bars_since_last_signal=%d close=%.4f atr=%.4f",
+            asset, timeframe, snapshot.get("ts"), action.value, score, confidence_score,
+            trend.value, ema_diff_atr, rsi_zone.value, bb_pos.value,
+            is_sideway, is_extreme_overextended, conflict, mtf_agree,
+            bars_since_last_signal, close, atr,
+        )
+
+        # --- [ENTRY_DIAGNOSTIC] — giả thuyết riêng: OIL wait_pullback 0% fill ---
+        if action in (Action.BUY, Action.SELL):
+            logger.info(
+                "[ENTRY_DIAGNOSTIC] asset=%s tf=%s ts=%s action=%s entry_type=%s "
+                "distance_atr=%.3f pullback_threshold=%.3f close=%.4f ema20=%.4f",
+                asset, timeframe, snapshot.get("ts"), action.value, entry_type,
+                distance_atr, pullback_threshold, close, ema20,
+            )
+
         return TradeAdvice(
             action=action.value,
             confidence=confidence.value,
