@@ -1403,6 +1403,76 @@ class TestPrompt5Diagnostics(unittest.TestCase):
         self.assertEqual(advice.entry_type, "wait_pullback")
 
 
+class TestTwelveDataFetcherLock(unittest.IsolatedAsyncioTestCase):
+    async def test_twelvedata_fetcher_serializes_concurrent_requests(self):
+        import time
+
+        active_concurrent = 0
+        max_concurrent_seen = 0
+        call_timestamps = []
+
+        class MockResponse:
+            def __init__(self):
+                self.status = 200
+
+            async def __aenter__(self):
+                nonlocal active_concurrent, max_concurrent_seen
+                active_concurrent += 1
+                if active_concurrent > max_concurrent_seen:
+                    max_concurrent_seen = active_concurrent
+                call_timestamps.append(time.monotonic())
+                await asyncio.sleep(0.01)  # Giả lập I/O delay nhỏ
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                nonlocal active_concurrent
+                active_concurrent -= 1
+
+            async def json(self, content_type=None):
+                return {
+                    "status": "ok",
+                    "values": [
+                        {
+                            "datetime": "2026-10-25 14:00:00",
+                            "open": "100.0",
+                            "high": "105.0",
+                            "low": "95.0",
+                            "close": "102.0",
+                            "volume": "1000",
+                        }
+                    ]
+                }
+
+        class MockSession:
+            def get(self, url, params=None, timeout=None):
+                return MockResponse()
+
+        mock_session = MockSession()
+        fetcher = TwelveDataFetcher(mock_session, api_key="test_key_valid", min_gap=0.05)
+
+        t1 = fetcher.fetch_candles("XAU/USD", "1h", limit=10)
+        t2 = fetcher.fetch_candles("USO", "1h", limit=10)
+        t3 = fetcher.fetch_candles("XAG/USD", "1h", limit=10)
+
+        results = await asyncio.gather(t1, t2, t3)
+
+        self.assertEqual(len(results), 3)
+        for candles in results:
+            self.assertEqual(len(candles), 1)
+            self.assertEqual(candles[0].close, 102.0)
+
+        # 1. Bất biến Mutual Exclusion: Không bao giờ có 2 request chạy đồng thời
+        self.assertEqual(max_concurrent_seen, 1)
+
+        # 2. Bất biến timing: Các request liên tiếp cách nhau >= min_gap (50ms)
+        self.assertEqual(len(call_timestamps), 3)
+        gap_1_2 = call_timestamps[1] - call_timestamps[0]
+        gap_2_3 = call_timestamps[2] - call_timestamps[1]
+
+        self.assertGreaterEqual(gap_1_2, 0.045, f"gap_1_2 was {gap_1_2:.4f}s, expected >= 0.045s")
+        self.assertGreaterEqual(gap_2_3, 0.045, f"gap_2_3 was {gap_2_3:.4f}s, expected >= 0.045s")
+
+
 if __name__ == "__main__":
     unittest.main()
 

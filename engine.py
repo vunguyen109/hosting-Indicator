@@ -2768,11 +2768,12 @@ class TwelveDataFetcher:
 
     _BASE = "https://api.twelvedata.com"
 
-    def __init__(self, session: aiohttp.ClientSession, api_key: str) -> None:
+    def __init__(self, session: aiohttp.ClientSession, api_key: str, min_gap: float = 8.0) -> None:
         self._session      = session
         self._api_key      = (api_key or "").strip()
         self._last_call    = 0.0
-        self._min_gap      = 8.0   # seconds -- stays within 8 req/min
+        self._min_gap      = min_gap   # seconds -- stays within 8 req/min
+        self._lock: Optional[asyncio.Lock] = None
         self.is_configured = bool(
             self._api_key
             and not self._api_key.startswith("YOUR_")
@@ -2780,6 +2781,13 @@ class TwelveDataFetcher:
         )
         if not self.is_configured:
             logger.info("TwelveData API key not set -> Skipping Gold & Oil requests (Zero-ENV standalone mode).")
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """Lazy-initialized asyncio.Lock attached to the currently running event loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def update_key(self, new_key: str) -> None:
         clean = (new_key or "").strip()
@@ -2797,50 +2805,52 @@ class TwelveDataFetcher:
     ) -> list[Candle]:
         if not self.is_configured:
             return []
-        # Throttle: wait until min_gap has elapsed since last request
-        gap = time.time() - self._last_call
-        if gap < self._min_gap:
-            await asyncio.sleep(self._min_gap - gap)
-        url    = f"{self._BASE}/time_series"
-        params = {
-            "symbol":     symbol,
-            "interval":   interval,
-            "outputsize": limit,
-            "apikey":     self._api_key,
-            "format":     "JSON",
-            "order":      "ASC",   # oldest -> newest
-        }
-        try:
-            async with self._session.get(
-                url, params=params,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
+        async with self.lock:
+            # Throttle: wait until min_gap has elapsed since last request
+            gap = time.time() - self._last_call
+            if gap < self._min_gap:
+                await asyncio.sleep(self._min_gap - gap)
+            url    = f"{self._BASE}/time_series"
+            params = {
+                "symbol":     symbol,
+                "interval":   interval,
+                "outputsize": limit,
+                "apikey":     self._api_key,
+                "format":     "JSON",
+                "order":      "ASC",   # oldest -> newest
+            }
+            try:
+                async with self._session.get(
+                    url, params=params,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    self._last_call = time.time()
+                    if resp.status != 200:
+                        logger.warning(f"TwelveData {symbol}/{interval}: HTTP {resp.status}")
+                        return []
+                    data = await resp.json(content_type=None)
+                    if data.get("status") == "error":
+                        logger.error(f"TwelveData API error: {data.get('message')}")
+                        return []
+                    candles: list[Candle] = []
+                    for row in data.get("values", []):
+                        try:
+                            dt = datetime.datetime.fromisoformat(row["datetime"])
+                            candles.append(Candle(
+                                ts=int(dt.timestamp()),
+                                open=float(row["open"]),   high=float(row["high"]),
+                                low=float(row["low"]),     close=float(row["close"]),
+                                volume=float(row.get("volume", 0)),
+                            ))
+                        except (KeyError, ValueError) as exc:
+                            logger.debug(f"TwelveData row parse skip: {exc}")
+                        except Exception as exc:
+                            logger.debug(f"TwelveData row error: {exc}")
+                    return candles
+            except Exception as exc:
                 self._last_call = time.time()
-                if resp.status != 200:
-                    logger.warning(f"TwelveData {symbol}/{interval}: HTTP {resp.status}")
-                    return []
-                data = await resp.json(content_type=None)
-                if data.get("status") == "error":
-                    logger.error(f"TwelveData API error: {data.get('message')}")
-                    return []
-                candles: list[Candle] = []
-                for row in data.get("values", []):
-                    try:
-                        dt = datetime.datetime.fromisoformat(row["datetime"])
-                        candles.append(Candle(
-                            ts=int(dt.timestamp()),
-                            open=float(row["open"]),   high=float(row["high"]),
-                            low=float(row["low"]),     close=float(row["close"]),
-                            volume=float(row.get("volume", 0)),
-                        ))
-                    except (KeyError, ValueError) as exc:
-                        logger.debug(f"TwelveData row parse skip: {exc}")
-                    except Exception as exc:
-                        logger.debug(f"TwelveData row error: {exc}")
-                return candles
-        except Exception as exc:
-            logger.error(f"TwelveDataFetcher ({symbol}): {exc}")
-            return []
+                logger.error(f"TwelveDataFetcher ({symbol}): {exc}")
+                return []
 
 
 # =============================================================================
