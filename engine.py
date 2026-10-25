@@ -147,10 +147,22 @@ CONFIG = {
             "symbol":     "BTCUSDT",
             "timeframes": ["1h", "4h"],
         },
+        "ETH": {
+            "name":       "Ethereum",
+            "source":     "binance",
+            "symbol":     "ETHUSDT",
+            "timeframes": ["1h", "4h"],
+        },
         "XAU": {
             "name":       "Gold",
             "source":     "twelvedata",
             "symbol":     "XAU/USD",
+            "timeframes": ["1h", "4h"],
+        },
+        "XAG": {
+            "name":       "Silver",
+            "source":     "twelvedata",
+            "symbol":     "XAG/USD",
             "timeframes": ["1h", "4h"],
         },
         "OIL": {
@@ -883,7 +895,7 @@ def build_timeframe_payload(asset: str, tf: str) -> dict:
 
 def build_snapshot(orchestrator: Optional[Any] = None) -> dict:
     snapshot = {"timeframes": {}}
-    assets = CONFIG.get("assets", {"BTC": {}, "XAU": {}, "OIL": {}})
+    assets = CONFIG.get("assets", {})
     for a in assets:
         snapshot[a] = {}
         snapshot["timeframes"][a] = {}
@@ -3785,7 +3797,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       <div class="tabs-group">
         <span class="group-label">Tài sản:</span>
         <button class="tab-btn active" id="btnAssetBTC" onclick="selectAsset('BTC')">₿ Bitcoin (BTC)</button>
+        <button class="tab-btn" id="btnAssetETH" onclick="selectAsset('ETH')">🔷 Ethereum (ETH)</button>
         <button class="tab-btn" id="btnAssetXAU" onclick="selectAsset('XAU')">🟡 Vàng (XAU)</button>
+        <button class="tab-btn" id="btnAssetXAG" onclick="selectAsset('XAG')">⚪ Bạc (XAG)</button>
         <button class="tab-btn" id="btnAssetOIL" onclick="selectAsset('OIL')">🛢️ Dầu thô (USO)</button>
       </div>
       <div class="tabs-group">
@@ -4059,7 +4073,9 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <span class="perf-filter-label">Tài sản:</span>
         <button class="perf-filter-btn active" data-filter="asset" data-val="ALL" onclick="setPerfFilter('asset', 'ALL')">Tất cả</button>
         <button class="perf-filter-btn" data-filter="asset" data-val="BTC" onclick="setPerfFilter('asset', 'BTC')">BTC</button>
+        <button class="perf-filter-btn" data-filter="asset" data-val="ETH" onclick="setPerfFilter('asset', 'ETH')">ETH</button>
         <button class="perf-filter-btn" data-filter="asset" data-val="XAU" onclick="setPerfFilter('asset', 'XAU')">XAU</button>
+        <button class="perf-filter-btn" data-filter="asset" data-val="XAG" onclick="setPerfFilter('asset', 'XAG')">XAG</button>
         <button class="perf-filter-btn" data-filter="asset" data-val="OIL" onclick="setPerfFilter('asset', 'OIL')">OIL</button>
 
         <span class="perf-filter-label" style="margin-left:10px;">Khung:</span>
@@ -4462,7 +4478,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         const tbody = document.getElementById('indicatorsTbody');
         const indMap = data.indicators || {};
         let rowsHtml = '';
-        const assets = ['BTC', 'XAU', 'OIL'];
+        const assets = Object.keys(indMap).length > 0 ? Object.keys(indMap) : ['BTC', 'ETH', 'XAU', 'XAG', 'OIL'];
 
         assets.forEach(asset => {
           const tfs = indMap[asset] || {};
@@ -4526,9 +4542,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
               atrTag = `<span class="tag-status status-safe">🍃 Sóng êm (${a.toFixed(2)})</span>`;
             }
 
-            let assetName = '₿ Bitcoin (BTC)';
-            if (asset === 'XAU') assetName = '🟡 Vàng (XAU)';
-            if (asset === 'OIL') assetName = '🛢️ Dầu thô (USO)';
+            const ASSET_TABLE_NAMES = {
+              'BTC': '₿ Bitcoin (BTC)',
+              'ETH': '🔷 Ethereum (ETH)',
+              'XAU': '🟡 Vàng (XAU)',
+              'XAG': '⚪ Bạc (XAG)',
+              'OIL': '🛢️ Dầu thô (USO)',
+            };
+            const assetName = ASSET_TABLE_NAMES[asset] || asset;
 
             let tfName = tf.includes('15') ? '15 Phút' : (tf.includes('4') ? '4 Giờ' : '1 Giờ');
 
@@ -4570,7 +4591,14 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
             let icon = '🔔';
             let confHtml = '<span class="conf-tag conf-mid">🟡 ĐỘ TIN CẬY: VỪA</span>';
 
-            const assetLabel = s.asset === 'BTC' ? 'Bitcoin' : (s.asset === 'XAU' ? 'Vàng' : 'Dầu thô');
+            const ASSET_LABELS = {
+              'BTC': 'Bitcoin',
+              'ETH': 'Ethereum',
+              'XAU': 'Vàng',
+              'XAG': 'Bạc',
+              'OIL': 'Dầu thô',
+            };
+            const assetLabel = ASSET_LABELS[s.asset] || s.asset;
             const tfLabel = s.timeframe.includes('15') ? '15 phút' : (s.timeframe.includes('4') ? '4 giờ' : '1 giờ');
             const priceStr = '$' + Number(s.price).toFixed(2);
 
@@ -4934,9 +4962,8 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     // --- CHUYỂN ĐỔI TÀI SẢN & KHUNG GIỜ ---
     function selectAsset(asset) {
       currentAsset = asset;
-      ['BTC', 'XAU', 'OIL'].forEach(a => {
-        const btn = document.getElementById('btnAsset' + a);
-        if (btn) btn.classList.toggle('active', a === asset);
+      document.querySelectorAll('[id^="btnAsset"]').forEach(btn => {
+        btn.classList.toggle('active', btn.id === 'btnAsset' + asset);
       });
       document.getElementById('activeChartTitle').textContent = `[${asset} · ${currentTimeframe}]`;
       fetchCandleData();

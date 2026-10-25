@@ -1473,6 +1473,94 @@ class TestTwelveDataFetcherLock(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(gap_2_3, 0.045, f"gap_2_3 was {gap_2_3:.4f}s, expected >= 0.045s")
 
 
+class TestNewAssetsSupport(unittest.TestCase):
+    def test_config_contains_eth_and_xag(self):
+        self.assertIn("ETH", CONFIG["assets"])
+        self.assertIn("XAG", CONFIG["assets"])
+
+        eth = CONFIG["assets"]["ETH"]
+        self.assertEqual(eth["source"], "binance")
+        self.assertEqual(eth["symbol"], "ETHUSDT")
+        self.assertEqual(eth["timeframes"], ["1h", "4h"])
+
+        xag = CONFIG["assets"]["XAG"]
+        self.assertEqual(xag["source"], "twelvedata")
+        self.assertEqual(xag["symbol"], "XAG/USD")
+        self.assertEqual(xag["timeframes"], ["1h", "4h"])
+
+    def test_decide_eth_pipeline(self):
+        engine = ConfluenceDecisionEngine(CONFIG)
+        eth_snapshot = {
+            "ts": 1792940000,
+            "asset": "ETH",
+            "timeframe": "1h",
+            "close": 3100.0,
+            "ema_fast": 3150.0,
+            "ema_slow": 3050.0,
+            "rsi": 58.0,
+            "atr": 45.0,
+            "bb_upper": 3250.0,
+            "bb_mid": 3100.0,
+            "bb_lower": 2950.0,
+        }
+        advice = engine.decide("ETH", "1h", eth_snapshot, recent_signals=[], recent_candles=None)
+        self.assertIn(advice.action, ["BUY", "SELL", "WAIT"])
+        self.assertIsInstance(advice.confidence_score, int)
+        self.assertIsInstance(advice.reasoning, list)
+        if advice.action in ["BUY", "SELL"]:
+            self.assertIsNotNone(advice.stop_loss)
+            self.assertIsNotNone(advice.take_profit_1)
+
+    def test_decide_xag_silver_pipeline(self):
+        engine = ConfluenceDecisionEngine(CONFIG)
+        xag_snapshot = {
+            "ts": 1792940000,
+            "asset": "XAG",
+            "timeframe": "1h",
+            "close": 33.50,
+            "ema_fast": 33.80,
+            "ema_slow": 33.10,
+            "rsi": 62.0,
+            "atr": 0.45,
+            "bb_upper": 34.50,
+            "bb_mid": 33.40,
+            "bb_lower": 32.30,
+        }
+        advice = engine.decide("XAG", "1h", xag_snapshot, recent_signals=[], recent_candles=None)
+        self.assertIn(advice.action, ["BUY", "SELL", "WAIT"])
+        self.assertIsInstance(advice.confidence_score, int)
+        self.assertIsInstance(advice.reasoning, list)
+        if advice.action in ["BUY", "SELL"]:
+            self.assertIsNotNone(advice.stop_loss)
+            self.assertIsNotNone(advice.take_profit_1)
+
+    def test_regression_existing_assets_btc_xau_oil(self):
+        engine = ConfluenceDecisionEngine(CONFIG)
+        btc_snapshot = {
+            "ts": 1792940000,
+            "asset": "BTC",
+            "timeframe": "1h",
+            "close": 80000.0,
+            "ema_fast": 80500.0,
+            "ema_slow": 79500.0,
+            "rsi": 50.0,
+            "atr": 300.0,
+            "bb_upper": 81000.0,
+            "bb_mid": 80000.0,
+            "bb_lower": 79000.0,
+        }
+        advice = engine.decide("BTC", "1h", btc_snapshot, recent_signals=[], recent_candles=None)
+        self.assertIn(advice.action, ["BUY", "SELL", "WAIT"])
+
+    def test_html_dashboard_contains_eth_and_xag_and_no_undefined(self):
+        from engine import HTML_DASHBOARD
+        self.assertIn('id="btnAssetETH"', HTML_DASHBOARD)
+        self.assertIn('id="btnAssetXAG"', HTML_DASHBOARD)
+        self.assertIn('data-val="ETH"', HTML_DASHBOARD)
+        self.assertIn('data-val="XAG"', HTML_DASHBOARD)
+        self.assertNotIn("targetTf", HTML_DASHBOARD)
+
+
 if __name__ == "__main__":
     unittest.main()
 
