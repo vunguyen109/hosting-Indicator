@@ -1187,6 +1187,55 @@ class TestRsiZoneSSOTAcrossAllIndicatorSources(unittest.TestCase):
             "_compute_indicators_with_zone() — nguy cơ rsi_zone lệch pha."
         )
 
+class TestHandleIndexSSOT(unittest.TestCase):
+    """
+    Kiểm thử bảo đảm handle_index() dùng HTML_DASHBOARD làm SSOT duy nhất,
+    không đọc file dashboard.html và không bao giờ bị override bởi file trên đĩa.
+    """
+
+    def test_handle_index_contains_all_ssot_signatures(self):
+        """Chiều 1: response của handle_index phải chứa đủ cả 3 chữ ký của Prompt 3 & Prompt 4."""
+        from engine import HTML_DASHBOARD
+        server = DashboardServer(orchestrator=None, host="127.0.0.1", port=8080)
+        resp = asyncio.run(server.handle_index(None))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.content_type, "text/html")
+        self.assertEqual(resp.charset, "utf-8")
+        self.assertEqual(resp.text, HTML_DASHBOARD)
+
+        # Chữ ký Prompt 3
+        self.assertIn("RSI_GAUGE_LABELS", resp.text)
+        self.assertIn("RSI_TABLE_LABELS", resp.text)
+        # Chữ ký Prompt 4
+        self.assertIn("display_action === 'HIDDEN'", resp.text)
+        self.assertIn('id="btnTf15m" style="display:none;"', resp.text)
+
+    def test_handle_index_ignores_dummy_dashboard_html_on_disk(self):
+        """Chiều 2: Nếu có file dashboard.html giả lập rác trên đĩa, handle_index vẫn trả về HTML_DASHBOARD nguyên bản."""
+        from engine import HTML_DASHBOARD
+        dummy_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+        dummy_content = "<html><body>DUMMY_CORRUPTED_DASHBOARD_CONTENT</body></html>"
+        server = DashboardServer(orchestrator=None, host="127.0.0.1", port=8080)
+
+        # Đảm bảo dọn dẹp bằng try/finally
+        try:
+            with open(dummy_path, "w", encoding="utf-8") as f:
+                f.write(dummy_content)
+
+            resp = asyncio.run(server.handle_index(None))
+            # Response phải khớp 100% với HTML_DASHBOARD, không bị nội dung rác override
+            self.assertEqual(resp.text, HTML_DASHBOARD)
+            self.assertNotIn("DUMMY_CORRUPTED_DASHBOARD_CONTENT", resp.text)
+            self.assertIn("RSI_GAUGE_LABELS", resp.text)
+            self.assertIn("RSI_TABLE_LABELS", resp.text)
+            self.assertIn("display_action === 'HIDDEN'", resp.text)
+        finally:
+            if os.path.exists(dummy_path):
+                os.remove(dummy_path)
+
+        # Sau khi dọn dẹp, xác nhận lại file dummy không còn sót lại
+        self.assertFalse(os.path.exists(dummy_path))
+
 
 if __name__ == "__main__":
     unittest.main()

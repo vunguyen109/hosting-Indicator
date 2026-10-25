@@ -36,8 +36,7 @@ Dự án **Hosting Indicator Engine** là một dịch vụ phát tín hiệu đ
 
 ```
 hosting-Indicator/
-├── engine.py              # Core Engine nguyên khối: Data Fetcher, Math, Rules, API, Web Server (2,439 dòng)
-├── dashboard.html         # Giao diện Web Dashboard độc lập (được server ưu tiên nạp nếu tồn tại)
+├── engine.py              # Core Engine nguyên khối: Data Fetcher, Math, Rules, API, Web Server, Web UI SSOT
 ├── requirements.txt       # Danh sách thư viện phụ thuộc (duy nhất aiohttp==3.9.5)
 ├── test_engine.py         # Bộ test suite tự động kiểm thử toàn bộ module lõi
 ├── implementation_plan.md # Kế hoạch triển khai đợt nâng cấp UX/Dashboard gần nhất
@@ -87,7 +86,7 @@ hosting-Indicator/
 | **Section 7: Persistence** | `StatePersistence` | Ghi trạng thái định kỳ 15 phút một lần xuống `./data/state.json`. Dùng kỹ thuật ghi ra temp file rồi `os.replace` để đảm bảo tính nguyên tử (atomic) trên POSIX. Tự động trim dữ liệu nếu vượt ngưỡng trần 1.5MB. |
 | **Section 8: Watchdog** | `DiskWatchdog` | Định kỳ mỗi 6 giờ kiểm tra dung lượng ổ cứng. Gửi cảnh báo Telegram nếu dung lượng sử dụng vượt quá 70%. |
 | **Section 9: Scheduler** | `seconds_until_next_close` | Tính toán chính xác số giây cần `sleep` cho đến thời điểm đóng nến tiếp theo + 5 giây bù trễ mạng của sàn giao dịch. |
-| **Section 10: Web Server** | `DashboardServer`, `HTML_DASHBOARD` | Nhúng server HTTP bằng `aiohttp.web`, tiêu thụ < 5MB RAM. Cung cấp API và Dashboard SPA. Ưu tiên nạp từ `dashboard.html` nếu file tồn tại. |
+| **Section 10: Web Server** | `DashboardServer`, `HTML_DASHBOARD` | Nhúng server HTTP bằng `aiohttp.web`, tiêu thụ < 5MB RAM. Cung cấp API và Dashboard SPA. `engine.py` (`HTML_DASHBOARD`) là Single Source of Truth (SSOT) duy nhất cho giao diện Web UI. |
 | **Section 11: Orchestrator** | `IndicatorOrchestrator` | Bộ điều phối chính: Khởi tạo HTTP session dùng chung, pre-fill lịch sử 300 nến vào RAM, quản lý 8 tasks chạy nền song song, hỗ trợ `reload_asset_buffers` khi người dùng nạp API key mới từ UI. |
 | **Section 12: Logging** | `setup_logging`, `main` | Rotating log (5MB x 2 file backup = tối đa 15MB disk). Cấu hình unbuffered stdout để log hiển thị tức thì trên bảng điều khiển cloud container. |
 
@@ -142,7 +141,7 @@ Server lắng nghe mặc định tại `0.0.0.0:${SERVER_PORT:-8080}`:
 
 ### 1. `GET /`
 - **Chức năng:** Trả về trang Web Dashboard Single Page App.
-- **Thứ tự nạp:** Ưu tiên đọc nội dung file [dashboard.html](file:///d:/vunq/hosting-Indicator/dashboard.html). Nếu không tìm thấy, fallback sang biến `HTML_DASHBOARD` nhúng sẵn trong `engine.py`.
+- **Cơ chế:** Trả về trực tiếp chuỗi `HTML_DASHBOARD` nhúng sẵn trong `engine.py` (Single Source of Truth duy nhất, không phụ thuộc file tĩnh ngoài đĩa).
 
 ### 2. `GET /health` & `GET /api/health`
 - **Chức năng:** Health check phục vụ PaaS Router / Load Balancer.
@@ -332,10 +331,10 @@ Server lắng nghe mặc định tại `0.0.0.0:${SERVER_PORT:-8080}`:
 
 Khi tiếp nhận dự án để thực hiện nâng cấp, cần đặc biệt chú ý:
 
-1. **Vấn đề mã nguồn kép (Dual Frontend Code):**
-   - Mã HTML/CSS/JS đang tồn tại đồng thời ở cả file [dashboard.html](file:///d:/vunq/hosting-Indicator/dashboard.html) và biến chuỗi `HTML_DASHBOARD` bên trong [engine.py](file:///d:/vunq/hosting-Indicator/engine.py#L1277).
-   - Cơ chế `DashboardServer.handle_index` ưu tiên đọc file [dashboard.html](file:///d:/vunq/hosting-Indicator/dashboard.html) nếu tồn tại. Khi chỉnh sửa frontend, cần đảm bảo đồng bộ cả hai nơi hoặc thống nhất loại bỏ chuỗi nhúng trong `engine.py`.
-2. **Kích thước file `engine.py` (Monolithic ~3,300 lines):**
+1. **[ĐÃ GIẢI QUYẾT] Chuẩn hóa Mã nguồn Giao diện (Web UI SSOT):**
+   - Trước đây mã HTML/CSS/JS tồn tại đồng thời ở cả file `dashboard.html` và chuỗi `HTML_DASHBOARD` trong `engine.py`, gây lỗi lệch pha giao diện trên production (Prompt 3).
+   - Đã chuẩn hóa: Xoá bỏ hoàn toàn file `dashboard.html` vật lý và logic override file trong `handle_index()`. `engine.py` là Single Source of Truth duy nhất, bảo đảm đúng triết lý Zero-dependency standalone của dự án.
+2. **Kích thước file `engine.py` (Monolithic):**
    - File bao trùm toàn bộ ứng dụng nhằm mục đích "single file execution". Nếu dự án mở rộng thêm nhiều chỉ báo và chiến lược mới, cần cân nhắc cấu trúc lại thành các package nhỏ hơn (`indicators/`, `fetchers/`, `server/`) nếu không bị ràng buộc triển khai 1 file.
 3. **Giới hạn Rate Limit của TwelveData:**
    - Free tier có hạn mức **8 req/phút** và **800 req/ngày**. Cơ chế throttle hiện tại cố định 8.0s giữa các lượt gọi. Nếu thêm tài sản mới hoặc thêm khung thời gian ngắn hơn (ví dụ M5, M1), hạn ngạch sẽ nhanh chóng bị cạn kiệt.

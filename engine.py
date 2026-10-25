@@ -5261,15 +5261,7 @@ class DashboardServer:
         self._site:   Optional[web.TCPSite]   = None
 
     async def handle_index(self, request: web.Request) -> web.Response:
-        content = HTML_DASHBOARD
-        dash_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
-        if os.path.exists(dash_path):
-            try:
-                with open(dash_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except Exception:
-                pass
-        return web.Response(text=content, content_type="text/html", charset="utf-8")
+        return web.Response(text=HTML_DASHBOARD, content_type="text/html", charset="utf-8")
 
     async def handle_candles(self, request: web.Request) -> web.Response:
         """
