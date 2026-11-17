@@ -20,19 +20,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import hmac
 import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
-from typing import Optional
+from typing import Any, Optional
 
 # Force stdout/stderr unbuffered mode immediately for cloud container environments (Botkeep/Docker)
 os.environ["PYTHONUNBUFFERED"] = "1"
@@ -72,8 +75,36 @@ def _load_dotenv(filepath: str = ".env") -> None:
 _load_dotenv()
 
 
-def _update_dotenv(updates: dict[str, str], filepath: str = ".env") -> None:
-    """Safely update or append key-value pairs to .env file."""
+ENV_CONFIG_WHITELIST: frozenset[str] = frozenset({
+    "TWELVE_API_KEY",
+    "TG_BOT_TOKEN",
+    "TG_CHAT_ID",
+})
+
+API_CONFIG_ALLOWED_KEYS: frozenset[str] = frozenset({
+    "twelvedata_api_key",
+    "telegram_bot_token",
+    "telegram_chat_id",
+})
+
+
+def _get_admin_token() -> str:
+    """Read ADMIN_TOKEN from environment without exposing it in CONFIG or API responses."""
+    return os.environ.get("ADMIN_TOKEN", "").strip()
+
+
+def _update_dotenv(updates: dict[str, str], filepath: Optional[str] = None) -> None:
+    """Safely update or append whitelisted key-value pairs to .env file, preserving all other lines."""
+    if filepath is None:
+        filepath = CONFIG.get("DOTENV_PATH", os.path.join(BASE_DIR, ".env"))
+    allowed_env_keys = set(CONFIG.get("ENV_CONFIG_WHITELIST", ENV_CONFIG_WHITELIST))
+    safe_updates = {
+        k: v for k, v in updates.items()
+        if k in allowed_env_keys and k != "ADMIN_TOKEN"
+    }
+    if not safe_updates:
+        return
+
     lines: list[str] = []
     keys_updated: set[str] = set()
     if os.path.exists(filepath):
@@ -88,13 +119,16 @@ def _update_dotenv(updates: dict[str, str], filepath: str = ".env") -> None:
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             k = stripped.split("=", 1)[0].strip()
-            if k in updates:
-                new_lines.append(f"{k}={updates[k]}\n")
+            if k in safe_updates:
+                new_lines.append(f"{k}={safe_updates[k]}\n")
                 keys_updated.add(k)
                 continue
         new_lines.append(line)
 
-    for k, v in updates.items():
+    if new_lines and not new_lines[-1].endswith("\n"):
+        new_lines[-1] = new_lines[-1] + "\n"
+
+    for k, v in safe_updates.items():
         if k not in keys_updated and v:
             new_lines.append(f"{k}={v}\n")
 
@@ -102,7 +136,7 @@ def _update_dotenv(updates: dict[str, str], filepath: str = ".env") -> None:
         with open(filepath, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
     except Exception as exc:
-        print(f"[WARN] Failed to write to {filepath}: {exc}", flush=True)
+        print(f"[WARN] Failed to write to {filepath}: {redact(exc)}", flush=True)
 
 
 def _parse_port(default: int = 8080) -> int:
@@ -277,7 +311,122 @@ CONFIG = {
     "TIMEFRAME_ORDER":              ["1h", "4h"],
     "TRACKABLE_TIMEFRAMES":         ["1h", "4h"],
     "CONFIDENCE_HIDE_ACTION_LEVELS":["LOW", "Thấp"],
+
+    # ---- Security & Hot-Config Controls (WP-S) --------------------------
+    "DOTENV_PATH":                  os.path.abspath(os.environ.get("DOTENV_PATH", os.path.join(BASE_DIR, ".env"))),
+    "ENV_CONFIG_WHITELIST":         ("TWELVE_API_KEY", "TG_BOT_TOKEN", "TG_CHAT_ID"),
+    "API_CONFIG_ALLOWED_KEYS":      ("twelvedata_api_key", "telegram_bot_token", "telegram_chat_id"),
+    "CONFIG_MAX_BODY_BYTES":        4096,
+    "CONFIG_AUTH_MAX_FAILURES_PER_MIN": 5,
+    "CONFIG_AUTH_WINDOW_SECONDS":   60,
+    "CONFIG_AUTH_MAX_TRACKED_IPS":  1024,
 }
+
+
+_RE_DISCORD_WEBHOOK = re.compile(
+    r"(https?://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api/webhooks/\d+/)([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+_RE_TG_BOT_URL = re.compile(r"(bot\d{5,15}:)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
+_RE_TG_STANDALONE = re.compile(r"\b(\d{6,15}):[A-Za-z0-9_-]{20,}\b")
+_RE_QUERY_SECRET = re.compile(
+    r"((?:apikey|api_key|access_token|secret|password|admin_token)\s*(?:=|:|%3D)\s*[\'\"]?)([^\s&\"'\]\)\,;>]+)",
+    re.IGNORECASE,
+)
+_RE_AUTH_HEADER = re.compile(
+    r"(Authorization\s*[\"'=:]+\s*(?:Bearer\s+)?)([^\s\"'\]\)\,;>]+)",
+    re.IGNORECASE,
+)
+_RE_BEARER = re.compile(r"(\bBearer\s+)([^\s\"'\]\)\,;>]+)", re.IGNORECASE)
+_RE_CHAT_ID = re.compile(r"(chat_id\s*[\"'=:]+\s*[\'\"]?)(-?\d{6,15})", re.IGNORECASE)
+
+
+def redact(value: Any) -> str:
+    """
+    Redact secrets, tokens, API keys, webhooks, and chat IDs from strings or exceptions.
+    Handles str(exc), exc.args, and aiohttp request_info URLs.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, BaseException):
+        parts: list[str] = []
+        s_exc = str(value)
+        if s_exc:
+            parts.append(s_exc)
+        if getattr(value, "args", None):
+            for arg in value.args:
+                s_arg = str(arg)
+                if s_arg and s_arg not in parts:
+                    parts.append(s_arg)
+        req_info = getattr(value, "request_info", None)
+        if req_info is not None:
+            real_url = getattr(req_info, "real_url", None)
+            if real_url is not None and str(real_url) not in " ".join(parts):
+                parts.append(f"url={real_url}")
+        url_attr = getattr(value, "url", None)
+        if url_attr is not None and str(url_attr) not in " ".join(parts):
+            parts.append(f"url={url_attr}")
+        text = " | ".join(parts) if parts else repr(value)
+    else:
+        text = str(value)
+
+    if not text:
+        return text
+
+    text = _RE_DISCORD_WEBHOOK.sub(r"\1****", text)
+    text = _RE_TG_BOT_URL.sub(r"\1****", text)
+    text = _RE_TG_STANDALONE.sub(r"\1:****", text)
+    text = _RE_QUERY_SECRET.sub(r"\1****", text)
+    text = _RE_AUTH_HEADER.sub(r"\1****", text)
+    text = _RE_BEARER.sub(r"\1****", text)
+    text = _RE_CHAT_ID.sub(r"\1****", text)
+
+    dynamic_secrets = (
+        _get_admin_token(),
+        str(CONFIG.get("twelvedata_api_key") or ""),
+        str(CONFIG.get("telegram_bot_token") or ""),
+        str(CONFIG.get("telegram_chat_id") or ""),
+        os.environ.get("TWELVE_API_KEY", ""),
+        os.environ.get("TG_BOT_TOKEN", ""),
+        os.environ.get("TG_CHAT_ID", ""),
+        os.environ.get("DISCORD_WEBHOOK_URL", ""),
+    )
+    for raw_sec in dynamic_secrets:
+        sec = (raw_sec or "").strip()
+        if len(sec) >= 6 and not sec.startswith(("YOUR_", "your_")):
+            if sec in text:
+                text = text.replace(sec, "****")
+            quoted = urllib.parse.quote(sec, safe="")
+            if len(quoted) >= 6 and quoted in text:
+                text = text.replace(quoted, "****")
+
+    return text
+
+
+class RedactingLogFilter(logging.Filter):
+    """Second-layer defense filter attached to all logging handlers and loggers."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+            record.msg = redact(rendered)
+            record.args = ()
+        except Exception:
+            record.msg = redact(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(redact(a) if isinstance(a, (str, BaseException)) else a for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {
+                    k: (redact(v) if isinstance(v, (str, BaseException)) else v)
+                    for k, v in record.args.items()
+                }
+        if record.exc_info and record.exc_info[1] is not None:
+            fmt = logging.Formatter()
+            record.exc_text = redact(fmt.formatException(record.exc_info))
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = redact(record.exc_text)
+        return True
 
 # Timeframe identifier -> seconds
 TF_SECONDS: dict[str, int] = {
@@ -2681,9 +2830,10 @@ class TelegramDispatcher:
                 async with session.post(url, json=payload) as resp:
                     if resp.status == 200:
                         return True
-                    logger.warning(f"Telegram HTTP {resp.status}: {(await resp.text())[:200]}")
+                    body_preview = redact((await resp.text())[:200])
+                    logger.warning(f"Telegram HTTP {resp.status}: {body_preview}")
             except Exception as exc:
-                logger.warning(f"Telegram attempt {attempt + 1} failed: {exc}")
+                logger.warning(f"Telegram attempt {attempt + 1} failed: {redact(exc)}")
             await asyncio.sleep(2 ** attempt)   # backoff: 1s, 2s, 4s
         return False
 
@@ -2762,7 +2912,7 @@ class BinanceFetcher:
                     for r in rows[:-1]   # drop last unclosed bar
                 ]
         except Exception as exc:
-            logger.error(f"BinanceFetcher ({symbol}): {exc}")
+            logger.error(f"BinanceFetcher ({symbol}): {redact(exc)}")
             return []
 
 
@@ -2842,7 +2992,7 @@ class TwelveDataFetcher:
                         return []
                     data = await resp.json(content_type=None)
                     if data.get("status") == "error":
-                        logger.error(f"TwelveData API error: {data.get('message')}")
+                        logger.error(f"TwelveData API error: {redact(data.get('message'))}")
                         return []
                     candles: list[Candle] = []
                     for row in data.get("values", []):
@@ -2855,13 +3005,13 @@ class TwelveDataFetcher:
                                 volume=float(row.get("volume", 0)),
                             ))
                         except (KeyError, ValueError) as exc:
-                            logger.debug(f"TwelveData row parse skip: {exc}")
+                            logger.debug(f"TwelveData row parse skip: {redact(exc)}")
                         except Exception as exc:
-                            logger.debug(f"TwelveData row error: {exc}")
+                            logger.debug(f"TwelveData row error: {redact(exc)}")
                     return candles
             except Exception as exc:
                 self._last_call = time.time()
-                logger.error(f"TwelveDataFetcher ({symbol}): {exc}")
+                logger.error(f"TwelveDataFetcher ({symbol}): {redact(exc)}")
                 return []
 
 
@@ -4173,6 +4323,11 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         <div class="modal-title">⚙️ Cấu Hình Kết Nối API</div>
         <button class="modal-close" onclick="closeConfigModal()">✕</button>
       </div>
+      <div id="cfgModalStatus" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:6px;font-size:0.82rem;"></div>
+      <div class="form-group">
+        <label>Admin Token (Bắt buộc để lưu cấu hình)</label>
+        <input type="password" id="cfgAdminToken" class="form-input" placeholder="Nhập ADMIN_TOKEN">
+      </div>
       <div class="form-group">
         <label>TwelveData API Key (Cho Vàng & Dầu)</label>
         <input type="password" id="cfgTwelveKey" class="form-input" placeholder="Nhập API key TwelveData">
@@ -4993,26 +5148,71 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 
     // --- MODAL CẤU HÌNH ---
     function openConfigModal() {
+      const tokenInput = document.getElementById('cfgAdminToken');
+      if (tokenInput) {
+        tokenInput.value = sessionStorage.getItem('admin_token') || '';
+      }
+      const statusBox = document.getElementById('cfgModalStatus');
+      if (statusBox) {
+        statusBox.style.display = 'none';
+        statusBox.textContent = '';
+      }
       document.getElementById('configModal').style.display = 'flex';
     }
     function closeConfigModal() {
       document.getElementById('configModal').style.display = 'none';
     }
     async function saveConfig() {
-      const twelveKey = document.getElementById('cfgTwelveKey').value.trim();
-      const tgToken   = document.getElementById('cfgTgToken').value.trim();
-      const tgChat    = document.getElementById('cfgTgChat').value.trim();
+      const adminToken = (document.getElementById('cfgAdminToken')?.value || '').trim();
+      const twelveKey  = document.getElementById('cfgTwelveKey').value.trim();
+      const tgToken    = document.getElementById('cfgTgToken').value.trim();
+      const tgChat     = document.getElementById('cfgTgChat').value.trim();
+      const statusBox  = document.getElementById('cfgModalStatus');
+
+      if (adminToken) {
+        sessionStorage.setItem('admin_token', adminToken);
+      } else {
+        sessionStorage.removeItem('admin_token');
+      }
+
+      const headers = { 'Content-Type': 'application/json' };
+      if (adminToken) {
+        headers['Authorization'] = 'Bearer ' + adminToken;
+      }
+
       try {
         const res = await fetch('/api/config', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: headers,
           body: JSON.stringify({
             twelvedata_api_key: twelveKey,
             telegram_bot_token: tgToken,
             telegram_chat_id: tgChat
           })
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 403) {
+          const msg = data.message || 'Cấu hình nóng đang bị tắt trên máy chủ (config disabled - ADMIN_TOKEN chưa được thiết lập).';
+          if (statusBox) {
+            statusBox.style.display = 'block';
+            statusBox.style.background = 'rgba(239,68,68,0.15)';
+            statusBox.style.color = '#fca5a5';
+            statusBox.textContent = '🔒 ' + msg;
+          }
+          alert(msg);
+          return;
+        }
+        if (!res.ok) {
+          const msg = data.message || ('Lỗi xác thực hoặc cấu hình (HTTP ' + res.status + ')');
+          if (statusBox) {
+            statusBox.style.display = 'block';
+            statusBox.style.background = 'rgba(239,68,68,0.15)';
+            statusBox.style.color = '#fca5a5';
+            statusBox.textContent = '⚠️ ' + msg;
+          }
+          alert(msg);
+          return;
+        }
         alert(data.message || 'Đã cập nhật cấu hình thành công!');
         closeConfigModal();
         updateDashboard();
@@ -5319,6 +5519,7 @@ class DashboardServer:
         self._orchestrator = orchestrator
         self._host         = host
         self._port         = port
+        self._auth_failures: dict[str, deque[float]] = {}
         self._app          = web.Application()
         self._app.router.add_get("/",             self.handle_index)
         self._app.router.add_get("/health",       self.handle_health)
@@ -5329,6 +5530,10 @@ class DashboardServer:
         self._app.router.add_post("/api/config",  self.handle_save_config)
         self._runner: Optional[web.AppRunner] = None
         self._site:   Optional[web.TCPSite]   = None
+        if not _get_admin_token():
+            logger.warning(
+                "[SECURITY] ADMIN_TOKEN is empty — hot configuration via POST /api/config is DISABLED (HTTP 403)."
+            )
 
     async def handle_index(self, request: web.Request) -> web.Response:
         return web.Response(text=HTML_DASHBOARD, content_type="text/html", charset="utf-8")
@@ -5496,10 +5701,96 @@ class DashboardServer:
         return web.json_response(data)
 
     async def handle_save_config(self, request: web.Request) -> web.Response:
+        admin_token = _get_admin_token()
+        if not admin_token:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "code": "config_disabled",
+                    "message": "Hot configuration is disabled because ADMIN_TOKEN is not configured.",
+                },
+                status=403,
+            )
+
+        max_body = int(CONFIG.get("CONFIG_MAX_BODY_BYTES", 4096))
+        if request.content_length is not None and request.content_length > max_body:
+            return web.json_response(
+                {"status": "error", "message": f"Payload too large (max {max_body} bytes)"},
+                status=413,
+            )
+        raw_body = await request.content.read(max_body + 1)
+        if len(raw_body) > max_body:
+            return web.json_response(
+                {"status": "error", "message": f"Payload too large (max {max_body} bytes)"},
+                status=413,
+            )
+
+        client_ip = request.remote or "127.0.0.1"
+        now_ts = time.monotonic()
+        window_sec = float(CONFIG.get("CONFIG_AUTH_WINDOW_SECONDS", 60.0))
+        max_failures = int(CONFIG.get("CONFIG_AUTH_MAX_FAILURES_PER_MIN", 5))
+        max_ips = int(CONFIG.get("CONFIG_AUTH_MAX_TRACKED_IPS", 1024))
+
+        ip_failures = self._auth_failures.get(client_ip)
+        if ip_failures is not None:
+            while ip_failures and (now_ts - ip_failures[0]) > window_sec:
+                ip_failures.popleft()
+            if not ip_failures:
+                self._auth_failures.pop(client_ip, None)
+                ip_failures = None
+
+        if ip_failures is not None and len(ip_failures) >= max_failures:
+            return web.json_response(
+                {"status": "error", "message": "Too many failed authentication attempts. Try again later."},
+                status=429,
+            )
+
+        auth_header = request.headers.get("Authorization", "")
+        token_ok = False
+        if auth_header.startswith("Bearer "):
+            provided_token = auth_header[7:].strip()
+            if provided_token:
+                token_ok = hmac.compare_digest(
+                    provided_token.encode("utf-8"),
+                    admin_token.encode("utf-8"),
+                )
+
+        if not token_ok:
+            if client_ip not in self._auth_failures:
+                if len(self._auth_failures) >= max_ips:
+                    oldest_ip = next(iter(self._auth_failures))
+                    self._auth_failures.pop(oldest_ip, None)
+                self._auth_failures[client_ip] = deque()
+            self._auth_failures[client_ip].append(now_ts)
+            logger.warning(f"[SECURITY] Unauthorized POST /api/config attempt from {client_ip}")
+            return web.json_response(
+                {"status": "error", "message": "Unauthorized: invalid or missing Bearer token"},
+                status=401,
+            )
+
+        raw_ctype = request.headers.get("Content-Type", "")
+        media_type = raw_ctype.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            return web.json_response(
+                {"status": "error", "message": "Unsupported Media Type: Content-Type must be application/json"},
+                status=415,
+            )
+
         try:
-            data = await request.json()
+            data = json.loads(raw_body.decode("utf-8"))
         except Exception:
             return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
+
+        if not isinstance(data, dict):
+            return web.json_response({"status": "error", "message": "JSON payload must be an object"}, status=400)
+
+        allowed_keys = set(CONFIG.get("API_CONFIG_ALLOWED_KEYS", API_CONFIG_ALLOWED_KEYS))
+        unknown_keys = [k for k in data.keys() if k not in allowed_keys]
+        if unknown_keys:
+            return web.json_response(
+                {"status": "error", "message": f"Disallowed configuration key(s): {', '.join(sorted(str(k) for k in unknown_keys))}"},
+                status=400,
+            )
 
         twelve_key = str(data.get("twelvedata_api_key", "")).strip()
         tg_token   = str(data.get("telegram_bot_token", "")).strip()
@@ -5933,14 +6224,22 @@ def setup_logging() -> logging.Logger:
     ch.setLevel(logging.INFO)
     handlers.append(ch)
 
+    redact_filter = RedactingLogFilter()
+
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     # Clear existing handlers to prevent duplicate lines
     root.handlers.clear()
+    root.filters.clear()
+    root.addFilter(redact_filter)
     for h in handlers:
+        h.addFilter(redact_filter)
         root.addHandler(h)
 
-    return logging.getLogger("indicator")
+    ind_logger = logging.getLogger("indicator")
+    ind_logger.filters.clear()
+    ind_logger.addFilter(redact_filter)
+    return ind_logger
 
 
 logger = setup_logging()

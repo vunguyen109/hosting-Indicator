@@ -117,17 +117,32 @@ class TestEngine(unittest.TestCase):
 
     def test_update_dotenv_file(self):
         with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as tmp:
-            tmp.write("HOST=0.0.0.0\nPORT=8080\n")
+            tmp.write("HOST=0.0.0.0\nPORT=8080\nADMIN_TOKEN=keep_me_safe\n")
             tmp_path = tmp.name
 
+        orig_dotenv_path = CONFIG.get("DOTENV_PATH")
+        CONFIG["DOTENV_PATH"] = tmp_path
         try:
-            _update_dotenv({"TWELVE_API_KEY": "my_new_key", "PORT": "9090"}, filepath=tmp_path)
+            _update_dotenv(
+                {
+                    "TWELVE_API_KEY": "my_new_key",
+                    "TG_CHAT_ID": "-100123456",
+                    "PORT": "9090",
+                    "ADMIN_TOKEN": "attempted_overwrite",
+                }
+            )
             with open(tmp_path, "r", encoding="utf-8") as f:
                 content = f.read()
             self.assertIn("TWELVE_API_KEY=my_new_key", content)
-            self.assertIn("PORT=9090", content)
+            self.assertIn("TG_CHAT_ID=-100123456", content)
+            # Non-whitelisted keys (PORT, HOST, ADMIN_TOKEN) must remain untouched
+            self.assertIn("PORT=8080", content)
+            self.assertNotIn("PORT=9090", content)
             self.assertIn("HOST=0.0.0.0", content)
+            self.assertIn("ADMIN_TOKEN=keep_me_safe", content)
+            self.assertNotIn("attempted_overwrite", content)
         finally:
+            CONFIG["DOTENV_PATH"] = orig_dotenv_path
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
@@ -1588,6 +1603,430 @@ class TestNewAssetsSupport(unittest.TestCase):
         self.assertIn('data-val="ETH"', HTML_DASHBOARD)
         self.assertIn('data-val="XAG"', HTML_DASHBOARD)
         self.assertNotIn("targetTf", HTML_DASHBOARD)
+
+
+class TestWPSecurity(unittest.TestCase):
+    """WP-S Security Test Suite: S-1..S-6 & S-A..S-F."""
+
+    def setUp(self):
+        self._orig_admin_token = os.environ.get("ADMIN_TOKEN")
+        self._orig_dotenv_path = CONFIG.get("DOTENV_PATH")
+        self._orig_td_key = CONFIG.get("twelvedata_api_key")
+        self._orig_tg_tok = CONFIG.get("telegram_bot_token")
+        self._orig_tg_chat = CONFIG.get("telegram_chat_id")
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._tmp_env = os.path.join(self._tmp_dir.name, ".env")
+        with open(self._tmp_env, "w", encoding="utf-8") as f:
+            f.write(
+                "# Test .env\n"
+                "HOST=0.0.0.0\n"
+                "PORT=8080\n"
+                "ADMIN_TOKEN=original_admin_token_in_file\n"
+                "SFTP_HOST=sftp.example.com\n"
+                "SFTP_PASSWORD=sftp_secret_keep\n"
+                "TWELVE_API_KEY=initial_td_key\n"
+                "TG_BOT_TOKEN=initial_tg_token\n"
+                "TG_CHAT_ID=initial_tg_chat\n"
+            )
+        CONFIG["DOTENV_PATH"] = self._tmp_env
+
+    def tearDown(self):
+        if self._orig_admin_token is None:
+            os.environ.pop("ADMIN_TOKEN", None)
+        else:
+            os.environ["ADMIN_TOKEN"] = self._orig_admin_token
+        CONFIG["DOTENV_PATH"] = self._orig_dotenv_path
+        CONFIG["twelvedata_api_key"] = self._orig_td_key
+        CONFIG["telegram_bot_token"] = self._orig_tg_tok
+        CONFIG["telegram_chat_id"] = self._orig_tg_chat
+        self._tmp_dir.cleanup()
+
+    def _make_dummy_orch(self, session=None):
+        from types import SimpleNamespace
+        async def _noop_reload(assets):
+            return None
+        return SimpleNamespace(
+            _twelve=TwelveDataFetcher(session, "initial_td_key"),
+            _tg=TelegramDispatcher("initial_tg_token", "initial_tg_chat"),
+            _start_time=1700000000.0,
+            _latest_advice={},
+            _latest_indicators={},
+            _bufs={},
+            _recent_signals=[],
+            outcome_tracker=None,
+            reload_asset_buffers=_noop_reload,
+        )
+
+    def test_s1_empty_admin_token_returns_403_loopback_and_logs_startup_warning(self):
+        import aiohttp
+        from aiohttp.test_utils import TestClient, TestServer
+        from engine import logger
+        import io
+        import logging
+
+        os.environ["ADMIN_TOKEN"] = ""
+        buf = io.StringIO()
+        h = logging.StreamHandler(buf)
+        logger.addHandler(h)
+        try:
+            orch = self._make_dummy_orch()
+            srv = DashboardServer(orch, "127.0.0.1", 0)
+            self.assertIn("ADMIN_TOKEN is empty", buf.getvalue())
+            self.assertIn("DISABLED", buf.getvalue())
+
+            async def _run():
+                async with TestClient(TestServer(srv._app)) as client:
+                    resp = await client.post(
+                        "/api/config",
+                        json={"twelvedata_api_key": "should_fail"},
+                        headers={"Authorization": "Bearer any_token"},
+                    )
+                    self.assertEqual(resp.status, 403)
+                    data = await resp.json()
+                    self.assertEqual(data.get("code"), "config_disabled")
+                await orch._tg.close()
+
+            asyncio.run(_run())
+        finally:
+            logger.removeHandler(h)
+
+    def test_s1_auth_401_415_413_400_200_compare_digest_and_no_cors(self):
+        import hmac
+        from unittest.mock import patch
+        from aiohttp.test_utils import TestClient, TestServer
+
+        os.environ["ADMIN_TOKEN"] = "ValidAdminSecretToken_2026"
+        orch = self._make_dummy_orch()
+        srv = DashboardServer(orch, "127.0.0.1", 0)
+
+        async def _run():
+            async with TestClient(TestServer(srv._app)) as client:
+                # 1. Missing token -> 401
+                r_no_tok = await client.post("/api/config", json={"twelvedata_api_key": "k1"})
+                self.assertEqual(r_no_tok.status, 401)
+
+                # 2. Wrong token -> 401 + verify hmac.compare_digest is called
+                with patch("engine.hmac.compare_digest", wraps=hmac.compare_digest) as spy_cmp:
+                    r_bad_tok = await client.post(
+                        "/api/config",
+                        json={"twelvedata_api_key": "k1"},
+                        headers={"Authorization": "Bearer WrongToken123"},
+                    )
+                    self.assertEqual(r_bad_tok.status, 401)
+                    self.assertTrue(spy_cmp.called)
+
+                # 3. Reset failures & test Content-Type: text/plain -> 415
+                srv._auth_failures.clear()
+                r_text = await client.post(
+                    "/api/config",
+                    data='{"twelvedata_api_key": "k1"}',
+                    headers={
+                        "Authorization": "Bearer ValidAdminSecretToken_2026",
+                        "Content-Type": "text/plain",
+                    },
+                )
+                self.assertEqual(r_text.status, 415)
+                for h_name in r_text.headers:
+                    self.assertNotIn("access-control", h_name.lower())
+
+                # 4. Body > 4KB (4096 bytes) -> 413
+                huge_body = '{"twelvedata_api_key": "' + ("A" * 4200) + '"}'
+                r_big = await client.post(
+                    "/api/config",
+                    data=huge_body,
+                    headers={
+                        "Authorization": "Bearer ValidAdminSecretToken_2026",
+                        "Content-Type": "application/json",
+                    },
+                )
+                self.assertEqual(r_big.status, 413)
+
+                # 5. Unknown / non-whitelisted key in JSON -> 400 (S-B)
+                for forbidden_payload in [
+                    {"ADMIN_TOKEN": "hack"},
+                    {"PORT": "9999"},
+                    {"SFTP_PASSWORD": "hack"},
+                    {"unknown_field": "val"},
+                ]:
+                    r_unk = await client.post(
+                        "/api/config",
+                        json=forbidden_payload,
+                        headers={"Authorization": "Bearer ValidAdminSecretToken_2026"},
+                    )
+                    self.assertEqual(r_unk.status, 400)
+
+                # 6. Valid token + valid JSON -> 200, updates whitelisted keys only, no secret echoed
+                r_ok = await client.post(
+                    "/api/config",
+                    json={
+                        "twelvedata_api_key": "updated_td_key_xyz",
+                        "telegram_bot_token": "888777666:AAH_updated_tg_secret_token_12345",
+                        "telegram_chat_id": "-100555666777",
+                    },
+                    headers={"Authorization": "Bearer ValidAdminSecretToken_2026"},
+                )
+                self.assertEqual(r_ok.status, 200)
+                for h_name in r_ok.headers:
+                    self.assertNotIn("access-control", h_name.lower())
+                ok_json = await r_ok.json()
+                ok_raw = await r_ok.text()
+                self.assertEqual(ok_json["status"], "ok")
+                self.assertTrue(ok_json["twelvedata_configured"])
+                self.assertTrue(ok_json["telegram_enabled"])
+                self.assertNotIn("updated_td_key_xyz", ok_raw)
+                self.assertNotIn("888777666", ok_raw)
+                self.assertNotIn("ValidAdminSecretToken_2026", ok_raw)
+
+                # 7. Verify GET /api/config returns 405 (matching baseline) and GET /api/snapshot never exposes ADMIN_TOKEN
+                r_get_cfg = await client.get("/api/config")
+                self.assertEqual(r_get_cfg.status, 405)
+
+                r_snap = await client.get("/api/snapshot")
+                self.assertEqual(r_snap.status, 200)
+                snap_text = await r_snap.text()
+                self.assertNotIn("ValidAdminSecretToken_2026", snap_text)
+                self.assertNotIn("ADMIN_TOKEN", snap_text)
+
+                # 8. Verify .env file preserved ADMIN_TOKEN, SFTP_*, HOST, PORT
+                with open(self._tmp_env, "r", encoding="utf-8") as f:
+                    env_content = f.read()
+                self.assertIn("ADMIN_TOKEN=original_admin_token_in_file", env_content)
+                self.assertIn("SFTP_HOST=sftp.example.com", env_content)
+                self.assertIn("SFTP_PASSWORD=sftp_secret_keep", env_content)
+                self.assertIn("HOST=0.0.0.0", env_content)
+                self.assertIn("PORT=8080", env_content)
+                self.assertIn("TWELVE_API_KEY=updated_td_key_xyz", env_content)
+                self.assertIn("TG_BOT_TOKEN=888777666:AAH_updated_tg_secret_token_12345", env_content)
+                self.assertIn("TG_CHAT_ID=-100555666777", env_content)
+
+            await orch._tg.close()
+
+        asyncio.run(_run())
+
+    def test_c2d_empty_telegram_fields_preserve_existing_dotenv(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        os.environ["ADMIN_TOKEN"] = "ValidAdminSecretToken_C2D"
+        orch = self._make_dummy_orch()
+        srv = DashboardServer(orch, "127.0.0.1", 0)
+
+        async def _run():
+            async with TestClient(TestServer(srv._app)) as client:
+                r = await client.post(
+                    "/api/config",
+                    json={
+                        "twelvedata_api_key": "only_twelve_updated_999",
+                        "telegram_bot_token": "",
+                        "telegram_chat_id": "   ",
+                    },
+                    headers={"Authorization": "Bearer ValidAdminSecretToken_C2D"},
+                )
+                self.assertEqual(r.status, 200)
+                with open(self._tmp_env, "r", encoding="utf-8") as f:
+                    env_content = f.read()
+                self.assertIn("TWELVE_API_KEY=only_twelve_updated_999", env_content)
+                self.assertIn("TG_BOT_TOKEN=initial_tg_token", env_content)
+                self.assertIn("TG_CHAT_ID=initial_tg_chat", env_content)
+                self.assertIn("ADMIN_TOKEN=original_admin_token_in_file", env_content)
+            await orch._tg.close()
+
+        asyncio.run(_run())
+
+    def test_s1_rate_limit_5_failed_attempts_per_min_returns_429(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        os.environ["ADMIN_TOKEN"] = "RateLimitTestAdminToken"
+        orch = self._make_dummy_orch()
+        srv = DashboardServer(orch, "127.0.0.1", 0)
+
+        async def _run():
+            async with TestClient(TestServer(srv._app)) as client:
+                for i in range(5):
+                    r = await client.post(
+                        "/api/config",
+                        json={"twelvedata_api_key": "k"},
+                        headers={"Authorization": f"Bearer wrong_{i}"},
+                    )
+                    self.assertEqual(r.status, 401)
+
+                # 6th attempt within 1 minute must return 429
+                r_6th = await client.post(
+                    "/api/config",
+                    json={"twelvedata_api_key": "k"},
+                    headers={"Authorization": "Bearer wrong_6"},
+                )
+                self.assertEqual(r_6th.status, 429)
+
+            await orch._tg.close()
+
+        asyncio.run(_run())
+
+    def test_s3_redact_with_10_patterns(self):
+        from engine import redact
+
+        os.environ["ADMIN_TOKEN"] = "MyRuntimeAdminSecret_999"
+        samples = [
+            (
+                "https://api.twelvedata.com/time_series?symbol=XAU/USD&apikey=td_secret_1234567890&interval=1h",
+                "td_secret_1234567890",
+            ),
+            (
+                "Error calling api_key=my_api_key_value_abc123 in query",
+                "my_api_key_value_abc123",
+            ),
+            (
+                "POST https://api.telegram.org/bot123456789:AAH_TelegramBotSecretToken_XyZ987654/sendMessage failed",
+                "AAH_TelegramBotSecretToken_XyZ987654",
+            ),
+            (
+                "Leaked standalone token 987654321:AAF_StandaloneTelegramSecret_1234567890",
+                "AAF_StandaloneTelegramSecret_1234567890",
+            ),
+            (
+                "Webhook error at https://discord.com/api/webhooks/123456789012345678/DiscordWebhookSecretToken_AbCdEf123",
+                "DiscordWebhookSecretToken_AbCdEf123",
+            ),
+            (
+                "Webhook error at https://ptb.discordapp.com/api/webhooks/999888777666/PtbDiscordSecret_999888",
+                "PtbDiscordSecret_999888",
+            ),
+            (
+                "Header Authorization: Bearer EyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.SecretPayload",
+                "EyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.SecretPayload",
+            ),
+            (
+                "Token Bearer raw_bearer_secret_token_777 rejected",
+                "raw_bearer_secret_token_777",
+            ),
+            (
+                'Payload {"chat_id": "-1001928374655", "text": "hi"}',
+                "-1001928374655",
+            ),
+            (
+                "Config error involving MyRuntimeAdminSecret_999 in runtime",
+                "MyRuntimeAdminSecret_999",
+            ),
+        ]
+        for raw_input, secret_sub in samples:
+            cleaned = redact(raw_input)
+            self.assertNotIn(secret_sub, cleaned, f"Secret '{secret_sub}' leaked in '{cleaned}'")
+            self.assertIn("****", cleaned)
+
+    def test_se_real_aiohttp_errors_and_log_filter_redaction(self):
+        import aiohttp
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        from engine import RedactingLogFilter, logger, redact
+        import io
+        import logging
+
+        TG_SEC = "777888999:AAH_RealAiohttpTelegramSecretToken_999"
+        TD_SEC = "real_aiohttp_twelvedata_secret_key_888"
+        CHAT_SEC = "-1009998887776"
+
+        log_buf = io.StringIO()
+        file_path = os.path.join(self._tmp_dir.name, "test_security.log")
+        stream_h = logging.StreamHandler(log_buf)
+        stream_h.addFilter(RedactingLogFilter())
+        file_h = logging.FileHandler(file_path, encoding="utf-8")
+        file_h.addFilter(RedactingLogFilter())
+        logger.addHandler(stream_h)
+        logger.addHandler(file_h)
+
+        async def _run():
+            # Build a real local aiohttp server returning 401, 403, 500 with full URL echoed
+            async def handle_tg_err(request: web.Request) -> web.Response:
+                status_code = int(request.query.get("code", "401"))
+                return web.Response(
+                    status=status_code,
+                    text=f"Telegram error {status_code} at {request.url}",
+                )
+
+            async def handle_td_err(request: web.Request) -> web.Response:
+                status_code = int(request.query.get("code", "403"))
+                return web.Response(
+                    status=status_code,
+                    text=f'{{"status":"error","code":{status_code},"message":"Denied for {request.url}"}}',
+                    content_type="application/json",
+                )
+
+            app = web.Application()
+            app.router.add_post("/bot{token}/sendMessage", handle_tg_err)
+            app.router.add_get("/time_series", handle_td_err)
+
+            server = TestServer(app)
+            await server.start_server()
+            base_url = f"http://127.0.0.1:{server.port}"
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    # 1. Real aiohttp 401/403/500 via TelegramDispatcher.send & TwelveDataFetcher.fetch_candles
+                    tg = TelegramDispatcher(TG_SEC, CHAT_SEC)
+                    tg._session = session
+                    for code in (401, 403, 500):
+                        tg._API_URL = f"{base_url}/bot{{token}}/sendMessage?code={code}"
+                        ok = await tg.send("hello", retries=1)
+                        self.assertFalse(ok)
+
+                    td = TwelveDataFetcher(session, TD_SEC, min_gap=0.0)
+                    td._BASE = base_url
+                    for code in (401, 403, 500):
+                        candles = await td.fetch_candles("XAU/USD", "1h", limit=2)
+                        self.assertEqual(candles, [])
+
+                    # 2. Real aiohttp ClientResponseError via raise_for_status()
+                    real_cre_str = None
+                    try:
+                        async with session.get(
+                            f"{base_url}/time_series",
+                            params={"symbol": "XAU/USD", "apikey": TD_SEC, "code": "401"},
+                        ) as resp:
+                            resp.raise_for_status()
+                    except aiohttp.ClientResponseError as cre:
+                        raw_unredacted = str(cre)
+                        self.assertIn(TD_SEC, raw_unredacted)
+                        real_cre_str = redact(cre)
+                        logger.error(f"Real ClientResponseError caught: {cre}")
+
+                    self.assertIsNotNone(real_cre_str)
+                    self.assertNotIn(TD_SEC, real_cre_str)
+                    print(f"\n[S-E RAW REDACTED ClientResponseError]: {real_cre_str}")
+
+                    # 3. Real connection refused on closed local port
+                    # Find an unused port by binding to 0 and closing immediately
+                    import socket
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_sock:
+                        s_sock.bind(("127.0.0.1", 0))
+                        closed_port = s_sock.getsockname()[1]
+
+                    tg_conn = TelegramDispatcher(TG_SEC, CHAT_SEC)
+                    tg_conn._session = session
+                    tg_conn._API_URL = f"http://127.0.0.1:{closed_port}/bot{{token}}/sendMessage"
+                    await tg_conn.send("hello", retries=1)
+
+                    td_conn = TwelveDataFetcher(session, TD_SEC, min_gap=0.0)
+                    td_conn._BASE = f"http://127.0.0.1:{closed_port}"
+                    await td_conn.fetch_candles("XAU/USD", "1h", limit=2)
+            finally:
+                await server.close()
+
+        try:
+            asyncio.run(_run())
+            stream_h.flush()
+            file_h.flush()
+            mem_logs = log_buf.getvalue()
+            with open(file_path, "r", encoding="utf-8") as f:
+                disk_logs = f.read()
+
+            for combined in (mem_logs, disk_logs):
+                self.assertNotIn(TG_SEC, combined)
+                self.assertNotIn(TD_SEC, combined)
+                self.assertNotIn(CHAT_SEC, combined)
+                self.assertIn("****", combined)
+        finally:
+            logger.removeHandler(stream_h)
+            logger.removeHandler(file_h)
+            file_h.close()
 
 
 if __name__ == "__main__":
