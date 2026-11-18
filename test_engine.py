@@ -2028,6 +2028,215 @@ class TestWPSecurity(unittest.TestCase):
             logger.removeHandler(file_h)
             file_h.close()
 
+    def test_c6c_invalid_values_return_400_and_preserve_dotenv_and_env(self):
+        import hashlib
+        from aiohttp.test_utils import TestClient, TestServer
+
+        admin_tok = "ValidLongAdminSecretToken_C6C_1234567890"
+        os.environ["ADMIN_TOKEN"] = admin_tok
+        CONFIG["twelvedata_api_key"] = "initial_td_key"
+        CONFIG["telegram_bot_token"] = "initial_tg_token"
+        CONFIG["telegram_chat_id"] = "initial_tg_chat"
+
+        orch = self._make_dummy_orch()
+        srv = DashboardServer(orch, "127.0.0.1", 0)
+
+        with open(self._tmp_env, "rb") as f:
+            sha_before = hashlib.sha256(f.read()).hexdigest()
+
+        invalid_inputs = [
+            "k\nADMIN_TOKEN=evil",
+            "k\rHOST=evil",
+            "k\x00",
+            "A" * 513,
+            "a#b",
+            "kéy",
+            'a"b',
+            "a'b",
+            "a\\b",
+        ]
+
+        async def _run():
+            async with TestClient(TestServer(srv._app)) as client:
+                for bad_val in invalid_inputs:
+                    # Also test coupled with a valid field to prove atomic pre-validation
+                    r = await client.post(
+                        "/api/config",
+                        json={
+                            "twelvedata_api_key": bad_val,
+                            "telegram_bot_token": "valid_token_that_must_not_apply",
+                        },
+                        headers={"Authorization": f"Bearer {admin_tok}"},
+                    )
+                    self.assertEqual(r.status, 400, f"Expected 400 for {bad_val!r}")
+                    body = await r.json()
+                    self.assertEqual(body.get("code"), "invalid_value")
+
+                    with open(self._tmp_env, "rb") as f:
+                        sha_after = hashlib.sha256(f.read()).hexdigest()
+                    self.assertEqual(sha_before, sha_after, f".env mutated for {bad_val!r}")
+                    self.assertEqual(os.environ.get("ADMIN_TOKEN"), admin_tok)
+                    self.assertEqual(CONFIG["twelvedata_api_key"], "initial_td_key")
+                    self.assertEqual(CONFIG["telegram_bot_token"], "initial_tg_token")
+                    self.assertEqual(CONFIG["telegram_chat_id"], "initial_tg_chat")
+
+            await orch._tg.close()
+
+        asyncio.run(_run())
+
+    def test_c6d_raw_socket_non_ascii_bearer_returns_401_and_counts_rate_limit(self):
+        import socket
+        from aiohttp.test_utils import TestServer
+
+        admin_tok = "ValidLongAdminSecretToken_C6D_1234567890"
+        os.environ["ADMIN_TOKEN"] = admin_tok
+        orch = self._make_dummy_orch()
+        srv = DashboardServer(orch, "127.0.0.1", 0)
+
+        def _send_raw_non_ascii_auth(port: int) -> int:
+            raw_req = (
+                b"POST /api/config HTTP/1.1\r\n"
+                + f"Host: 127.0.0.1:{port}\r\n".encode("ascii")
+                + b"Authorization: Bearer \xc3\xa9\r\n"
+                + b"Content-Type: application/json\r\n"
+                + b"Content-Length: 2\r\n"
+                + b"Connection: close\r\n\r\n"
+                + b"{}"
+            )
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as sock:
+                sock.sendall(raw_req)
+                chunks = []
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+            resp_bytes = b"".join(chunks)
+            status_line = resp_bytes.split(b"\r\n", 1)[0].decode("latin-1")
+            return int(status_line.split()[1])
+
+        async def _run():
+            server = TestServer(srv._app)
+            await server.start_server()
+            try:
+                loop = asyncio.get_running_loop()
+                # First 5 attempts with raw 0xC3 0xA9 must return 401 (never 500) and count toward rate-limit
+                for i in range(5):
+                    code = await loop.run_in_executor(None, _send_raw_non_ascii_auth, server.port)
+                    self.assertEqual(code, 401, f"Attempt {i+1} returned {code} instead of 401")
+                # 6th attempt must return 429
+                code_6th = await loop.run_in_executor(None, _send_raw_non_ascii_auth, server.port)
+                self.assertEqual(code_6th, 429)
+            finally:
+                await server.close()
+                await orch._tg.close()
+
+        asyncio.run(_run())
+
+    def test_c6e_weak_admin_token_under_32_chars_logs_warning_without_leaking(self):
+        import io
+        import logging
+        from engine import logger
+
+        weak_secret = "ShortToken_Under32_XyZ99"
+        self.assertLess(len(weak_secret), 32)
+        os.environ["ADMIN_TOKEN"] = weak_secret
+
+        buf = io.StringIO()
+        h = logging.StreamHandler(buf)
+        h.setLevel(logging.WARNING)
+        logger.addHandler(h)
+        try:
+            orch = self._make_dummy_orch()
+            _ = DashboardServer(orch, "127.0.0.1", 0)
+            log_text = buf.getvalue()
+            self.assertIn("ADMIN_TOKEN", log_text)
+            self.assertIn("32", log_text)
+            self.assertNotIn(weak_secret, log_text)
+            asyncio.run(orch._tg.close())
+        finally:
+            logger.removeHandler(h)
+
+    def test_c7_production_setup_logging_filter_and_logger_exception_and_normal_logs(self):
+        import logging
+        import aiohttp
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        from engine import RedactingLogFilter, redact, setup_logging
+
+        orig_log_file = CONFIG.get("log_file")
+        tmp_prod_log = os.path.join(self._tmp_dir.name, "prod_c7.log")
+        CONFIG["log_file"] = tmp_prod_log
+        FAKE_KEY = "fake_c7_twelvedata_secret_key_9988776655"
+
+        try:
+            ind_logger = setup_logging()
+            root_logger = logging.getLogger()
+
+            # 1. Assert every handler of root and indicator has RedactingLogFilter
+            self.assertGreaterEqual(len(root_logger.handlers), 1)
+            for h in root_logger.handlers:
+                self.assertTrue(
+                    any(isinstance(flt, RedactingLogFilter) for flt in h.filters),
+                    f"Root handler {h} missing RedactingLogFilter",
+                )
+            for h in ind_logger.handlers:
+                self.assertTrue(
+                    any(isinstance(flt, RedactingLogFilter) for flt in h.filters),
+                    f"Indicator handler {h} missing RedactingLogFilter",
+                )
+            self.assertTrue(any(isinstance(flt, RedactingLogFilter) for flt in root_logger.filters))
+            self.assertTrue(any(isinstance(flt, RedactingLogFilter) for flt in ind_logger.filters))
+
+            # 2. Trigger real aiohttp.ClientResponseError with fake key and call logger.exception
+            async def _trigger_cre():
+                async def _err(request):
+                    return web.Response(status=401, text="Unauthorized")
+
+                app = web.Application()
+                app.router.add_get("/time_series", _err)
+                server = TestServer(app)
+                await server.start_server()
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        try:
+                            async with session.get(
+                                f"http://127.0.0.1:{server.port}/time_series?symbol=XAU/USD&apikey={FAKE_KEY}"
+                            ) as resp:
+                                resp.raise_for_status()
+                        except aiohttp.ClientResponseError as cre:
+                            self.assertIn(FAKE_KEY, str(cre))
+                            ind_logger.exception("C7 exception with real ClientResponseError", exc_info=cre)
+                finally:
+                    await server.close()
+
+            asyncio.run(_trigger_cre())
+            for h in root_logger.handlers:
+                h.flush()
+
+            with open(tmp_prod_log, "r", encoding="utf-8") as f:
+                disk_content = f.read()
+
+            self.assertIn("C7 exception with real ClientResponseError", disk_content)
+            self.assertIn("ClientResponseError", disk_content)
+            self.assertNotIn(FAKE_KEY, disk_content)
+            self.assertIn("apikey=****", disk_content)
+
+            # 3. 5 normal log lines must pass through redact() completely unchanged
+            os.environ["ADMIN_TOKEN"] = "ValidLongAdminSecretToken_C7_1234567890"
+            normal_lines = [
+                "2026-11-17T16:00:05 [INFO    ] indicator: [BTC 1h] close=91234.5000 RSI=54.2 ATR=612.3400",
+                "Candle closed at ts=1776301200 for asset BTC 1h",
+                "Ratio check 1234:5678 passed without conflict",
+                '127.0.0.1 [17/Nov/2026:16:00:05 +0000] "GET /api/snapshot HTTP/1.1" 200 1842',
+                "2026-11-17T16:00:06 [INFO    ] indicator: [Tracker] Track 408a5f8e evaluated at ts=1794931199",
+            ]
+            for line in normal_lines:
+                self.assertEqual(redact(line), line, f"Normal log line was modified: {line!r}")
+        finally:
+            CONFIG["log_file"] = orig_log_file
+            setup_logging()
+
 
 if __name__ == "__main__":
     unittest.main()

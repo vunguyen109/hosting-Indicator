@@ -93,15 +93,76 @@ def _get_admin_token() -> str:
     return os.environ.get("ADMIN_TOKEN", "").strip()
 
 
+_FORBIDDEN_CONFIG_VALUE_CHARS: frozenset[str] = frozenset({'"', "'", "\\", "#"})
+
+
+def _is_empty_or_spaces_only(raw_val: str) -> bool:
+    """Return True only if raw_val is empty or consists strictly of ASCII space (0x20) characters."""
+    return raw_val == "" or all(ch == " " for ch in raw_val)
+
+
+def _is_valid_config_value(val: str, max_len: int = 512) -> bool:
+    """
+    Validate hot-config value before applying:
+    - Printable ASCII without whitespace (0x21..0x7E)
+    - Disallow ", ', \\, #
+    - Length 1..max_len (<= 512)
+    """
+    if not isinstance(val, str) or not (1 <= len(val) <= max_len):
+        return False
+    for ch in val:
+        code = ord(ch)
+        if code < 0x21 or code > 0x7E or ch in _FORBIDDEN_CONFIG_VALUE_CHARS:
+            return False
+    return True
+
+
+def _check_bearer_authorization(request: web.Request, admin_token: str) -> bool:
+    """
+    Verify Authorization: Bearer <token> using constant-time byte comparison.
+    Reads raw header bytes so arbitrary non-ASCII bytes never raise 500.
+    """
+    if not admin_token:
+        return False
+    try:
+        raw_auth: Optional[bytes] = None
+        for h_name, h_val in getattr(request, "raw_headers", ()):
+            if isinstance(h_name, bytes) and h_name.lower() == b"authorization":
+                raw_auth = (
+                    h_val
+                    if isinstance(h_val, bytes)
+                    else str(h_val).encode("utf-8", errors="surrogateescape")
+                )
+                break
+        if raw_auth is None:
+            auth_str = request.headers.get("Authorization", "")
+            if not auth_str:
+                return False
+            raw_auth = auth_str.encode("utf-8", errors="surrogateescape")
+        prefix = b"Bearer "
+        if not raw_auth.startswith(prefix):
+            return False
+        provided_bytes = raw_auth[len(prefix):].strip()
+        if not provided_bytes:
+            return False
+        expected_bytes = admin_token.encode("utf-8", errors="surrogateescape")
+        return hmac.compare_digest(provided_bytes, expected_bytes)
+    except Exception:
+        return False
+
+
 def _update_dotenv(updates: dict[str, str], filepath: Optional[str] = None) -> None:
     """Safely update or append whitelisted key-value pairs to .env file, preserving all other lines."""
     if filepath is None:
         filepath = CONFIG.get("DOTENV_PATH", os.path.join(BASE_DIR, ".env"))
     allowed_env_keys = set(CONFIG.get("ENV_CONFIG_WHITELIST", ENV_CONFIG_WHITELIST))
-    safe_updates = {
-        k: v for k, v in updates.items()
-        if k in allowed_env_keys and k != "ADMIN_TOKEN"
-    }
+    max_val_len = int(CONFIG.get("CONFIG_MAX_VALUE_LEN", 512))
+    safe_updates: dict[str, str] = {}
+    for k, v in updates.items():
+        if k in allowed_env_keys and k != "ADMIN_TOKEN":
+            if not isinstance(v, str) or not _is_valid_config_value(v, max_len=max_val_len):
+                raise ValueError(f"Invalid configuration value for {k}")
+            safe_updates[k] = v
     if not safe_updates:
         return
 
@@ -317,6 +378,8 @@ CONFIG = {
     "ENV_CONFIG_WHITELIST":         ("TWELVE_API_KEY", "TG_BOT_TOKEN", "TG_CHAT_ID"),
     "API_CONFIG_ALLOWED_KEYS":      ("twelvedata_api_key", "telegram_bot_token", "telegram_chat_id"),
     "CONFIG_MAX_BODY_BYTES":        4096,
+    "CONFIG_MAX_VALUE_LEN":         512,
+    "CONFIG_MIN_ADMIN_TOKEN_LEN":   32,
     "CONFIG_AUTH_MAX_FAILURES_PER_MIN": 5,
     "CONFIG_AUTH_WINDOW_SECONDS":   60,
     "CONFIG_AUTH_MAX_TRACKED_IPS":  1024,
@@ -426,6 +489,8 @@ class RedactingLogFilter(logging.Filter):
             record.exc_info = None
         elif record.exc_text:
             record.exc_text = redact(record.exc_text)
+        if getattr(record, "stack_info", None):
+            record.stack_info = redact(record.stack_info)
         return True
 
 # Timeframe identifier -> seconds
@@ -5530,9 +5595,15 @@ class DashboardServer:
         self._app.router.add_post("/api/config",  self.handle_save_config)
         self._runner: Optional[web.AppRunner] = None
         self._site:   Optional[web.TCPSite]   = None
-        if not _get_admin_token():
+        admin_tok = _get_admin_token()
+        min_tok_len = int(CONFIG.get("CONFIG_MIN_ADMIN_TOKEN_LEN", 32))
+        if not admin_tok:
             logger.warning(
                 "[SECURITY] ADMIN_TOKEN is empty — hot configuration via POST /api/config is DISABLED (HTTP 403)."
+            )
+        elif len(admin_tok) < min_tok_len:
+            logger.warning(
+                f"[SECURITY] ADMIN_TOKEN length ({len(admin_tok)}) is less than {min_tok_len} characters; use at least {min_tok_len} random characters."
             )
 
     async def handle_index(self, request: web.Request) -> web.Response:
@@ -5745,15 +5816,7 @@ class DashboardServer:
                 status=429,
             )
 
-        auth_header = request.headers.get("Authorization", "")
-        token_ok = False
-        if auth_header.startswith("Bearer "):
-            provided_token = auth_header[7:].strip()
-            if provided_token:
-                token_ok = hmac.compare_digest(
-                    provided_token.encode("utf-8"),
-                    admin_token.encode("utf-8"),
-                )
+        token_ok = _check_bearer_authorization(request, admin_token)
 
         if not token_ok:
             if client_ip not in self._auth_failures:
@@ -5792,9 +5855,27 @@ class DashboardServer:
                 status=400,
             )
 
-        twelve_key = str(data.get("twelvedata_api_key", "")).strip()
-        tg_token   = str(data.get("telegram_bot_token", "")).strip()
-        tg_chat    = str(data.get("telegram_chat_id", "")).strip()
+        max_val_len = int(CONFIG.get("CONFIG_MAX_VALUE_LEN", 512))
+        validated_fields: dict[str, str] = {}
+        for k, raw_val in data.items():
+            if not isinstance(raw_val, str):
+                return web.json_response(
+                    {"status": "error", "code": "invalid_value", "message": f"Invalid value type for {k}"},
+                    status=400,
+                )
+            if _is_empty_or_spaces_only(raw_val):
+                validated_fields[k] = ""
+                continue
+            if not _is_valid_config_value(raw_val, max_len=max_val_len):
+                return web.json_response(
+                    {"status": "error", "code": "invalid_value", "message": f"Invalid value for {k}"},
+                    status=400,
+                )
+            validated_fields[k] = raw_val
+
+        twelve_key = validated_fields.get("twelvedata_api_key", "")
+        tg_token   = validated_fields.get("telegram_bot_token", "")
+        tg_chat    = validated_fields.get("telegram_chat_id", "")
 
         updates_to_save: dict[str, str] = {}
 
@@ -6228,7 +6309,12 @@ def setup_logging() -> logging.Logger:
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    # Clear existing handlers to prevent duplicate lines
+    # Close and clear existing handlers to prevent duplicate lines or file locks
+    for old_h in list(root.handlers):
+        try:
+            old_h.close()
+        except Exception:
+            pass
     root.handlers.clear()
     root.filters.clear()
     root.addFilter(redact_filter)
@@ -6239,6 +6325,8 @@ def setup_logging() -> logging.Logger:
     ind_logger = logging.getLogger("indicator")
     ind_logger.filters.clear()
     ind_logger.addFilter(redact_filter)
+    for h in ind_logger.handlers:
+        h.addFilter(redact_filter)
     return ind_logger
 
 
