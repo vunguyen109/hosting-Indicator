@@ -5,3 +5,7 @@ logs/
 __pycache__/
 *.pyc
 *.tmp
+.env.*
+node_modules/
+.DS_Store
+
